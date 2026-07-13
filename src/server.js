@@ -291,7 +291,11 @@ export async function serve({
   app.post("/api/:key/prompts", async (req, res, next) => {
     try {
       const shouldEndSession = Boolean(req.body?.endSession || req.body?.end_session);
-      const session = await store.queuePrompts(req.params.key, req.body || {});
+      const session = await store.queuePrompts(req.params.key, req.body || {}, {
+        resolveAttachment: (sessionKeyValue, id) => resolveAttachment(attachmentStateRoot, sessionKeyValue, id),
+        maxPerPrompt: attachmentConfig.maxPerPrompt,
+        maxPromptBytes: attachmentConfig.maxPromptBytes,
+      });
       if (!session) {
         res.status(404).json({ error: "session not found" });
         return;
