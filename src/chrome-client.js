@@ -1304,6 +1304,10 @@ window.addEventListener("message", (event) => {
 async function uploadAttachment(message) {
   const localId = String(message.localId || "");
   if (!localId) return;
+  // Echo the sending document's nonce on every result so the SDK can drop a result
+  // that arrives after a live-reload has replaced the document (F1).
+  const documentNonce = String(message.documentNonce || "");
+  const reply = (fields) => postToFrame({ type: "lavish:attachmentResult", localId, documentNonce, ...fields });
   const bytes = message.bytes;
   let size;
   if (ArrayBuffer.isView(bytes)) {
@@ -1317,12 +1321,7 @@ async function uploadAttachment(message) {
     }
   }
   if (!Number.isFinite(size) || size < 0) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      localId,
-      ok: false,
-      error: "invalid upload payload",
-    });
+    reply({ ok: false, error: "invalid upload payload" });
     return;
   }
   // Reject over-cap images before they hit the network: an over-cap upload aborts
@@ -1330,30 +1329,18 @@ async function uploadAttachment(message) {
   // the chip would never leave "uploading". Catching it here guarantees the card
   // reaches its error+retry state. The server still enforces the cap authoritatively.
   if (attachmentMaxBytes > 0 && size > attachmentMaxBytes) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      localId,
-      ok: false,
-      error: "Image is larger than the " + formatByteLimit(attachmentMaxBytes) + " limit",
-    });
+    reply({ ok: false, error: "Image is larger than the " + formatByteLimit(attachmentMaxBytes) + " limit" });
     return;
   }
   // Confused-deputy guard: rate + cumulative-byte ceiling before touching the network.
   const now = Date.now();
   while (uploadTimestamps.length && now - uploadTimestamps[0] > UPLOAD_RATE_WINDOW_MS) uploadTimestamps.shift();
   if (uploadTimestamps.length >= UPLOAD_RATE_MAX) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      localId,
-      ok: false,
-      error: "Too many uploads. Wait a moment and retry.",
-    });
+    reply({ ok: false, error: "Too many uploads. Wait a moment and retry." });
     return;
   }
   if (uploadedBytesTotal + size > UPLOAD_SESSION_BYTE_QUOTA) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      localId,
+    reply({
       ok: false,
       error: "Upload limit reached for this session (" + formatByteLimit(UPLOAD_SESSION_BYTE_QUOTA) + ").",
     });
@@ -1369,19 +1356,9 @@ async function uploadAttachment(message) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || "Upload failed");
-    postToFrame({
-      type: "lavish:attachmentResult",
-      localId,
-      ok: true,
-      id: (data.attachment && data.attachment.id) || "",
-    });
+    reply({ ok: true, id: (data.attachment && data.attachment.id) || "" });
   } catch (error) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      localId,
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    reply({ ok: false, error: error instanceof Error ? error.message : String(error) });
   }
 }
 

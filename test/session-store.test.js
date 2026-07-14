@@ -999,3 +999,39 @@ test("queuePrompts rejects a present non-array attachments field instead of drop
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("queuePrompts enforces the per-prompt count cap by ref count before any filesystem resolution (E1 DoS)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hi</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    // A crafted over-cap batch of (unknown) ids must be rejected up front WITHOUT
+    // calling the resolver even once - otherwise it would hold the shared store mutex
+    // doing one disk stat per id and stall all polling/state writes.
+    let stats = 0;
+    const resolveAttachment = async () => {
+      stats += 1;
+      return null;
+    };
+    const ids = Array.from({ length: 50 }, (_, n) => ({ id: "id-" + n }));
+    const result = await store.queuePrompts(
+      session.key,
+      { prompts: [{ uid: "1", prompt: "flood", selector: "", tag: "h1", text: "", attachments: ids }] },
+      { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
+    );
+    assert.ok(result.rejected, "over-cap batch is rejected");
+    assert.equal(
+      result.rejected.every((r) => r.reason === "too-many"),
+      true,
+    );
+    assert.equal(stats, 0, "resolver was never called for an over-cap batch");
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting", "nothing persisted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

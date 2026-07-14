@@ -13,11 +13,13 @@ import {
   classifyHorizontalOverflow,
   classifyVerticalOverflow,
   createArtifactSdk,
+  createAttachmentsController,
   deriveLavishQueueKey,
   fragmentsSignificantlyOverlap,
   isModeToggleHotkeyEvent,
   isNativeInteractiveControl,
   MODE_TOGGLE_HOTKEY_KEY,
+  resolveAttachmentMaxCount,
   resolveVisibleSpillCandidates,
 } from "./artifact-sdk.js";
 import * as mermaidNode from "./mermaid-node.js";
@@ -1422,6 +1424,8 @@ const fragmentsSignificantlyOverlap=${fragmentsSignificantlyOverlap.toString()};
 const resolveVisibleSpillCandidates=${resolveVisibleSpillCandidates.toString()};
 const classifyHorizontalOverflow=${classifyHorizontalOverflow.toString()};
 const classifyVerticalOverflow=${classifyVerticalOverflow.toString()};
+const resolveAttachmentMaxCount=${resolveAttachmentMaxCount.toString()};
+const createAttachmentsController=${createAttachmentsController.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
 (${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers, ${JSON.stringify(sdkOptions)});

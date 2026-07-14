@@ -198,6 +198,206 @@ export function resolveVisibleSpillCandidates(spillCandidates, { epsilon = 1 } =
   );
 }
 
+// The annotation card's per-prompt image count cap. Mirrors the server's
+// LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT, threaded in via createSdkJs (W1); the
+// literal 4 is only the fallback when the SDK runs without that wiring. Exported so
+// the option->cap mapping is unit-tested rather than only text-matched.
+export function resolveAttachmentMaxCount(options = {}) {
+  const configured = options && options.maxAttachmentCount;
+  return Number.isFinite(configured) && configured > 0 ? configured : 4;
+}
+
+// The per-card image attachment controller, extracted from createArtifactSdk with
+// every browser dependency injected so it is unit-testable without a live DOM AND
+// serializable into the sandboxed SDK bundle (createSdkJs). createArtifactSdk wires
+// the real deps (renderChip=attachmentChipHtml, postMessage=parent.postMessage,
+// createObjectUrl=URL.createObjectURL, ...); tests pass fakes to exercise the count
+// cap (W1), the error-state queue gate via hasErrors (W2), and render/onLayout (W3).
+/**
+ * @param {HTMLElement} listEl
+ * @param {{
+ *   maxCount?: number,
+ *   acceptedMime?: Record<string, boolean>,
+ *   renderChip?: (item: any, index: number) => string,
+ *   nextLocalId?: () => string,
+ *   notify?: (message: string) => void,
+ *   onLayout?: () => void,
+ *   postMessage?: (message: any) => void,
+ *   createObjectUrl?: (file: any) => string,
+ *   revokeObjectUrl?: (url: string) => void,
+ * }} [deps]
+ */
+export function createAttachmentsController(
+  listEl,
+  {
+    maxCount = 4,
+    acceptedMime = {},
+    renderChip = () => "",
+    nextLocalId = () => "att",
+    notify = () => {},
+    onLayout = () => {},
+    postMessage = () => {},
+    createObjectUrl = () => "",
+    revokeObjectUrl = () => {},
+  } = {},
+) {
+  /** @type {any[]} */
+  const items = [];
+
+  function render() {
+    listEl.innerHTML = items.map((item, index) => renderChip(item, index)).join("");
+    listEl.hidden = items.length === 0;
+    for (const button of listEl.querySelectorAll("[data-attachment-remove]")) {
+      button.addEventListener("click", () => removeAt(Number(button.getAttribute("data-attachment-remove"))));
+    }
+    for (const button of listEl.querySelectorAll("[data-attachment-retry]")) {
+      button.addEventListener("click", () => retryAt(Number(button.getAttribute("data-attachment-retry"))));
+    }
+    // Chip rows change the card's height, so let the card re-clamp itself back inside
+    // the viewport (W3) - otherwise a grown card can push Queue/Cancel off-frame.
+    onLayout();
+  }
+
+  function upload(item) {
+    item.status = "uploading";
+    item.error = "";
+    render();
+    item.file
+      .arrayBuffer()
+      .then((bytes) => {
+        if (!items.includes(item)) return;
+        postMessage({
+          type: "lavish:uploadAttachment",
+          localId: item.localId,
+          name: item.name,
+          mime: item.mime,
+          bytes,
+        });
+      })
+      .catch(() => {
+        if (!items.includes(item)) return;
+        item.status = "error";
+        item.error = "Could not read image";
+        render();
+      });
+  }
+
+  function add(file) {
+    if (!file || !acceptedMime[file.type]) return false;
+    // Over the per-prompt count cap (W1): reject THIS selection and tell the user
+    // right away instead of silently swallowing it. `maxCount` is the server's
+    // configured limit threaded in - a hardcoded revert would fail the W1 test.
+    if (items.length >= maxCount) {
+      notify("You can attach up to " + maxCount + " image" + (maxCount === 1 ? "" : "s") + ".");
+      return false;
+    }
+    const item = {
+      localId: nextLocalId(),
+      file,
+      name: file.name || "image",
+      mime: file.type,
+      status: "uploading",
+      id: "",
+      error: "",
+      url: createObjectUrl(file),
+    };
+    items.push(item);
+    upload(item);
+    return true;
+  }
+
+  function addFiles(fileList) {
+    let added = false;
+    for (const file of fileList || []) added = add(file) || added;
+    return added;
+  }
+
+  function removeAt(index) {
+    const item = items[index];
+    if (!item) return;
+    if (item.url) revokeObjectUrl(item.url);
+    items.splice(index, 1);
+    // F6: do NOT eagerly ask the chrome to delete the stored file. The same
+    // content-addressed id can be held by a ready-but-unqueued chip in ANOTHER
+    // browser tab, whose live reference is invisible to the server's queued-prompt
+    // refcount - an eager delete there breaks that tab's later send. Reclaiming a
+    // removed chip's bytes is left to the reference-aware sweeper (the documented
+    // backstop), which only reaps files past their TTL AND unreferenced.
+    render();
+  }
+
+  function retryAt(index) {
+    if (items[index] && items[index].file) upload(items[index]);
+  }
+
+  // Surface dropped non-image(s) as dismissible UNSUPPORTED_TYPE error chips (no
+  // file, so no thumbnail and no retry). Accepts one name or a list and renders ONCE
+  // for the whole batch (F7) so dropping many unsupported files is not quadratic.
+  function rejectUnsupported(names) {
+    const list = Array.isArray(names) ? names : [names];
+    let pushed = false;
+    for (const name of list) {
+      items.push({
+        localId: nextLocalId(),
+        file: null,
+        name: name || "file",
+        mime: "",
+        status: "error",
+        id: "",
+        error: "UNSUPPORTED_TYPE",
+        url: "",
+      });
+      pushed = true;
+    }
+    if (pushed) render();
+  }
+
+  function handleResult(localId, ok, id, error) {
+    const item = items.find((entry) => entry.localId === localId);
+    if (!item) return;
+    if (ok && id) {
+      item.status = "ready";
+      item.id = String(id);
+      item.error = "";
+    } else {
+      item.status = "error";
+      item.error = String(error || "Upload failed");
+    }
+    render();
+  }
+
+  function collectReady() {
+    return items.filter((item) => item.status === "ready" && item.id).map((item) => ({ id: item.id, name: item.name }));
+  }
+
+  function hasReady() {
+    return items.some((item) => item.status === "ready" && item.id);
+  }
+
+  // Any chip still mid-flight. Queuing while one is uploading would silently drop it
+  // (collectReady excludes it, and closeCard destroys the controller), so the send
+  // path gates on this (R2.4).
+  function hasPending() {
+    return items.some((item) => item.status === "uploading");
+  }
+
+  // Any chip in the error state - a failed upload (retryable) or a rejected non-image.
+  // collectReady drops these and closeCard destroys the card, so queuing while one is
+  // present would silently discard the failed attachment with its retry/remove UI; the
+  // send path gates on this and keeps the card open (W2).
+  function hasErrors() {
+    return items.some((item) => item.status === "error");
+  }
+
+  function destroy() {
+    for (const item of items) if (item.url) revokeObjectUrl(item.url);
+    items.length = 0;
+  }
+
+  render();
+  return { addFiles, rejectUnsupported, handleResult, collectReady, hasReady, hasPending, hasErrors, destroy };
+}
+
 /**
  * @param {*} deriveQueueKey
  * @param {*} [isNativeInteractive]
@@ -226,10 +426,14 @@ export function createArtifactSdk(
   // The count cap mirrors the server's LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT, passed
   // in via createSdkJs (W1); the literal 4 is only the fallback when the SDK runs
   // without that wiring (e.g. a unit-test call to createArtifactSdk).
-  const ATTACHMENT_MAX_COUNT =
-    Number.isFinite(options.maxAttachmentCount) && options.maxAttachmentCount > 0 ? options.maxAttachmentCount : 4;
+  const ATTACHMENT_MAX_COUNT = resolveAttachmentMaxCount(options);
   const ATTACHMENT_ACCEPTED_MIME = { "image/png": true, "image/jpeg": true, "image/webp": true };
   let attachmentLocalCounter = 0;
+  // A nonce unique to THIS document load. Upload messages carry it and the chrome
+  // echoes it on each result; the result handler discards any result whose nonce
+  // does not match, so an upload that completes after a live-reload (which resets
+  // the localId counter) can't mark a fresh card's chip with the wrong id (F1).
+  const documentNonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
   // The controller for the currently open card, so upload results routed from the
   // chrome reach the right chips. Only one card is ever open at a time.
   let activeAttachments = null;
@@ -280,165 +484,22 @@ export function createArtifactSdk(
     );
   }
 
-  // Per-card image attachment state. Captures files, renders chips, drives uploads
-  // through the chrome (which owns the same-origin server round trip), and reports
-  // which uploads are ready to ride along with the queued prompt.
-  /**
-   * @param {HTMLElement} listEl
-   * @param {{ notify?: (message: string) => void, onLayout?: () => void }} [config]
-   */
-  function makeAttachmentsController(listEl, { notify = () => {}, onLayout = () => {} } = {}) {
-    const items = [];
-
-    function render() {
-      listEl.innerHTML = items.map((item, index) => attachmentChipHtml(item, index)).join("");
-      listEl.hidden = items.length === 0;
-      for (const button of listEl.querySelectorAll("[data-attachment-remove]")) {
-        button.addEventListener("click", () => removeAt(Number(button.getAttribute("data-attachment-remove"))));
-      }
-      for (const button of listEl.querySelectorAll("[data-attachment-retry]")) {
-        button.addEventListener("click", () => retryAt(Number(button.getAttribute("data-attachment-retry"))));
-      }
-      // Chip rows change the card's height, so let the card re-clamp itself back
-      // inside the viewport (W3) - otherwise a grown card can push Queue/Cancel off
-      // the bottom of the frame.
-      onLayout();
-    }
-
-    function upload(item) {
-      item.status = "uploading";
-      item.error = "";
-      render();
-      item.file
-        .arrayBuffer()
-        .then((bytes) => {
-          if (!items.includes(item)) return;
-          parent.postMessage(
-            { type: "lavish:uploadAttachment", localId: item.localId, name: item.name, mime: item.mime, bytes },
-            "*",
-          );
-        })
-        .catch(() => {
-          if (!items.includes(item)) return;
-          item.status = "error";
-          item.error = "Could not read image";
-          render();
-        });
-    }
-
-    function add(file) {
-      if (!file || !ATTACHMENT_ACCEPTED_MIME[file.type]) return false;
-      // Over the per-prompt count cap: reject THIS selection and tell the user right
-      // away (W1) instead of silently swallowing it, so a 5th drop/paste/pick doesn't
-      // just vanish. The cap mirrors the server's LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT.
-      if (items.length >= ATTACHMENT_MAX_COUNT) {
-        notify(
-          "You can attach up to " + ATTACHMENT_MAX_COUNT + " image" + (ATTACHMENT_MAX_COUNT === 1 ? "" : "s") + ".",
-        );
-        return false;
-      }
-      const item = {
-        localId: "att-" + ++attachmentLocalCounter,
-        file,
-        name: file.name || "image",
-        mime: file.type,
-        status: "uploading",
-        id: "",
-        error: "",
-        url: URL.createObjectURL(file),
-      };
-      items.push(item);
-      upload(item);
-      return true;
-    }
-
-    function addFiles(fileList) {
-      let added = false;
-      for (const file of fileList || []) added = add(file) || added;
-      return added;
-    }
-
-    function removeAt(index) {
-      const item = items[index];
-      if (!item) return;
-      if (item.url) URL.revokeObjectURL(item.url);
-      items.splice(index, 1);
-      // Tell the chrome to delete the stored file, but only when no OTHER chip in
-      // this card still shares that content-addressed id (the same image attached
-      // twice dedups to one file): deleting it would break the sibling chip. The
-      // server also refcounts against queued prompts; the sweeper is the backstop.
-      if (item.id && !items.some((other) => other.id === item.id)) {
-        parent.postMessage({ type: "lavish:removeAttachment", id: item.id }, "*");
-      }
-      render();
-    }
-
-    function retryAt(index) {
-      if (items[index] && items[index].file) upload(items[index]);
-    }
-
-    // Surface a dropped non-image as a dismissible UNSUPPORTED_TYPE error chip (no
-    // file, so no thumbnail and no retry) instead of letting the browser open it.
-    function rejectUnsupported(name) {
-      items.push({
-        localId: "att-" + ++attachmentLocalCounter,
-        file: null,
-        name: name || "file",
-        mime: "",
-        status: "error",
-        id: "",
-        error: "UNSUPPORTED_TYPE",
-        url: "",
-      });
-      render();
-    }
-
-    function handleResult(localId, ok, id, error) {
-      const item = items.find((entry) => entry.localId === localId);
-      if (!item) return;
-      if (ok && id) {
-        item.status = "ready";
-        item.id = String(id);
-        item.error = "";
-      } else {
-        item.status = "error";
-        item.error = String(error || "Upload failed");
-      }
-      render();
-    }
-
-    function collectReady() {
-      return items
-        .filter((item) => item.status === "ready" && item.id)
-        .map((item) => ({ id: item.id, name: item.name }));
-    }
-
-    function hasReady() {
-      return items.some((item) => item.status === "ready" && item.id);
-    }
-
-    // Any chip still mid-flight. Queuing while one is uploading would silently drop
-    // it (collectReady excludes it, and closeCard destroys the controller), so the
-    // send path gates on this (R2.4).
-    function hasPending() {
-      return items.some((item) => item.status === "uploading");
-    }
-
-    // Any chip in the error state - a failed upload (retryable) or a rejected
-    // non-image. collectReady drops these and closeCard destroys the card, so queuing
-    // while one is present would silently discard the failed attachment along with its
-    // retry/remove UI; the send path gates on this and keeps the card open (W2).
-    function hasErrors() {
-      return items.some((item) => item.status === "error");
-    }
-
-    function destroy() {
-      for (const item of items) if (item.url) URL.revokeObjectURL(item.url);
-      items.length = 0;
-    }
-
-    render();
-    return { addFiles, rejectUnsupported, handleResult, collectReady, hasReady, hasPending, hasErrors, destroy };
+  // The per-card image attachment controller lives at module scope as the injectable,
+  // unit-testable `createAttachmentsController` (below); createArtifactSdk wires its
+  // real browser dependencies here. `attachmentChipHtml` is passed in as `renderChip`.
+  function makeAttachmentsController(listEl, config = {}) {
+    return createAttachmentsController(listEl, {
+      maxCount: ATTACHMENT_MAX_COUNT,
+      acceptedMime: ATTACHMENT_ACCEPTED_MIME,
+      renderChip: attachmentChipHtml,
+      nextLocalId: () => "att-" + ++attachmentLocalCounter,
+      // Stamp every controller->chrome message with this document's nonce so the
+      // chrome can echo it and the result handler can drop stale cross-reload results (F1).
+      postMessage: (message) => parent.postMessage({ ...message, documentNonce }, "*"),
+      createObjectUrl: (file) => URL.createObjectURL(file),
+      revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+      ...config,
+    });
   }
 
   function uid(el) {
@@ -1396,15 +1457,14 @@ export function createArtifactSdk(
     });
     card.addEventListener("drop", (event) => {
       // Intercept every drop over the card so a dropped PDF/other file can never
-      // navigate the frame away; accept images or surface UNSUPPORTED_TYPE.
+      // navigate the frame away. A MIXED drop must partial-accept (F4): attach every
+      // supported image AND surface an UNSUPPORTED_TYPE chip for each unsupported file,
+      // never silently discarding the unsupported ones just because an image is present.
       event.preventDefault();
       card.classList.remove("is-dropping");
-      const files = imageFilesFromDataTransfer(event.dataTransfer);
-      if (files.length) {
-        attachments.addFiles(files);
-      } else if (dataTransferHasFiles(event.dataTransfer)) {
-        attachments.rejectUnsupported(unsupportedDropName(event.dataTransfer));
-      }
+      const { images, unsupportedNames } = partitionDroppedFiles(event.dataTransfer);
+      if (images.length) attachments.addFiles(images);
+      if (unsupportedNames.length) attachments.rejectUnsupported(unsupportedNames);
     });
 
     // Try to queue the card. Returns true only if a prompt was actually queued, so
@@ -1476,12 +1536,35 @@ export function createArtifactSdk(
     return (dataTransfer.types || []).includes?.("Files");
   }
 
-  function unsupportedDropName(dataTransfer) {
-    if (!dataTransfer) return "file";
-    for (const file of dataTransfer.files || []) {
-      if (file && !ATTACHMENT_ACCEPTED_MIME[file.type]) return file.name || "file";
+  // Split a drop into supported images and the names of unsupported files, so a mixed
+  // drop can attach the images AND report every unsupported file (F4). Prefers the
+  // `files` list; falls back to `items` (pasted/dragged screenshots arrive as items in
+  // some browsers).
+  function partitionDroppedFiles(dataTransfer) {
+    /** @type {any[]} */
+    const images = [];
+    /** @type {string[]} */
+    const unsupportedNames = [];
+    if (!dataTransfer) return { images, unsupportedNames };
+    const files = [...(dataTransfer.files || [])];
+    if (files.length) {
+      for (const file of files) {
+        if (!file) continue;
+        if (ATTACHMENT_ACCEPTED_MIME[file.type]) images.push(file);
+        else unsupportedNames.push(file.name || "file");
+      }
+      return { images, unsupportedNames };
     }
-    return "file";
+    for (const item of dataTransfer.items || []) {
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile ? item.getAsFile() : null;
+      if (ATTACHMENT_ACCEPTED_MIME[item.type]) {
+        if (file) images.push(file);
+      } else {
+        unsupportedNames.push((file && file.name) || "file");
+      }
+    }
+    return { images, unsupportedNames };
   }
 
   /** @type {Window & { lavish?: unknown }} */ (window).lavish = {
@@ -1497,6 +1580,10 @@ export function createArtifactSdk(
     const msg = event.data || {};
     if (msg.type === "lavish:setAnnotationMode") setAnnotationMode(msg.enabled);
     if (msg.type === "lavish:attachmentResult") {
+      // F1: ignore a result whose nonce is from a different document load - it belongs
+      // to an upload started before a live-reload, and the localId counter has since
+      // reset, so honoring it could mark a fresh card's chip with the wrong id.
+      if (msg.documentNonce && msg.documentNonce !== documentNonce) return;
       activeAttachments?.handleResult(msg.localId, msg.ok, msg.id, msg.error);
     }
     if (msg.type === "lavish:requestSnapshot") {

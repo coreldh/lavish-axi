@@ -274,8 +274,16 @@ export async function writeAttachment(stateDir, key, buffer, { maxBytes = DEFAUL
     // B3: dedup re-upload of identical content must refresh the mtime so a new
     // reference restarts the TTL clock. Otherwise an aged-but-re-referenced file
     // is reaped by the very next sweep, breaking the fresh prompt's thumbnail.
+    // F3: do NOT swallow a refresh failure - a stale mtime would leave the file
+    // sweep-eligible while we still report the upload ready. If utimes fails, rewrite
+    // the identical bytes atomically (which also resets the mtime); let a rewrite
+    // failure propagate so the caller never treats an un-refreshed file as ready.
     const now = new Date();
-    await utimes(file, now, now).catch(() => {});
+    try {
+      await utimes(file, now, now);
+    } catch {
+      await writeFileAtomically(file, buffer);
+    }
   }
   await writeSidecar(file, {
     v: 1,

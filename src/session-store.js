@@ -385,12 +385,18 @@ async function resolvePromptAttachments(refs, key, options = {}) {
   }
   const resolved = [];
   const rejected = [];
+  // Enforce the per-prompt COUNT cap against the ref count BEFORE resolving anything.
+  // Checking `resolved.length` inside the loop let a crafted batch of unknown ids
+  // slip the cap and still cost one filesystem stat per id - and since E1 runs this
+  // whole path under the shared store mutex, thousands of sequential stats would
+  // stall every poll and state write. Over-cap -> reject the whole prompt's refs up
+  // front without touching the resolver.
+  if (refs.length > maxPerPrompt) {
+    for (const ref of refs) rejected.push({ id: ref.id, name: ref.name || "", reason: "too-many" });
+    return { resolved, rejected };
+  }
   let totalBytes = 0;
   for (const ref of refs) {
-    if (resolved.length >= maxPerPrompt) {
-      rejected.push({ id: ref.id, name: ref.name || "", reason: "too-many" });
-      continue;
-    }
     const metadata = await resolveAttachment(key, ref.id);
     if (!metadata) {
       rejected.push({ id: ref.id, name: ref.name || "", reason: "not-found" });
