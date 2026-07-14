@@ -954,3 +954,42 @@ test("queuePrompts rejects malformed/id-less attachment refs instead of silently
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("queuePrompts rejects a present non-array attachments field instead of dropping it (C4)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hi</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const known = "a".repeat(64) + ".png";
+    const resolveAttachment = async (_key, id) =>
+      id === known ? { id: known, type: "image", path: "/vetted/a.png", mime: "image/png", bytes: 10 } : null;
+
+    // A present but non-array attachments container (object or string) can never
+    // name a stored file; it must be surfaced as malformed, not silently dropped.
+    for (const bad of [{ id: known }, "garbage"]) {
+      const result = await store.queuePrompts(
+        session.key,
+        { prompts: [{ uid: "1", prompt: "bad", selector: "", tag: "h1", text: "", attachments: bad }] },
+        { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
+      );
+      assert.ok(result.rejected, "non-array attachments container is rejected");
+      assert.ok(
+        result.rejected.some((r) => r.reason === "malformed"),
+        "reported as malformed",
+      );
+      assert.equal((await store.takeFeedback(session.key)).status, "waiting", "nothing persisted");
+    }
+
+    // An absent or falsy attachments field is NOT malformed - it just means no images.
+    const ok = await store.queuePrompts(session.key, {
+      prompts: [{ uid: "2", prompt: "fine", selector: "", tag: "h1", text: "", attachments: undefined }],
+    });
+    assert.ok(ok && !ok.rejected, "absent attachments field is accepted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -351,7 +351,13 @@ function normalizeAttachmentRefs(value) {
 // result into its all-or-nothing rejection batch. Duplicate ids are NOT reported -
 // collapsing the same content-addressed image to one ref is intentional dedup.
 function collectMalformedAttachmentRefs(value) {
-  if (!Array.isArray(value)) return [];
+  // Absent or falsy = no attachments field to honor, nothing to reject. But a
+  // PRESENT, truthy NON-array container (`attachments: { id: "…" }`, or
+  // `attachments: "garbage"`) is itself malformed: normalizeAttachmentRefs would
+  // drop it wholesale, so flag it rather than let the POST succeed without the
+  // attachment the client meant to send (C4).
+  if (!value) return [];
+  if (!Array.isArray(value)) return [{ id: "", name: "", reason: "malformed" }];
   const malformed = [];
   for (const item of value) {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
