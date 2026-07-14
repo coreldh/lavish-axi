@@ -38,7 +38,6 @@ import {
 } from "./export-bundle.js";
 import { publishToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
-import { AsyncMutex } from "./async-mutex.js";
 import { bindHost, hostForUrl, linkHost } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 import {
@@ -218,11 +217,13 @@ export async function serve({
   const attachmentConfig = resolveAttachmentConfig();
   // Attachment bytes are content-addressed on disk alongside the whiteboard sidecars.
   const attachmentStateRoot = path.dirname(stateFile);
-  // ONE shared lock for the whole attachment lifecycle: upload finalize, the
-  // /prompts resolve+persist, delete, and the reference-aware sweep all run under
-  // it, so a reference can never be acquired in the window between the sweeper's
-  // reference snapshot and its delete (D5).
-  const attachmentLifecycleLock = new AsyncMutex();
+  // The store owns the ONE shared lock covering BOTH state consistency AND the
+  // attachment lifecycle. It serializes every state.json read-modify-write
+  // internally (E1); the server routes its attachment disk sections - upload
+  // finalize, delete, the reference-aware sweep - through the same lock via
+  // `store.runExclusive`, so a reference can never be acquired in the window between
+  // the sweeper's reference snapshot and its delete (D5), and `queuePrompts` cannot
+  // interleave with a concurrent poll.
 
   const defaultJsonParser = express.json({ limit: "2mb" });
   const whiteboardJsonParser = express.json({ limit: "20mb" });
@@ -362,7 +363,6 @@ export async function serve({
         resolveAttachment: (sessionKeyValue, id) => resolveAttachment(attachmentStateRoot, sessionKeyValue, id),
         maxPerPrompt: attachmentConfig.maxPerPrompt,
         maxPromptBytes: attachmentConfig.maxPromptBytes,
-        lock: attachmentLifecycleLock,
       });
       if (!result) {
         res.status(404).json({ error: "session not found" });
@@ -656,7 +656,9 @@ export async function serve({
   });
 
   app.get("/sdk.js", (req, res) => {
-    res.type("application/javascript").send(createSdkJs(String(req.query.key || "")));
+    res
+      .type("application/javascript")
+      .send(createSdkJs(String(req.query.key || ""), { maxAttachmentCount: attachmentConfig.maxPerPrompt }));
   });
 
   // The whiteboard frame page. Hosted by the chrome in a dedicated sandboxed
@@ -839,7 +841,7 @@ export async function serve({
       }
       // Finalize under the lifecycle lock so the dedup mtime refresh (B3) and the
       // dims sidecar write can't interleave with a concurrent sweep/delete.
-      const attachment = await attachmentLifecycleLock.runExclusive(() =>
+      const attachment = await store.runExclusive(() =>
         writeAttachment(attachmentStateRoot, req.params.key, buffer, {
           maxBytes: attachmentConfig.maxBytes,
         }),
@@ -878,7 +880,7 @@ export async function serve({
       // shared by an already-queued prompt (the same image attached twice, deduped
       // to one id) must survive a chip removal, or the queued prompt's thumbnail and
       // path break. Only reap the file when no pending prompt still references it.
-      const status = await attachmentLifecycleLock.runExclusive(async () => {
+      const status = await store.runExclusive(async () => {
         const referenced = await store.referencedAttachmentIds();
         if (referenced.has(`${req.params.key}/${req.params.id}`)) return "referenced";
         return (await removeAttachment(attachmentStateRoot, req.params.key, req.params.id)) ? "removed" : "absent";
@@ -988,7 +990,7 @@ export async function serve({
       // The reference snapshot AND the enumerate/delete run as one critical section
       // so a reference acquired mid-sweep (a concurrent upload finalize or /prompts
       // resolve) can never point at a file this sweep is about to remove (D5).
-      const result = await attachmentLifecycleLock.runExclusive(async () => {
+      const result = await store.runExclusive(async () => {
         const referenced = await store.referencedAttachmentIds();
         return sweepAttachments(attachmentStateRoot, {
           ttlMs: attachmentConfig.ttlMs,
@@ -1394,7 +1396,11 @@ export function createWhiteboardFrameHtml(channelToken = "") {
 </html>`;
 }
 
-export function createSdkJs(key) {
+/**
+ * @param {string} key
+ * @param {{ maxAttachmentCount?: number }} [options]
+ */
+export function createSdkJs(key, { maxAttachmentCount } = {}) {
   // Serialize every helper exported by mermaid-node.js as a same-scope const so
   // cross-helper calls (e.g. mermaidNodeFrom → mermaidNodeElement) resolve in the
   // browser. Deriving this from the module's exports — rather than a hand-kept
@@ -1402,6 +1408,11 @@ export function createSdkJs(key) {
   const mermaidHelperEntries = Object.entries(mermaidNode).filter(([, value]) => typeof value === "function");
   const mermaidHelperDecls = mermaidHelperEntries.map(([name, fn]) => `const ${name}=${fn.toString()};`).join("\n");
   const mermaidHelperKeys = mermaidHelperEntries.map(([name]) => name).join(", ");
+  // The per-prompt attachment cap is authoritative on the server (attachment-store.js);
+  // pass it to the SDK so the annotation card's local count guard matches the server
+  // limit instead of a hardcoded literal (W1). The card is still only a UX guide - the
+  // server re-enforces the cap on /prompts and rejects the whole batch on a mismatch.
+  const sdkOptions = { maxAttachmentCount: Number.isFinite(maxAttachmentCount) ? maxAttachmentCount : undefined };
   return `(() => {
 const key=${JSON.stringify(key)};
 void key;
@@ -1416,7 +1427,7 @@ const findStableLayoutFindings=${findStableLayoutFindings.toString()};
 const isNearTotalOcclusion=${isNearTotalOcclusion.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
-(${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers);
+(${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers, ${JSON.stringify(sdkOptions)});
 })();`;
 }
 
