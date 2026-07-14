@@ -101,12 +101,20 @@ export class SessionStore {
     const alreadyEnded = session.status === "ended";
     const normalizedPrompts = prompts.map(normalizePrompt);
     // Resolve every attachment BEFORE mutating anything. If any prompt's images
-    // can't be fully honored - an unknown id, or over the per-prompt count/byte
-    // cap - reject the WHOLE batch and persist nothing (C4). Silently truncating
-    // here while returning success would drop images the user attached, and the
-    // chrome would clear its queue believing they were delivered.
+    // can't be fully honored - a malformed ref, an unknown id, or over the
+    // per-prompt count/byte cap - reject the WHOLE batch and persist nothing (C4).
+    // Silently truncating here while returning success would drop images the user
+    // attached, and the chrome would clear its queue believing they were delivered.
     const rejected = [];
-    for (const prompt of normalizedPrompts) {
+    for (let index = 0; index < normalizedPrompts.length; index += 1) {
+      const prompt = normalizedPrompts[index];
+      // `normalizeAttachmentRefs` already stripped non-object / id-less entries out
+      // of `prompt.attachments`, so inspect the RAW payload for them here - dropping
+      // them silently would violate C4's "never silently drop" guarantee just as a
+      // bad id does. Duplicate ids are intentional dedup (content-addressed), not a
+      // malformed drop, so they are not rejected.
+      const malformed = collectMalformedAttachmentRefs(prompts[index] && prompts[index].attachments);
+      if (malformed.length) rejected.push(...malformed);
       const { resolved, rejected: promptRejected } = await resolvePromptAttachments(prompt.attachments, key, options);
       if (promptRejected.length) rejected.push(...promptRejected);
       if (resolved.length > 0) prompt.attachments = resolved;
@@ -334,6 +342,28 @@ function normalizeAttachmentRefs(value) {
     refs.push(name ? { id, name } : { id });
   }
   return refs;
+}
+
+// Attachment refs that `normalizeAttachmentRefs` would drop because they can never
+// name a stored file: a non-object entry, or an object with no `id`. C4 requires
+// these surface as rejections (so a crafted or corrupt payload can't quietly lose
+// an attachment while the POST still reports success), so `queuePrompts` folds the
+// result into its all-or-nothing rejection batch. Duplicate ids are NOT reported -
+// collapsing the same content-addressed image to one ref is intentional dedup.
+function collectMalformedAttachmentRefs(value) {
+  if (!Array.isArray(value)) return [];
+  const malformed = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      malformed.push({ id: "", name: "", reason: "malformed" });
+      continue;
+    }
+    if (!String(item.id || "")) {
+      const name = item.name === undefined || item.name === null ? "" : String(item.name).slice(0, 200);
+      malformed.push({ id: "", name, reason: "malformed" });
+    }
+  }
+  return malformed;
 }
 
 // Replace each client ref with server-vetted metadata, enforcing the per-prompt

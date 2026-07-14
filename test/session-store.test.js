@@ -910,3 +910,47 @@ test("queuePrompts and takeFeedback serialize so a mid-resolution poll never clo
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("queuePrompts rejects malformed/id-less attachment refs instead of silently dropping them (C4)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hi</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const known = "a".repeat(64) + ".png";
+    const resolveAttachment = async (_key, id) =>
+      id === known
+        ? { id: known, type: "image", path: "/vetted/a.png", mime: "image/png", bytes: 10, width: 1, height: 1 }
+        : null;
+
+    // A valid ref alongside a non-object and an id-less object: the whole batch is
+    // rejected atomically (C4), the malformed entries are reported (not dropped),
+    // and nothing - not even the valid ref - is persisted.
+    const result = await store.queuePrompts(
+      session.key,
+      {
+        prompts: [
+          {
+            uid: "1",
+            prompt: "mixed",
+            selector: "",
+            tag: "h1",
+            text: "",
+            attachments: [{ id: known }, "garbage", { name: "no-id.png" }],
+          },
+        ],
+      },
+      { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
+    );
+
+    assert.ok(result.rejected, "batch reports rejections");
+    const malformed = result.rejected.filter((r) => r.reason === "malformed");
+    assert.equal(malformed.length, 2, "both the non-object and the id-less object are surfaced");
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting", "nothing was persisted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
