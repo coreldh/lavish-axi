@@ -1509,6 +1509,38 @@ test("chrome renders queued-prompt attachment thumbnails from the server endpoin
   assert.match(html, /Image annotation/);
 });
 
+test("chrome renders a malformed queued attachment safely instead of wedging the tab (DoS guard)", async () => {
+  const chrome = await createChromeHarness();
+  const good = "a".repeat(64) + ".png";
+  // A hostile artifact posts a mix of a null entry, a non-object, an id-less object,
+  // and one valid ref. Rendering must not throw (which would wedge the tab on reload).
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: {
+      prompt: "",
+      selector: "h1",
+      tag: "annotation",
+      text: "",
+      attachments: [null, "garbage", { name: "no-id" }, { id: good, name: "ok.png" }],
+    },
+  });
+  const html = chrome.element("annotationPills").innerHTML;
+  assert.match(html, new RegExp("/api/abc/attachments/" + good), "the one valid attachment still renders");
+  assert.doesNotMatch(html, /undefined/, "no malformed entry leaks a broken thumbnail");
+});
+
+test("chrome shows a +N indicator when a queued prompt has more images than the preview limit", async () => {
+  const chrome = await createChromeHarness();
+  const attachments = Array.from({ length: 7 }, (_, n) => ({ id: String(n).repeat(64).slice(0, 64) + ".png" }));
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "", selector: "h1", tag: "annotation", text: "", attachments },
+  });
+  const html = chrome.element("annotationPills").innerHTML;
+  assert.equal((html.match(/pill-attachment"/g) || []).length, 4, "only the preview limit of 4 thumbnails render");
+  assert.match(html, /pill-attachment-more[^>]*>\+3/, "the 3 omitted images are surfaced as +3");
+});
+
 test("chrome rejects an over-cap image before it hits the network", async () => {
   const requests = [];
   const chrome = await createChromeHarness({

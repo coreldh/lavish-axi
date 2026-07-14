@@ -207,31 +207,44 @@ function attachmentCount(prompt) {
   return Array.isArray(prompt.attachments) ? prompt.attachments.length : 0;
 }
 
+const PILL_ATTACHMENT_PREVIEW_LIMIT = 4;
+
 // Thumbnails for a queued prompt's images, served straight from the same-origin
 // attachment endpoint (the ids are already server-vetted at upload time).
 function pillAttachmentsHtml(prompt) {
-  if (!attachmentCount(prompt)) return "";
-  return (
-    '<span class="pill-attachments">' +
-    prompt.attachments
-      .slice(0, 4)
-      .map((attachment) => {
-        const alt = escapeHtml(attachment.name || "image");
-        return (
-          '<img class="pill-attachment" src="/api/' +
-          encodeURIComponent(key) +
-          "/attachments/" +
-          encodeURIComponent(attachment.id) +
-          '" alt="' +
-          alt +
-          '" title="' +
-          alt +
-          '">'
-        );
-      })
-      .join("") +
-    "</span>"
-  );
+  // Guard against a hostile or malformed queued payload (e.g. `attachments: [null]`
+  // posted by an untrusted artifact): render only well-formed entries here without
+  // mutating the raw queue, so a null dereference can't throw on every render and
+  // wedge the tab after each reload. SessionStore still rejects malformed refs under
+  // C4 server-side.
+  const valid = Array.isArray(prompt.attachments)
+    ? prompt.attachments.filter((attachment) => attachment && typeof attachment === "object" && attachment.id)
+    : [];
+  if (!valid.length) return "";
+  const shown = valid.slice(0, PILL_ATTACHMENT_PREVIEW_LIMIT);
+  const overflow = valid.length - shown.length;
+  const thumbs = shown
+    .map((attachment) => {
+      const alt = escapeHtml(attachment.name || "image");
+      return (
+        '<img class="pill-attachment" src="/api/' +
+        encodeURIComponent(key) +
+        "/attachments/" +
+        encodeURIComponent(attachment.id) +
+        '" alt="' +
+        alt +
+        '" title="' +
+        alt +
+        '">'
+      );
+    })
+    .join("");
+  // The count cap is configurable (LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT), so a prompt
+  // can carry more than the preview shows - surface the omitted count instead of
+  // silently hiding them (W1).
+  const more =
+    overflow > 0 ? '<span class="pill-attachment-more" title="' + overflow + ' more">+' + overflow + "</span>" : "";
+  return '<span class="pill-attachments">' + thumbs + more + "</span>";
 }
 
 const DEFAULT_SEND_HINT = "Write a message or annotate an element first.";
