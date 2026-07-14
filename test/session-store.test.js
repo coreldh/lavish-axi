@@ -968,15 +968,16 @@ test("queuePrompts rejects a present non-array attachments field instead of drop
     const resolveAttachment = async (_key, id) =>
       id === known ? { id: known, type: "image", path: "/vetted/a.png", mime: "image/png", bytes: 10 } : null;
 
-    // A present but non-array attachments container (object or string) can never
-    // name a stored file; it must be surfaced as malformed, not silently dropped.
-    for (const bad of [{ id: known }, "garbage"]) {
+    // Any PRESENT non-array attachments value - an object, a string, or a falsy
+    // scalar like null/false/0/"" - can never name a stored file; it must be
+    // surfaced as malformed, not silently dropped. Only a truly absent field is ok.
+    for (const bad of [{ id: known }, "garbage", null, false, 0, ""]) {
       const result = await store.queuePrompts(
         session.key,
         { prompts: [{ uid: "1", prompt: "bad", selector: "", tag: "h1", text: "", attachments: bad }] },
         { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
       );
-      assert.ok(result.rejected, "non-array attachments container is rejected");
+      assert.ok(result.rejected, `non-array attachments (${JSON.stringify(bad)}) is rejected`);
       assert.ok(
         result.rejected.some((r) => r.reason === "malformed"),
         "reported as malformed",
@@ -984,11 +985,16 @@ test("queuePrompts rejects a present non-array attachments field instead of drop
       assert.equal((await store.takeFeedback(session.key)).status, "waiting", "nothing persisted");
     }
 
-    // An absent or falsy attachments field is NOT malformed - it just means no images.
+    // A truly absent attachments field (undefined / key omitted) is NOT malformed -
+    // it just means the prompt carries no images.
     const ok = await store.queuePrompts(session.key, {
       prompts: [{ uid: "2", prompt: "fine", selector: "", tag: "h1", text: "", attachments: undefined }],
     });
     assert.ok(ok && !ok.rejected, "absent attachments field is accepted");
+    const okOmitted = await store.queuePrompts(session.key, {
+      prompts: [{ uid: "3", prompt: "also fine", selector: "", tag: "h1", text: "" }],
+    });
+    assert.ok(okOmitted && !okOmitted.rejected, "omitted attachments field is accepted");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
