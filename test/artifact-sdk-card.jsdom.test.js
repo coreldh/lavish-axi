@@ -24,6 +24,12 @@ function bootSdk({ maxAttachmentCount } = {}) {
   // jsdom doesn't implement CSS.escape, which selector() uses to build element paths.
   if (!window.CSS) window.CSS = {};
   if (!window.CSS.escape) window.CSS.escape = (value) => String(value).replace(/[^\w-]/g, (ch) => "\\" + ch);
+  // Older jsdom's File lacks arrayBuffer(), which upload() reads before posting bytes.
+  if (!window.File.prototype.arrayBuffer) {
+    window.File.prototype.arrayBuffer = function arrayBuffer() {
+      return Promise.resolve(new ArrayBuffer(0));
+    };
+  }
   const posted = [];
   // The bundle posts to `parent` (which is the window itself in jsdom); capture it.
   window.postMessage = (message) => posted.push(message);
