@@ -2,12 +2,30 @@ import crypto from "node:crypto";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { AsyncMutex } from "./async-mutex.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./whiteboard-core.js";
 
 export class SessionStore {
   constructor(file) {
     this.file = file;
+    // One mutex serializes EVERY read-modify-write of `state.json`. `readState`
+    // reads the whole file in one shot and `writeState` rewrites it wholesale, so
+    // a lost update can only come from two mutators interleaving read/await/write.
+    // Any method that reads then (after an `await`) writes must run under this lock
+    // - otherwise a poll's `takeFeedback` can clear prompts in the window a
+    // `queuePrompts` holds its pre-resolve snapshot open, then `queuePrompts` writes
+    // the stale snapshot back and clobbers the take (E1). The server also runs its
+    // attachment disk-lifecycle sections (upload finalize, delete, sweep) under this
+    // same lock via `runExclusive`, so a reference snapshot taken by delete/sweep
+    // stays consistent with `queuePrompts` (D5) - one lock covers state AND files.
+    this.lock = new AsyncMutex();
+  }
+
+  // Shared critical-section entry point so the server's attachment lifecycle
+  // operations serialize against every store mutation under the SAME lock.
+  runExclusive(fn) {
+    return this.lock.runExclusive(fn);
   }
 
   async listSessions() {
@@ -27,7 +45,14 @@ export class SessionStore {
   }
 
   async upsertSession(file, url) {
+    // `canonicalFile` (a realpath) does not touch state, so resolve it before
+    // taking the lock and keep only the read-modify-write inside the critical
+    // section.
     const absolute = await canonicalFile(file);
+    return this.lock.runExclusive(() => this.#upsertSessionLocked(absolute, url));
+  }
+
+  async #upsertSessionLocked(absolute, url) {
     const key = sessionKey(absolute);
     const state = await this.readState();
     const existing = state.sessions[key] || {};
@@ -58,12 +83,11 @@ export class SessionStore {
   // `/prompts` POST cannot point an attachment at an arbitrary file. Without a
   // resolver, unresolved attachments are dropped rather than trusted.
   async queuePrompts(key, payload, options = {}) {
-    // The whole read -> resolve -> write path runs under the shared attachment
-    // lifecycle lock (when one is supplied) so it is atomic against the sweeper's
-    // reference snapshot + delete and against upload finalize (D5). Without a lock
-    // (unit tests, no attachments) it runs inline.
-    const critical = () => this.#queuePromptsLocked(key, payload, options);
-    return options.lock ? options.lock.runExclusive(critical) : critical();
+    // The whole read -> resolve -> write path runs under the store's single lock so
+    // it is atomic against a concurrent poll's `takeFeedback` / `recordLayoutWarnings`
+    // (E1) AND against the sweeper's reference snapshot + delete and upload finalize,
+    // which the server runs under the same lock via `runExclusive` (D5).
+    return this.lock.runExclusive(() => this.#queuePromptsLocked(key, payload, options));
   }
 
   async #queuePromptsLocked(key, payload, options) {
@@ -112,6 +136,10 @@ export class SessionStore {
   }
 
   async recordLayoutWarnings(key, payload) {
+    return this.lock.runExclusive(() => this.#recordLayoutWarningsLocked(key, payload));
+  }
+
+  async #recordLayoutWarningsLocked(key, payload) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -147,6 +175,10 @@ export class SessionStore {
   }
 
   async takeFeedback(key) {
+    return this.lock.runExclusive(() => this.#takeFeedbackLocked(key));
+  }
+
+  async #takeFeedbackLocked(key) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -190,6 +222,10 @@ export class SessionStore {
   // agent explicitly closing the loop via `lavish-axi end` ("agent"). Only a user-initiated end
   // blocks a plain reopen - see `SessionStore` callers in server.js.
   async endSession(key, endedBy = "agent") {
+    return this.lock.runExclusive(() => this.#endSessionLocked(key, endedBy));
+  }
+
+  async #endSessionLocked(key, endedBy) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -205,6 +241,10 @@ export class SessionStore {
   }
 
   async addAgentReply(key, text) {
+    return this.lock.runExclusive(() => this.#addAgentReplyLocked(key, text));
+  }
+
+  async #addAgentReplyLocked(key, text) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
@@ -217,9 +257,12 @@ export class SessionStore {
   }
 
   // `key/id` strings for every attachment still referenced by a pending prompt,
-  // across all sessions. The attachment sweeper uses this so it never reaps a file
-  // that belongs to a queued-but-undelivered prompt. Delivered prompts are cleared
-  // from `prompts` by takeFeedback, so their attachments become sweep-eligible.
+  // across all sessions. The attachment sweeper and delete use this so they never
+  // reap a file that belongs to a queued-but-undelivered prompt. Delivered prompts
+  // are cleared from `prompts` by takeFeedback, so their attachments become
+  // sweep-eligible. This is a pure read and must NOT take `this.lock`: the server
+  // calls it from inside `runExclusive`, so self-locking would deadlock; running it
+  // there keeps its snapshot atomic with the subsequent disk delete.
   async referencedAttachmentIds() {
     const state = await this.readState();
     const referenced = new Set();
