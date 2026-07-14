@@ -41,6 +41,13 @@ function describeAttachmentRejection(rejected, caps) {
   if (reasons.has("too-many") && caps && caps.maxPerPrompt) {
     parts.push("more than " + caps.maxPerPrompt + " images on one annotation");
   }
+  if (reasons.has("request-too-many")) {
+    parts.push(
+      caps && caps.maxRefsPerRequest
+        ? "more than " + caps.maxRefsPerRequest + " images in one send (split the batch)"
+        : "too many images in one send (split the batch)",
+    );
+  }
   if (reasons.has("not-found")) {
     parts.push("an image is no longer available");
   }
@@ -1292,7 +1299,11 @@ window.addEventListener("message", (event) => {
     submitLayoutWarnings(msg.layout_warnings).catch(() => {});
   }
   if (msg.type === "lavish:uploadAttachment") uploadAttachment(msg);
-  if (msg.type === "lavish:removeAttachment") removeAttachment(msg.id);
+  // F6: the chrome deliberately does NOT honor a delete request from the sandboxed
+  // (untrusted) artifact iframe. An artifact could learn its content id from an upload
+  // result and ask to delete a file a ready-but-unqueued chip in ANOTHER tab still
+  // holds - a cross-tab data-loss confused-deputy. All reclamation is left to the
+  // reference-aware server sweeper (the documented backstop).
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
   if (msg.type === "lavish:endSession") endSession();
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
@@ -1362,17 +1373,6 @@ async function uploadAttachment(message) {
     reply({ ok: true, id: (data.attachment && data.attachment.id) || "" });
   } catch (error) {
     reply({ ok: false, error: error instanceof Error ? error.message : String(error) });
-  }
-}
-
-async function removeAttachment(id) {
-  const attachmentId = String(id || "");
-  if (!attachmentId) return;
-  try {
-    // Best effort: an orphaned upload is reaped by the reference-aware server sweeper.
-    await fetch("/api/" + key + "/attachments/" + encodeURIComponent(attachmentId), { method: "DELETE" });
-  } catch {
-    // Ignore - a failed delete just leaves the file for the sweeper.
   }
 }
 

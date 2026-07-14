@@ -121,16 +121,20 @@ export class SessionStore {
       0,
     );
     if (totalAttachmentRefs > requestRefCap) {
+      // A DISTINCT reason from the per-prompt "too-many" so the chrome tells the user
+      // the WHOLE batch is too large (split it), not that one annotation has too many
+      // images.
       const rejected = [];
       for (const prompt of normalizedPrompts) {
         for (const ref of prompt.attachments || [])
-          rejected.push({ id: ref.id, name: ref.name || "", reason: "too-many" });
+          rejected.push({ id: ref.id, name: ref.name || "", reason: "request-too-many" });
       }
       return {
         rejected,
         caps: {
           maxPerPrompt: Number.isFinite(options.maxPerPrompt) ? options.maxPerPrompt : null,
           maxPromptBytes: Number.isFinite(options.maxPromptBytes) ? options.maxPromptBytes : null,
+          maxRefsPerRequest: Number.isFinite(requestRefCap) ? requestRefCap : null,
         },
       };
     }

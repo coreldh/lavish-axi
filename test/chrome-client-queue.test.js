@@ -1474,7 +1474,7 @@ test("chrome reports an upload failure back to the card", async () => {
   assert.equal(result.error, "unsupported image type");
 });
 
-test("chrome deletes a removed attachment through the server", async () => {
+test("chrome ignores a delete request from the untrusted artifact iframe (F6, confused-deputy)", async () => {
   const requests = [];
   const chrome = await createChromeHarness({
     fetchImpl: async (url, options) => {
@@ -1483,10 +1483,16 @@ test("chrome deletes a removed attachment through the server", async () => {
     },
   });
   const id = "a".repeat(64) + ".png";
+  // The sandboxed artifact could learn this id from an upload result and try to delete
+  // a file another tab still holds. The chrome must NOT act on it - reclamation is the
+  // reference-aware sweeper's job.
   chrome.sendFrameMessage({ type: "lavish:removeAttachment", id });
   await flushPromises();
-  assert.equal(requests[0].url, "/api/abc/attachments/" + id);
-  assert.equal(requests[0].options.method, "DELETE");
+  assert.equal(
+    requests.some((r) => r.options && r.options.method === "DELETE"),
+    false,
+    "no DELETE is issued for an iframe-originated remove request",
+  );
 });
 
 test("chrome renders queued-prompt attachment thumbnails from the server endpoint", async () => {

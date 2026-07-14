@@ -1070,9 +1070,11 @@ test("queuePrompts bounds total attachment resolution across the whole request, 
     );
     assert.ok(result.rejected, "the flooded request is rejected");
     assert.equal(
-      result.rejected.every((r) => r.reason === "too-many"),
+      result.rejected.every((r) => r.reason === "request-too-many"),
       true,
+      "a request-level flood uses a distinct reason from a per-prompt breach",
     );
+    assert.equal(result.caps.maxRefsPerRequest, 64, "the request-level cap is reported");
     assert.equal(stats, 0, "no resolver stat ran for the over-request-cap flood");
     assert.equal((await store.takeFeedback(session.key)).status, "waiting", "nothing persisted");
 
