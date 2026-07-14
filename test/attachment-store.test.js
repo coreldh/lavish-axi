@@ -370,3 +370,24 @@ test("sweepAttachments prunes empty session dirs and tolerates a missing root", 
     });
   });
 });
+
+test("sweepAttachments counts an un-deletable expired file toward the disk cap (undercount fix)", async () => {
+  await withTempDir(async (dir) => {
+    const KEY_B = "fedcba9876543210";
+    const a = await writeAttachment(dir, KEY, PNG_2x1, {});
+    const b = await writeAttachment(dir, KEY_B, PNG_2x1, {});
+    // A is aged past the TTL; B stays fresh.
+    const old = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    await utimes(a.path, new Date(old), new Date(old));
+    // A's unlink fails; every other remove succeeds. (The fake remove doesn't touch
+    // disk - the sweep result is what we assert.)
+    const remove = async (p) => p !== a.path;
+    const cap = a.bytes + b.bytes - 1;
+    const result = await sweepAttachments(dir, { ttlMs: 24 * 60 * 60 * 1000, maxDiskBytes: cap, remove });
+    // A's un-deletable bytes still count, keeping the total over the cap, so the fresh
+    // unreferenced B is evicted. If A were dropped from the accounting, the total would
+    // look under the cap and B would wrongly survive.
+    assert.equal(result.deleted, 1, "B is evicted because A's un-deletable bytes keep total over cap");
+    assert.equal(result.freedBytes, b.bytes);
+  });
+});

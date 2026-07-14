@@ -405,7 +405,13 @@ export async function listAttachments(stateDir) {
 // cap is set, oldest UNREFERENCED files are then evicted until under the cap;
 // referenced files are never evicted even if that leaves the total over budget.
 export async function sweepAttachments(stateDir, options = {}) {
-  const { ttlMs = DEFAULT_ATTACHMENT_TTL_MS, maxDiskBytes = null, referenced = new Set(), now = Date.now() } = options;
+  const {
+    ttlMs = DEFAULT_ATTACHMENT_TTL_MS,
+    maxDiskBytes = null,
+    referenced = new Set(),
+    now = Date.now(),
+    remove = removeFile,
+  } = options;
   const files = await listAttachments(stateDir);
   let deleted = 0;
   let freedBytes = 0;
@@ -414,9 +420,14 @@ export async function sweepAttachments(stateDir, options = {}) {
     const isReferenced = referenced.has(`${file.key}/${file.id}`);
     const expired = ttlMs != null && now - file.mtimeMs > ttlMs;
     if (!isReferenced && expired) {
-      if (await removeFile(file.path)) {
+      if (await remove(file.path)) {
         deleted += 1;
         freedBytes += file.bytes;
+      } else {
+        // The file is expired but the unlink failed - it is still on disk, so keep it
+        // in the accounting as an unreferenced survivor rather than dropping it. Else
+        // its bytes vanish from the disk-cap total and storage can stay over quota.
+        survivors.push({ ...file, referenced: false });
       }
     } else {
       survivors.push({ ...file, referenced: isReferenced });
@@ -427,7 +438,7 @@ export async function sweepAttachments(stateDir, options = {}) {
     const evictable = survivors.filter((file) => !file.referenced).sort((a, b) => a.mtimeMs - b.mtimeMs);
     for (const file of evictable) {
       if (total <= maxDiskBytes) break;
-      if (await removeFile(file.path)) {
+      if (await remove(file.path)) {
         deleted += 1;
         freedBytes += file.bytes;
         total -= file.bytes;
