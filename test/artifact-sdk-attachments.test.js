@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createAttachmentsController, resolveAttachmentMaxCount } from "../src/artifact-sdk.js";
+import {
+  attachmentQueueBlockReason,
+  buildAttachmentControllerDeps,
+  clampCardPosition,
+  createAttachmentsController,
+  resolveAttachmentMaxCount,
+} from "../src/artifact-sdk.js";
 import { createSdkJs } from "../src/server.js";
 
 // The annotation card lives inside the sandboxed artifact iframe, so its full
@@ -71,6 +77,76 @@ test("the attachment card enforces the CONFIGURED count cap, not a hardcoded val
   assert.match(one.notices[0], /up to 1 image\./);
 });
 
+test("buildAttachmentControllerDeps derives the card cap from the SERVER option and stamps the nonce (W1 + F1)", () => {
+  const sent = [];
+  const io = {
+    acceptedMime: { "image/png": true },
+    renderChip: () => "",
+    documentNonce: "doc-9",
+    nextLocalId: () => "x",
+    sendToChrome: (message) => sent.push(message),
+    createObjectUrl: () => "blob:x",
+    revokeObjectUrl: () => {},
+  };
+  // The production wiring derives maxCount from the server option here - a hardcoded
+  // revert would make these fail even though the controller test injects its own cap.
+  assert.equal(buildAttachmentControllerDeps({ maxAttachmentCount: 7 }, io).maxCount, 7);
+  assert.equal(buildAttachmentControllerDeps({}, io).maxCount, 4);
+  assert.equal(buildAttachmentControllerDeps({ maxAttachmentCount: 0 }, io).maxCount, 4);
+
+  // Every outgoing message is stamped with the document nonce (F1).
+  buildAttachmentControllerDeps({}, io).postMessage({ type: "lavish:uploadAttachment", localId: "z" });
+  assert.deepEqual(sent.at(-1), { type: "lavish:uploadAttachment", localId: "z", documentNonce: "doc-9" });
+  // The acceptedMime + object-url deps are passed straight through.
+  const deps = buildAttachmentControllerDeps({}, io);
+  assert.equal(deps.acceptedMime, io.acceptedMime);
+  assert.equal(deps.createObjectUrl, io.createObjectUrl);
+});
+
+test("attachmentQueueBlockReason blocks the queue on pending OR errored chips, using the real controller (R2.4 + W2)", () => {
+  const clean = makeController();
+  assert.equal(attachmentQueueBlockReason(clean.controller), null);
+
+  const errored = makeController();
+  errored.controller.rejectUnsupported(["a.pdf"]);
+  assert.equal(attachmentQueueBlockReason(errored.controller), "errors");
+
+  // An in-flight upload (fake arrayBuffer never resolves to ready) stays "uploading".
+  const pending = makeController();
+  pending.controller.addFiles([pngFile()]);
+  assert.equal(attachmentQueueBlockReason(pending.controller), "pending");
+});
+
+test("clampCardPosition keeps the annotation card inside the viewport (W3)", () => {
+  // A comfortably-fitting card just anchors below-left of the target.
+  assert.deepEqual(
+    clampCardPosition({ left: 100, bottom: 40 }, { width: 320, height: 200 }, { width: 1440, height: 900 }),
+    { left: 100, top: 48 },
+  );
+  // A card whose bottom would fall off-screen (e.g. after chip rows grow it) is pulled
+  // up so its full height - Queue/Cancel included - stays inside the viewport (W3).
+  const grown = clampCardPosition(
+    { left: 100, bottom: 800 },
+    { width: 320, height: 300 },
+    { width: 1440, height: 900 },
+  );
+  assert.equal(grown.top, 900 - 300 - 12);
+  assert.ok(grown.top + 300 <= 900, "the whole card fits within the viewport height");
+  // A card near the right/top edges is pulled in and floored at the 12px margin.
+  assert.equal(
+    clampCardPosition({ left: 1400, bottom: 40 }, { width: 320, height: 200 }, { width: 1440, height: 900 }).left,
+    1440 - 320 - 12,
+  );
+  assert.equal(
+    clampCardPosition({ left: 4, bottom: -20 }, { width: 320, height: 200 }, { width: 1440, height: 900 }).top,
+    12,
+  );
+  assert.equal(
+    clampCardPosition({ left: 4, bottom: 40 }, { width: 320, height: 200 }, { width: 1440, height: 900 }).left,
+    12,
+  );
+});
+
 test("hasErrors flags failed and rejected chips that collectReady would otherwise drop (W2)", () => {
   const { controller } = makeController();
   assert.equal(controller.hasErrors(), false);
@@ -125,8 +201,9 @@ test("upload results are bound to the document by a nonce so a stale reload can'
   assert.match(sdk, /const documentNonce =/);
   // Stamped on every outgoing controller message...
   assert.match(sdk, /\.\.\.message, documentNonce/);
-  // ...and stale results (from a pre-reload document) are dropped on the way in.
-  assert.match(sdk, /msg\.documentNonce && msg\.documentNonce !== documentNonce/);
+  // ...and only an EXACT nonce match is honored, so a missing/empty or stale nonce is
+  // rejected (a truthiness check would let a nonce-less crafted result through).
+  assert.match(sdk, /if \(msg\.documentNonce !== documentNonce\) return;/);
 });
 
 test("a mixed drop partial-accepts images AND reports unsupported files (F4)", () => {
@@ -163,9 +240,12 @@ test("the SDK bundle renders chips with a thumbnail, name, status, and a titled 
   assert.match(sdk, /lavish-attachment-remove/);
 });
 
-test("the SDK bundle gates queuing until in-flight uploads settle and errors clear (R2.4 + W2)", () => {
-  assert.match(sdk, /if \(attachments\.hasPending\(\)\)/);
+test("the SDK bundle gates queuing via attachmentQueueBlockReason and only sends when queued (R2.4 + W2)", () => {
+  assert.match(sdk, /const block = attachmentQueueBlockReason\(attachments\)/);
+  assert.match(sdk, /block === "pending"/);
   assert.match(sdk, /Waiting for an image to finish uploading/);
-  assert.match(sdk, /if \(attachments\.hasErrors\(\)\)/);
+  assert.match(sdk, /block === "errors"/);
+  // W3 wiring: the card passes positionCard as onLayout so chip rows re-clamp it.
+  assert.match(sdk, /onLayout: positionCard/);
   assert.match(sdk, /const queued = tryQueue\(\);\s*\n?\s*[\s\S]*?if \(queued && sendNow\) sendQueuedPrompts\(\)/);
 });

@@ -1305,8 +1305,11 @@ async function uploadAttachment(message) {
   const localId = String(message.localId || "");
   if (!localId) return;
   // Echo the sending document's nonce on every result so the SDK can drop a result
-  // that arrives after a live-reload has replaced the document (F1).
+  // that arrives after a live-reload has replaced the document (F1). A real SDK upload
+  // always stamps a nonce, so a nonce-less upload message is not from the live document
+  // - reject it rather than echo an empty nonce a crafted result could then match.
   const documentNonce = String(message.documentNonce || "");
+  if (!documentNonce) return;
   const reply = (fields) => postToFrame({ type: "lavish:attachmentResult", localId, documentNonce, ...fields });
   const bytes = message.bytes;
   let size;

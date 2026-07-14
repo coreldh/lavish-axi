@@ -207,6 +207,52 @@ export function resolveAttachmentMaxCount(options = {}) {
   return Number.isFinite(configured) && configured > 0 ? configured : 4;
 }
 
+// Build the createAttachmentsController deps that createArtifactSdk wires. Exported
+// (and used by the real card) so the two wiring points a card can't easily prove on
+// its own are unit-tested: the count cap is derived from the SERVER option here (a
+// hardcoded revert fails the test), and every outgoing message is stamped with the
+// document nonce (F1) here. Card-specific deps (notify, onLayout) are layered on top.
+/**
+ * @param {{ maxAttachmentCount?: number }} options
+ * @param {{ acceptedMime: any, renderChip: any, documentNonce: string, nextLocalId: () => string,
+ *   sendToChrome: (message: any) => void, createObjectUrl: (file: any) => string,
+ *   revokeObjectUrl: (url: string) => void }} io
+ */
+export function buildAttachmentControllerDeps(options, io) {
+  return {
+    maxCount: resolveAttachmentMaxCount(options),
+    acceptedMime: io.acceptedMime,
+    renderChip: io.renderChip,
+    nextLocalId: io.nextLocalId,
+    postMessage: (message) => io.sendToChrome({ ...message, documentNonce: io.documentNonce }),
+    createObjectUrl: io.createObjectUrl,
+    revokeObjectUrl: io.revokeObjectUrl,
+  };
+}
+
+// The single decision the card's queue path defers to: block queuing while any chip is
+// still uploading (R2.4) OR in an error state (W2), so neither is silently dropped by
+// collectReady/closeCard. Exported so removing either guard is caught behaviorally.
+export function attachmentQueueBlockReason(controller) {
+  if (controller.hasPending()) return "pending";
+  if (controller.hasErrors()) return "errors";
+  return null;
+}
+
+// Clamp the annotation card fully inside the viewport (W3). Pure geometry so the
+// re-clamp math is unit-tested; positionCard applies it with the live card/anchor/
+// window sizes after every attachment-row render.
+/**
+ * @param {{ left: number, bottom: number }} anchor
+ * @param {{ width: number, height: number }} cardSize
+ * @param {{ width: number, height: number }} viewport
+ */
+export function clampCardPosition(anchor, cardSize, viewport) {
+  const left = Math.min(Math.max(12, anchor.left), viewport.width - cardSize.width - 12);
+  const top = Math.min(Math.max(12, anchor.bottom + 8), viewport.height - cardSize.height - 12);
+  return { left, top };
+}
+
 // The per-card image attachment controller, extracted from createArtifactSdk with
 // every browser dependency injected so it is unit-testable without a live DOM AND
 // serializable into the sandboxed SDK bundle (createSdkJs). createArtifactSdk wires
@@ -423,10 +469,8 @@ export function createArtifactSdk(
   // server re-validates size and enforces the per-prompt count/byte caps at queue
   // time (see attachment-store.js), rejecting the entire send batch on a mismatch
   // so the chrome can preserve the queue and surface the correction to the user.
-  // The count cap mirrors the server's LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT, passed
-  // in via createSdkJs (W1); the literal 4 is only the fallback when the SDK runs
-  // without that wiring (e.g. a unit-test call to createArtifactSdk).
-  const ATTACHMENT_MAX_COUNT = resolveAttachmentMaxCount(options);
+  // The card count cap is derived from the server option by buildAttachmentControllerDeps
+  // (W1); the literal 4 fallback lives in resolveAttachmentMaxCount.
   const ATTACHMENT_ACCEPTED_MIME = { "image/png": true, "image/jpeg": true, "image/webp": true };
   let attachmentLocalCounter = 0;
   // A nonce unique to THIS document load. Upload messages carry it and the chrome
@@ -489,15 +533,15 @@ export function createArtifactSdk(
   // real browser dependencies here. `attachmentChipHtml` is passed in as `renderChip`.
   function makeAttachmentsController(listEl, config = {}) {
     return createAttachmentsController(listEl, {
-      maxCount: ATTACHMENT_MAX_COUNT,
-      acceptedMime: ATTACHMENT_ACCEPTED_MIME,
-      renderChip: attachmentChipHtml,
-      nextLocalId: () => "att-" + ++attachmentLocalCounter,
-      // Stamp every controller->chrome message with this document's nonce so the
-      // chrome can echo it and the result handler can drop stale cross-reload results (F1).
-      postMessage: (message) => parent.postMessage({ ...message, documentNonce }, "*"),
-      createObjectUrl: (file) => URL.createObjectURL(file),
-      revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+      ...buildAttachmentControllerDeps(options, {
+        acceptedMime: ATTACHMENT_ACCEPTED_MIME,
+        renderChip: attachmentChipHtml,
+        documentNonce,
+        nextLocalId: () => "att-" + ++attachmentLocalCounter,
+        sendToChrome: (message) => parent.postMessage(message, "*"),
+        createObjectUrl: (file) => URL.createObjectURL(file),
+        revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+      }),
       ...config,
     });
   }
@@ -1413,8 +1457,11 @@ export function createArtifactSdk(
     // its Queue/Cancel buttons off the bottom of the frame (W3). The anchor `rect` is
     // captured once; only the card's own measured size varies between calls.
     function positionCard() {
-      const left = Math.min(Math.max(12, rect.left), window.innerWidth - card.offsetWidth - 12);
-      const top = Math.min(Math.max(12, rect.bottom + 8), window.innerHeight - card.offsetHeight - 12);
+      const { left, top } = clampCardPosition(
+        rect,
+        { width: card.offsetWidth, height: card.offsetHeight },
+        { width: window.innerWidth, height: window.innerHeight },
+      );
       card.style.left = left + "px";
       card.style.top = top + "px";
     }
@@ -1475,11 +1522,12 @@ export function createArtifactSdk(
     // queuing would discard the failed image and its retry/remove UI - keep the card
     // open so the user can retry or explicitly remove it first.
     function tryQueue() {
-      if (attachments.hasPending()) {
+      const block = attachmentQueueBlockReason(attachments);
+      if (block === "pending") {
         notify("Waiting for an image to finish uploading…");
         return false;
       }
-      if (attachments.hasErrors()) {
+      if (block === "errors") {
         notify("An image couldn't be attached. Retry or remove it before queuing.");
         return false;
       }
@@ -1580,10 +1628,11 @@ export function createArtifactSdk(
     const msg = event.data || {};
     if (msg.type === "lavish:setAnnotationMode") setAnnotationMode(msg.enabled);
     if (msg.type === "lavish:attachmentResult") {
-      // F1: ignore a result whose nonce is from a different document load - it belongs
-      // to an upload started before a live-reload, and the localId counter has since
-      // reset, so honoring it could mark a fresh card's chip with the wrong id.
-      if (msg.documentNonce && msg.documentNonce !== documentNonce) return;
+      // F1: only honor a result stamped with THIS document's exact nonce. A truthiness
+      // check would let a missing/empty nonce through, so a crafted result with a
+      // guessed localId could mark the current card; require exact equality, which also
+      // rejects a result from a pre-live-reload document (whose localId counter reset).
+      if (msg.documentNonce !== documentNonce) return;
       activeAttachments?.handleResult(msg.localId, msg.ok, msg.id, msg.error);
     }
     if (msg.type === "lavish:requestSnapshot") {

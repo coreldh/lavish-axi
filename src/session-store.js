@@ -6,6 +6,13 @@ import { AsyncMutex } from "./async-mutex.js";
 import { normalizeMermaidNodeTarget } from "./mermaid-node.js";
 import { EXCALIDRAW_SCENE_TARGET_TYPE, normalizeExcalidrawSceneTarget } from "./whiteboard-core.js";
 
+// A whole /prompts request may resolve at most `maxPerPrompt * this` attachment refs
+// across all its prompts before it is rejected as a flood (see queuePrompts). With the
+// default per-prompt cap of 4 that is 64 total refs - far above any real batch send,
+// but a hard ceiling on how many sequential disk stats one request holds the store
+// mutex through.
+const ATTACHMENT_REQUEST_REF_FACTOR = 16;
+
 export class SessionStore {
   constructor(file) {
     this.file = file;
@@ -100,6 +107,33 @@ export class SessionStore {
     const shouldEndSession = Boolean(payload.endSession || payload.end_session);
     const alreadyEnded = session.status === "ended";
     const normalizedPrompts = prompts.map(normalizePrompt);
+    // Bound total resolver work for the WHOLE request before touching disk. The
+    // per-prompt cap (resolvePromptAttachments) stops one over-cap prompt, but a
+    // <=2 MB POST can carry thousands of prompts each with a few valid-looking unknown
+    // ids; resolving them all would hold the shared store mutex through thousands of
+    // sequential filesystem stats and stall every poll/state write. Reject the batch
+    // up front when the total ref count exceeds a request-level bound.
+    const requestRefCap = Number.isFinite(options.maxPerPrompt)
+      ? options.maxPerPrompt * ATTACHMENT_REQUEST_REF_FACTOR
+      : Infinity;
+    const totalAttachmentRefs = normalizedPrompts.reduce(
+      (sum, prompt) => sum + (Array.isArray(prompt.attachments) ? prompt.attachments.length : 0),
+      0,
+    );
+    if (totalAttachmentRefs > requestRefCap) {
+      const rejected = [];
+      for (const prompt of normalizedPrompts) {
+        for (const ref of prompt.attachments || [])
+          rejected.push({ id: ref.id, name: ref.name || "", reason: "too-many" });
+      }
+      return {
+        rejected,
+        caps: {
+          maxPerPrompt: Number.isFinite(options.maxPerPrompt) ? options.maxPerPrompt : null,
+          maxPromptBytes: Number.isFinite(options.maxPromptBytes) ? options.maxPromptBytes : null,
+        },
+      };
+    }
     // Resolve every attachment BEFORE mutating anything. If any prompt's images
     // can't be fully honored - a malformed ref, an unknown id, or over the
     // per-prompt count/byte cap - reject the WHOLE batch and persist nothing (C4).

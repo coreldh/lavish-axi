@@ -1035,3 +1035,58 @@ test("queuePrompts enforces the per-prompt count cap by ref count before any fil
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("queuePrompts bounds total attachment resolution across the whole request, not just per prompt (DoS)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hi</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+
+    // Each prompt is within the per-prompt cap of 4, but thousands of such prompts
+    // would otherwise drive thousands of sequential resolver stats under the store
+    // mutex. The request-level bound (maxPerPrompt * 16 = 64 refs) rejects the whole
+    // batch up front without calling the resolver.
+    let stats = 0;
+    const resolveAttachment = async () => {
+      stats += 1;
+      return null;
+    };
+    const prompts = Array.from({ length: 30 }, (_, p) => ({
+      uid: String(p),
+      prompt: "x",
+      selector: "",
+      tag: "h1",
+      text: "",
+      attachments: Array.from({ length: 4 }, (_, n) => ({ id: "p" + p + "-id" + n })),
+    }));
+    const result = await store.queuePrompts(
+      session.key,
+      { prompts },
+      { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
+    );
+    assert.ok(result.rejected, "the flooded request is rejected");
+    assert.equal(
+      result.rejected.every((r) => r.reason === "too-many"),
+      true,
+    );
+    assert.equal(stats, 0, "no resolver stat ran for the over-request-cap flood");
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting", "nothing persisted");
+
+    // A request comfortably under the request cap still resolves normally.
+    const okId = "a".repeat(64) + ".png";
+    const okResolver = async (_key, id) =>
+      id === okId ? { id: okId, type: "image", path: "/x/a.png", mime: "image/png", bytes: 5 } : null;
+    const ok = await store.queuePrompts(
+      session.key,
+      { prompts: [{ uid: "1", prompt: "fine", selector: "", tag: "h1", text: "", attachments: [{ id: okId }] }] },
+      { resolveAttachment: okResolver, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
+    );
+    assert.ok(ok && !ok.rejected, "a small request is accepted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

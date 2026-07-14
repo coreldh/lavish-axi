@@ -343,6 +343,7 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
 
   chrome.sendFrameMessage({
     type: "lavish:uploadAttachment",
+    documentNonce: "test-nonce",
     localId: "invalid",
     mime: "image/png",
     bytes: { byteLength: 16 },
@@ -358,6 +359,7 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
   // A single oversized (>256 MiB session quota) upload is refused BEFORE the network.
   chrome.sendFrameMessage({
     type: "lavish:uploadAttachment",
+    documentNonce: "test-nonce",
     localId: "big",
     mime: "image/png",
     bytes: new ArrayBuffer(300 * 1024 * 1024),
@@ -372,6 +374,7 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
   for (let i = 0; i < 30; i += 1) {
     chrome.sendFrameMessage({
       type: "lavish:uploadAttachment",
+      documentNonce: "test-nonce",
       localId: "ok-" + i,
       mime: "image/png",
       bytes: new ArrayBuffer(16),
@@ -382,6 +385,7 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
 
   chrome.sendFrameMessage({
     type: "lavish:uploadAttachment",
+    documentNonce: "test-nonce",
     localId: "throttled",
     mime: "image/png",
     bytes: new ArrayBuffer(16),
@@ -391,6 +395,47 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
   const throttled = chrome.postedToFrame.find((m) => m.type === "lavish:attachmentResult" && m.localId === "throttled");
   assert.equal(throttled.ok, false);
   assert.match(throttled.error, /Too many uploads/);
+});
+
+test("chrome ignores a nonce-less upload message and echoes the document nonce on results (F1)", async () => {
+  let fetches = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => {
+      fetches += 1;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+
+  // A real SDK upload always carries a nonce; a nonce-less message is not from the
+  // live document and must be dropped without a reply (so a crafted result can't then
+  // match an empty nonce).
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    localId: "no-nonce",
+    mime: "image/png",
+    bytes: new ArrayBuffer(16),
+  });
+  await flushPromises();
+  assert.equal(fetches, 0, "a nonce-less upload never hits the network");
+  assert.equal(
+    chrome.postedToFrame.some((m) => m.type === "lavish:attachmentResult" && m.localId === "no-nonce"),
+    false,
+    "no result is posted for a nonce-less upload",
+  );
+
+  // A properly stamped upload succeeds and its result echoes the same nonce.
+  chrome.sendFrameMessage({
+    type: "lavish:uploadAttachment",
+    documentNonce: "doc-123",
+    localId: "with-nonce",
+    mime: "image/png",
+    bytes: new ArrayBuffer(16),
+  });
+  await flushPromises();
+  const result = chrome.postedToFrame.find((m) => m.type === "lavish:attachmentResult" && m.localId === "with-nonce");
+  assert.ok(result, "a nonce-stamped upload gets a result");
+  assert.equal(result.ok, true);
+  assert.equal(result.documentNonce, "doc-123", "the result echoes the sending document's nonce");
 });
 
 test("chrome client posts layout warnings from the artifact iframe", async () => {
@@ -1390,6 +1435,7 @@ test("chrome uploads captured attachment bytes and reports the server id to the 
   const bytes = new Uint8Array([1, 2, 3]).buffer;
   chrome.sendFrameMessage({
     type: "lavish:uploadAttachment",
+    documentNonce: "test-nonce",
     localId: "att-1",
     name: "mock.png",
     mime: "image/png",
@@ -1414,6 +1460,7 @@ test("chrome reports an upload failure back to the card", async () => {
   });
   chrome.sendFrameMessage({
     type: "lavish:uploadAttachment",
+    documentNonce: "test-nonce",
     localId: "att-9",
     name: "bad.svg",
     mime: "image/svg+xml",
@@ -1468,6 +1515,7 @@ test("chrome rejects an over-cap image before it hits the network", async () => 
   const bytes = new Uint8Array([1, 2, 3, 4, 5, 6]).buffer; // 6 bytes > 4-byte cap
   chrome.sendFrameMessage({
     type: "lavish:uploadAttachment",
+    documentNonce: "test-nonce",
     localId: "att-x",
     name: "big.png",
     mime: "image/png",

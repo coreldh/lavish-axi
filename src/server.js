@@ -10,6 +10,9 @@ import chokidar from "chokidar";
 import express from "express";
 
 import {
+  attachmentQueueBlockReason,
+  buildAttachmentControllerDeps,
+  clampCardPosition,
   classifyHorizontalOverflow,
   classifyVerticalOverflow,
   createArtifactSdk,
@@ -1425,6 +1428,9 @@ const resolveVisibleSpillCandidates=${resolveVisibleSpillCandidates.toString()};
 const classifyHorizontalOverflow=${classifyHorizontalOverflow.toString()};
 const classifyVerticalOverflow=${classifyVerticalOverflow.toString()};
 const resolveAttachmentMaxCount=${resolveAttachmentMaxCount.toString()};
+const buildAttachmentControllerDeps=${buildAttachmentControllerDeps.toString()};
+const attachmentQueueBlockReason=${attachmentQueueBlockReason.toString()};
+const clampCardPosition=${clampCardPosition.toString()};
 const createAttachmentsController=${createAttachmentsController.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
