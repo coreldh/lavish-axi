@@ -77,6 +77,19 @@ test("the attachment card enforces the CONFIGURED count cap, not a hardcoded val
   assert.match(one.notices[0], /up to 1 image\./);
 });
 
+test("the count cap counts only images, not UNSUPPORTED_TYPE placeholders (W1 + F4)", () => {
+  const state = makeController({ maxCount: 1 });
+  // A rejected non-image adds an error placeholder chip (file: null).
+  state.controller.rejectUnsupported(["doc.pdf"]);
+  // A valid image must still be accepted - the placeholder is a notice, not an
+  // attachment, so it does not consume the single image slot.
+  assert.equal(state.controller.addFiles([pngFile("a.png")]), true, "the image is accepted alongside a reject chip");
+  assert.equal(state.notices.length, 0, "the unsupported placeholder did not consume the image slot");
+  // But a SECOND image is genuinely over the cap of 1.
+  state.controller.addFiles([pngFile("b.png")]);
+  assert.match(state.notices.at(-1), /up to 1 image/);
+});
+
 test("buildAttachmentControllerDeps derives the card cap from the SERVER option and stamps the nonce (W1 + F1)", () => {
   const sent = [];
   const io = {

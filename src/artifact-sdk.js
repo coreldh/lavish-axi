@@ -332,8 +332,12 @@ export function createAttachmentsController(
     if (!file || !acceptedMime[file.type]) return false;
     // Over the per-prompt count cap (W1): reject THIS selection and tell the user
     // right away instead of silently swallowing it. `maxCount` is the server's
-    // configured limit threaded in - a hardcoded revert would fail the W1 test.
-    if (items.length >= maxCount) {
+    // configured limit threaded in - a hardcoded revert would fail the W1 test. Count
+    // only real image entries: UNSUPPORTED_TYPE placeholders (file: null, from
+    // rejectUnsupported) are rejection notices, not attachments, so they must not
+    // consume an image slot or block a later image / partial-accept (F4).
+    const imageCount = items.reduce((count, item) => count + (item.file ? 1 : 0), 0);
+    if (imageCount >= maxCount) {
       notify("You can attach up to " + maxCount + " image" + (maxCount === 1 ? "" : "s") + ".");
       return false;
     }
