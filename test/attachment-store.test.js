@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -243,6 +243,23 @@ test("resolveAttachmentConfig reads LAVISH_AXI_* limits with sane fallbacks", ()
   assert.equal(resolveAttachmentConfig({ LAVISH_AXI_MAX_ATTACHMENT_BYTES: "-1" }).maxBytes, 10 * 1024 * 1024);
   assert.equal(resolveAttachmentConfig({ LAVISH_AXI_ATTACHMENT_TTL_MS: "0" }).ttlMs, null);
   assert.equal(resolveAttachmentConfig({ LAVISH_AXI_MAX_ATTACHMENT_DISK_MB: "-5" }).maxDiskBytes, 512 * 1024 * 1024);
+
+  // A fractional value < 1 must FALL BACK to the default, not floor to 0 - a zero
+  // server cap would break the client/server count alignment the SDK relies on (W1).
+  assert.equal(resolveAttachmentConfig({ LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT: "0.5" }).maxPerPrompt, 4);
+  assert.equal(resolveAttachmentConfig({ LAVISH_AXI_MAX_ATTACHMENTS_PER_PROMPT: "2.9" }).maxPerPrompt, 2);
+});
+
+test("writeAttachment stores images owner-only (0600 files, 0700 dir)", async () => {
+  if (process.platform === "win32") return; // POSIX mode bits only
+  await withTempDir(async (dir) => {
+    const { path: file } = await writeAttachment(dir, KEY, PNG_2x1, {});
+    const fileMode = (await stat(file)).mode & 0o777;
+    const dirMode = (await stat(attachmentsDir(dir, KEY))).mode & 0o777;
+    assert.equal(fileMode, 0o600, "the image file is not group/world-readable");
+    assert.equal((await stat(`${file}.meta`)).mode & 0o777, 0o600, "the sidecar is owner-only too");
+    assert.equal(dirMode, 0o700, "the attachment directory is owner-only");
+  });
 });
 
 test("writeAttachment leaves no stray temp files behind", async () => {

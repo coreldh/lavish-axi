@@ -66,8 +66,11 @@ export function resolveAttachmentConfig(env = process.env) {
 function positiveIntEnv(raw, fallback) {
   const trimmed = String(raw ?? "").trim();
   if (trimmed === "") return fallback;
-  const value = Number(trimmed);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+  // Floor BEFORE the range check: a fractional value like `0.5` must fall back to the
+  // default, not floor to 0 (which would set the server cap to zero while the SDK's
+  // resolver still falls back to 4, breaking client/server cap alignment).
+  const value = Math.floor(Number(trimmed));
+  return Number.isFinite(value) && value >= 1 ? value : fallback;
 }
 
 function durationEnv(raw, fallback) {
@@ -240,7 +243,11 @@ async function readSidecarDims(file) {
 async function writeFileAtomically(file, content) {
   const temporary = `${file}.${process.pid}.${++temporaryFileId}.tmp`;
   try {
-    await writeFile(temporary, content);
+    // Owner-only (0600) so attachment images and their .meta sidecars are not
+    // world-readable under a default 0022 umask - screenshots can be sensitive. The
+    // mode is set on the fresh temp file and preserved by rename. Owner bits survive
+    // the umask, so this is 0600 regardless of the process umask.
+    await writeFile(temporary, content, { mode: 0o600 });
     await rename(temporary, file);
   } catch (error) {
     await rm(temporary, { force: true }).catch(() => {});
@@ -265,7 +272,9 @@ export async function writeAttachment(stateDir, key, buffer, { maxBytes = DEFAUL
   if (!type) throw statusError("unsupported image type (expected PNG, JPEG, or WebP)", 415);
   const id = `${crypto.createHash("sha256").update(buffer).digest("hex")}.${type.ext}`;
   const dir = attachmentsDir(stateDir, key);
-  await mkdir(dir, { recursive: true });
+  // Owner-only (0700) so another local user can't traverse in and read stored
+  // screenshots. Owner bits survive a default 0022 umask.
+  await mkdir(dir, { recursive: true, mode: 0o700 });
   const file = attachmentFile(stateDir, key, id);
   const dims = imageDimensions(buffer, type.mime);
   if (!(await pathExists(file))) {
