@@ -1417,6 +1417,15 @@ async function uploadAttachment(message) {
 async function removeAttachment(id) {
   const attachmentId = String(id || "");
   if (!attachmentId) return;
+  if (
+    queued.some(
+      (prompt) =>
+        Array.isArray(prompt.attachments) &&
+        prompt.attachments.some((attachment) => String(attachment?.id || "") === attachmentId),
+    )
+  ) {
+    return;
+  }
   try {
     // Best effort: an orphaned upload is reaped by the reference-aware server sweeper.
     await fetch("/api/" + key + "/attachments/" + encodeURIComponent(attachmentId), { method: "DELETE" });

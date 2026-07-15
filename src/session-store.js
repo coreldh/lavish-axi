@@ -323,13 +323,11 @@ function normalizePrompt(prompt) {
 // mime, size, and dimensions are never taken from the payload (see queuePrompts).
 function normalizeAttachmentRefs(value) {
   if (!Array.isArray(value)) return [];
-  const seen = new Set();
   const refs = [];
   for (const item of value) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const id = String(item.id || "");
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
+    if (!id) continue;
     const name = item.name === undefined || item.name === null ? "" : String(item.name).slice(0, 200);
     refs.push(name ? { id, name } : { id });
   }
