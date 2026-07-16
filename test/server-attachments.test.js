@@ -393,3 +393,69 @@ test("disk-cap admission: queued uploads across pages cannot exceed maxDiskBytes
     { env: { LAVISH_AXI_MAX_ATTACHMENT_DISK_MB: String(16384 / (1024 * 1024)) } },
   );
 });
+
+test("an uppercase/IDN configured link host still admits a legit same-origin write (ORIGIN-001)", async () => {
+  // The trusted origin is built from LAVISH_AXI_LINK_HOST; if it is stored verbatim
+  // while request origins are URL-normalized (lowercased), a legitimate write from the
+  // page's own (normalized) origin fails 403. The configured host must be canonicalized
+  // exactly as request origins are. The server still binds loopback; only the trusted
+  // ORIGIN differs.
+  await withSession(
+    async ({ base, key }) => {
+      const port = new URL(base).port;
+      // A real same-origin write from the normalized configured origin passes.
+      const legit = await rawRequest(base, `/api/${key}/attachments`, {
+        method: "POST",
+        headers: { "content-type": "image/png", host: `example.com:${port}`, origin: `http://example.com:${port}` },
+        body: PNG_2x1,
+      });
+      assert.equal(legit.status, 200, "the page's own (normalized) origin is admitted");
+
+      // A genuine cross-origin request is still rejected.
+      const attacker = await rawRequest(base, `/api/${key}/attachments`, {
+        method: "POST",
+        headers: { "content-type": "image/png", host: "attacker.example", origin: "http://attacker.example" },
+        body: PNG_2x1,
+      });
+      assert.equal(attacker.status, 403, "a real cross-origin write is still rejected");
+    },
+    { env: { LAVISH_AXI_LINK_HOST: "Example.COM" } },
+  );
+});
+
+test("disk-cap admission counts in-grace crash-temp/orphan bytes (ATTACH-003)", async () => {
+  // A crash leaves a temp file that is within the 5-minute grace, so the sweep does
+  // NOT reap it, and it is not a valid ID_RE attachment so it is absent from
+  // `chargedBytes`. Its allocation is nonetheless real on disk, so admission must
+  // count it - otherwise an upload fills the nominal cap on top of hidden bytes.
+  const distinct = (i) => Buffer.concat([PNG_2x1, Buffer.from([0, 0, 0, i])]);
+  await withSession(
+    async ({ base, key, artifact }) => {
+      // One image, uploaded + queued so it is referenced (charged 2 blocks = 8192).
+      const up = await uploadImage(base, key, distinct(0));
+      assert.equal(up.status, 200);
+      const { attachment } = await up.json();
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prompts: [
+            { uid: "0", prompt: "p", selector: "body", tag: "body", text: "", attachments: [{ id: attachment.id }] },
+          ],
+        }),
+      });
+
+      // Simulate crash debris: a fresh temp file (within grace) consuming one block,
+      // invisible to ID_RE and to `chargedBytes`.
+      const attachDir = path.join(path.dirname(artifact), "attachments", key);
+      await writeFile(path.join(attachDir, "b".repeat(64) + ".png.777.1.tmp"), Buffer.alloc(4096));
+
+      // Cap = 16384 (2 objects). Valid committed = 8192; the hidden temp adds 4096.
+      // A second 8192-charge upload would be 8192+8192 = 16384 <= cap if the temp is
+      // ignored (the bug), but 8192+4096+8192 = 20480 > cap once it is counted.
+      const second = await uploadImage(base, key, distinct(1));
+      assert.equal(second.status, 507, "the upload is refused once hidden crash-temp bytes are counted");
+    },
+    { env: { LAVISH_AXI_MAX_ATTACHMENT_DISK_MB: String(16384 / (1024 * 1024)) } },
+  );
+});

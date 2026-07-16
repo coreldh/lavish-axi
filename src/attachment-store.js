@@ -589,10 +589,11 @@ export async function sweepAttachments(stateDir, options = {}) {
   deleted += orphans.deleted;
   freedBytes += orphans.freedBytes;
   await pruneEmptyDirs(path.join(stateDir, "attachments"));
-  // `chargedBytes` is the committed attachment storage that survived this sweep, so
-  // admission (writeAttachment) can bound the total without a second crawl or a
-  // separate counter - the SAME derived accounting the cap uses.
-  return { deleted, freedBytes, chargedBytes: chargedTotal };
+  // `chargedBytes` is ALL committed allocation that survived this sweep - valid
+  // attachments PLUS in-grace/undeletable orphan-temp/.meta debris - so admission
+  // (writeAttachment) bounds the true on-disk total without a second crawl or a
+  // separate counter, the SAME derived accounting the cap uses (ATTACH-003).
+  return { deleted, freedBytes, chargedBytes: chargedTotal + orphans.survivingBytes };
 }
 
 // Scan each session dir for files that leak past the caps because ID_RE hides them:
@@ -604,6 +605,11 @@ async function reapOrphanFiles(stateDir, now) {
   const root = path.join(stateDir, "attachments");
   let deleted = 0;
   let freedBytes = 0;
+  // Allocated cost of orphan/temp files that REMAIN on disk (within the write grace,
+  // or whose deletion failed). These are invisible to `chargedBytes` but consume real
+  // disk, so admission must count them or an upload overshoots the cap on top of hidden
+  // crash debris (ATTACH-003).
+  let survivingBytes = 0;
   for (const dirent of await readdirSafe(root)) {
     if (!dirent.isDirectory() || !isValidAttachmentKey(dirent.name)) continue;
     const dir = path.join(root, dirent.name);
@@ -613,28 +619,29 @@ async function reapOrphanFiles(stateDir, now) {
       if (!entry.isFile()) continue;
       const filePath = path.join(dir, entry.name);
       const sidecarMatch = SIDECAR_ORPHAN_RE.exec(entry.name);
+      const isTemp = TEMP_FILE_RE.test(entry.name);
+      const isOrphanSidecar = sidecarMatch && !present.has(sidecarMatch[1]);
+      if (!isTemp && !isOrphanSidecar) continue;
       try {
-        if (TEMP_FILE_RE.test(entry.name)) {
-          const info = await stat(filePath);
-          if (now - info.mtimeMs <= ATTACHMENT_TEMP_GRACE_MS) continue; // possibly a live write
-          if (await removeFile(filePath)) {
-            deleted += 1;
-            freedBytes += info.size;
-          }
-        } else if (sidecarMatch && !present.has(sidecarMatch[1])) {
-          // An `.meta` whose image id is not in this dir: its image is gone.
-          const info = await stat(filePath);
-          if (await removeFile(filePath)) {
-            deleted += 1;
-            freedBytes += info.size;
-          }
+        const info = await stat(filePath);
+        // A temp within the grace may be a live write - keep it, but still charge it.
+        if (isTemp && now - info.mtimeMs <= ATTACHMENT_TEMP_GRACE_MS) {
+          survivingBytes += allocatedBytes(info.size);
+          continue;
+        }
+        if (await removeFile(filePath)) {
+          deleted += 1;
+          freedBytes += info.size;
+        } else {
+          // Deletion failed, so the bytes are still on disk - count them.
+          survivingBytes += allocatedBytes(info.size);
         }
       } catch {
         // Raced with a rename/delete; skip it.
       }
     }
   }
-  return { deleted, freedBytes };
+  return { deleted, freedBytes, survivingBytes };
 }
 
 async function readdirSafe(dir) {

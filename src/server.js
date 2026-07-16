@@ -1128,9 +1128,18 @@ const LOOPBACK_ORIGIN_HOSTS = ["127.0.0.1", "localhost", "[::1]"];
 // or otherwise) is never in this set, so its requests are rejected regardless of the
 // Host header it forges.
 export function serverTrustedOrigins(linkHostName, port, bindHostName = linkHostName) {
-  const origins = new Set([`http://${hostForUrl(linkHostName)}:${port}`]);
+  // Store each trusted origin canonicalized the SAME way request origins are compared
+  // (`normalizeOrigin` = `new URL(...).origin`), so an uppercase or IDN configured host
+  // (`http://Example.COM` / a Unicode host) matches the browser's normalized Origin
+  // (`http://example.com` / punycode) instead of failing every legitimate write (ORIGIN-001).
+  const origins = new Set();
+  const add = (raw) => {
+    const normalized = normalizeOrigin(raw);
+    if (normalized) origins.add(normalized);
+  };
+  add(`http://${hostForUrl(linkHostName)}:${port}`);
   if (isLoopbackHostName(bindHostName) || isLoopbackHostName(linkHostName)) {
-    for (const alias of LOOPBACK_ORIGIN_HOSTS) origins.add(`http://${alias}:${port}`);
+    for (const alias of LOOPBACK_ORIGIN_HOSTS) add(`http://${alias}:${port}`);
   }
   return origins;
 }
