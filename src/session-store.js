@@ -78,6 +78,12 @@ export class SessionStore {
       prompts: existingPrompts,
       layout_warnings: [],
       delivered_layout_warning_keys: existing.delivered_layout_warning_keys || [],
+      // Carried across a reopen on purpose: this list is what keeps a just-delivered
+      // attachment out of the sweeper's reach, and re-opening the artifact during the
+      // grace window would otherwise erase that protection while the agent is still
+      // reading the path. Every field this constructor omits is silently dropped, so
+      // any new session field must be added here too.
+      delivered_attachments: existing.delivered_attachments || [],
       dom_snapshot: existing.dom_snapshot || "",
       chat: existing.chat || [],
       updated_at: new Date().toISOString(),
@@ -220,15 +226,25 @@ export class SessionStore {
     // attachment can be reaped in the window between this response leaving and the
     // agent opening the path it was given.
     const deliveredNow = Date.now();
-    const deliveredAttachments = (session.delivered_attachments || []).filter(
-      (entry) => entry && entry.id && deliveredNow - Number(entry.at) <= ATTACHMENT_DELIVERY_GRACE_MS,
-    );
+    // Keyed by content id, so re-delivering the same image refreshes its window
+    // instead of taking another slot. Storage is content-addressed: without this,
+    // one frequently reused image would fill the bound and evict distinct
+    // attachments still inside their own grace - the exact loss this prevents.
+    const retained = new Map();
+    for (const entry of session.delivered_attachments || []) {
+      if (!entry || !entry.id) continue;
+      if (deliveredNow - Number(entry.at) > ATTACHMENT_DELIVERY_GRACE_MS) continue;
+      retained.set(entry.id, { id: entry.id, at: Number(entry.at) });
+    }
     for (const prompt of prompts) {
       for (const attachment of prompt.attachments || []) {
-        if (attachment && attachment.id) deliveredAttachments.push({ id: attachment.id, at: deliveredNow });
+        if (!attachment || !attachment.id) continue;
+        // Re-insert so the freshest delivery is also the newest for the bound below.
+        retained.delete(attachment.id);
+        retained.set(attachment.id, { id: attachment.id, at: deliveredNow });
       }
     }
-    session.delivered_attachments = deliveredAttachments.slice(-MAX_DELIVERED_ATTACHMENTS);
+    session.delivered_attachments = [...retained.values()].slice(-MAX_DELIVERED_ATTACHMENTS);
     session.prompts = [];
     session.layout_warnings = [];
     session.pending_prompts = 0;
