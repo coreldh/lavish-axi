@@ -472,7 +472,7 @@ test("sweepAttachments prunes empty session dirs and tolerates a missing root", 
     assert.equal(remaining, "ENOENT");
     // No attachments root at all: a no-op, not a throw.
     await withTempDir(async (empty) => {
-      assert.deepEqual(await sweepAttachments(empty, {}), { deleted: 0, freedBytes: 0 });
+      assert.deepEqual(await sweepAttachments(empty, {}), { deleted: 0, freedBytes: 0, chargedBytes: 0 });
     });
   });
 });

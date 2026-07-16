@@ -331,7 +331,13 @@ export async function writeAttachment(
   stateDir,
   key,
   buffer,
-  { maxBytes = DEFAULT_MAX_ATTACHMENT_BYTES, touchFile = utimes } = {},
+  {
+    maxBytes = DEFAULT_MAX_ATTACHMENT_BYTES,
+    touchFile = utimes,
+    maxDiskBytes = null,
+    ttlMs = null,
+    referenced = new Set(),
+  } = {},
 ) {
   if (!isValidAttachmentKey(key)) throw statusError(`invalid attachment session key: ${key}`, 400);
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) throw statusError("empty attachment upload", 400);
@@ -339,10 +345,33 @@ export async function writeAttachment(
   const type = detectImageType(buffer);
   if (!type) throw statusError("unsupported image type (expected PNG, JPEG, or WebP)", 415);
   const id = `${crypto.createHash("sha256").update(buffer).digest("hex")}.${type.ext}`;
-  await ensureAttachmentDir(stateDir, key);
   const file = attachmentFile(stateDir, key, id);
   const dims = imageDimensions(buffer, type.mime);
-  if (!(await pathExists(file))) {
+  const isNew = !(await pathExists(file));
+  // Admission (hard cap): a NEW object must not push committed storage past the disk
+  // cap. Dedup (existing content) adds nothing, so it always admits. The charge is the
+  // SAME allocated accounting the sweep/cap use (image block(s) + one sidecar block -
+  // a sidecar is always < one block), so there is no separate counter and no 683x
+  // undercount. `sweepAttachments` first reclaims unreferenced/expired down toward
+  // (cap - newCharge) and returns the committed `chargedBytes` that survived, so a
+  // second crawl is avoided; if the remainder plus this object still exceeds the cap
+  // (everything left is referenced), the upload is refused with 507. The caller runs
+  // this under the lifecycle lock, so the reference snapshot and the write are atomic.
+  // Runs BEFORE ensureAttachmentDir: the sweep prunes empty dirs, so creating the
+  // session dir afterwards guarantees it exists for the write below.
+  if (isNew && maxDiskBytes != null) {
+    const newCharge = allocatedBytes(buffer.length) + ATTACHMENT_ALLOC_BLOCK_BYTES;
+    const swept = await sweepAttachments(stateDir, {
+      ttlMs,
+      maxDiskBytes: Math.max(0, maxDiskBytes - newCharge),
+      referenced,
+    });
+    if (swept.chargedBytes + newCharge > maxDiskBytes) {
+      throw statusError("attachment storage is full", 507);
+    }
+  }
+  await ensureAttachmentDir(stateDir, key);
+  if (isNew) {
     await writeFileAtomically(file, buffer);
   } else {
     // B3: dedup re-upload of identical content must refresh the mtime so a new
@@ -560,7 +589,10 @@ export async function sweepAttachments(stateDir, options = {}) {
   deleted += orphans.deleted;
   freedBytes += orphans.freedBytes;
   await pruneEmptyDirs(path.join(stateDir, "attachments"));
-  return { deleted, freedBytes };
+  // `chargedBytes` is the committed attachment storage that survived this sweep, so
+  // admission (writeAttachment) can bound the total without a second crawl or a
+  // separate counter - the SAME derived accounting the cap uses.
+  return { deleted, freedBytes, chargedBytes: chargedTotal };
 }
 
 // Scan each session dir for files that leak past the caps because ID_RE hides them:

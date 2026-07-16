@@ -313,3 +313,83 @@ test("the server sweeps an expired, unreferenced attachment at startup", async (
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+import http from "node:http";
+
+// A raw HTTP request so we can set the Host header (fetch forbids it), which the
+// DNS-rebinding scenario requires: the victim's browser is on the attacker's origin
+// and therefore sends a matching, attacker-controlled Host AND Origin.
+/**
+ * @param {string} base
+ * @param {string} requestPath
+ * @param {{ method?: string, headers?: Record<string, string>, body?: Buffer | string }} [options]
+ */
+function rawRequest(base, requestPath, { method = "GET", headers = {}, body } = {}) {
+  const url = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: url.hostname, port: url.port, path: requestPath, method, headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+test("same-origin guard rejects a DNS-rebinding request whose Host equals its Origin (security)", async () => {
+  await withSession(async ({ base, key }) => {
+    // The OLD guard derived the expected origin from the request's own Host header, so
+    // an attacker page whose Host and Origin both say `attacker.example` matched itself
+    // and passed. The guard must instead reject any origin that is not the server's
+    // CONFIGURED loopback address, regardless of the Host header.
+    const spoofed = await rawRequest(base, `/api/${key}/attachments`, {
+      method: "POST",
+      headers: { "content-type": "image/png", host: "attacker.example", origin: "http://attacker.example" },
+      body: PNG_2x1,
+    });
+    assert.equal(spoofed.status, 403, "a spoofed-Host cross-origin upload is rejected");
+
+    // A legitimate loopback upload (Host and Origin are the real server address) passes.
+    const legit = await rawRequest(base, `/api/${key}/attachments`, {
+      method: "POST",
+      headers: { "content-type": "image/png", host: new URL(base).host, origin: base },
+      body: PNG_2x1,
+    });
+    assert.equal(legit.status, 200, "a legitimate loopback upload still passes");
+  });
+});
+
+test("disk-cap admission: queued uploads across pages cannot exceed maxDiskBytes (security)", async () => {
+  // Distinct tiny PNGs (append bytes past the IHDR so each hashes uniquely but still
+  // detects as PNG). Each charges 2 blocks (image + sidecar) = 8192 B; the cap fits 2.
+  const distinct = (i) => Buffer.concat([PNG_2x1, Buffer.from([0, 0, 0, i])]);
+  await withSession(
+    async ({ base, key }) => {
+      const queueRef = (id, i) =>
+        fetch(`${base}/api/${key}/prompts`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            prompts: [{ uid: String(i), prompt: "p", selector: "body", tag: "body", text: "", attachments: [{ id }] }],
+          }),
+        });
+
+      // Upload + queue two images so they are REFERENCED (a sweep can never evict them).
+      for (let i = 0; i < 2; i += 1) {
+        const up = await uploadImage(base, key, distinct(i));
+        assert.equal(up.status, 200, `image ${i} is admitted under the cap`);
+        const { attachment } = await up.json();
+        await queueRef(attachment.id, i);
+      }
+
+      // The third upload would push committed storage over the cap, and the two on disk
+      // are referenced (queued) so nothing can be evicted - admission must refuse it,
+      // so committed storage never exceeds maxDiskBytes.
+      const third = await uploadImage(base, key, distinct(2));
+      assert.equal(third.status, 507, "the over-cap upload is refused at admission");
+    },
+    { env: { LAVISH_AXI_MAX_ATTACHMENT_DISK_MB: String(16384 / (1024 * 1024)) } },
+  );
+});

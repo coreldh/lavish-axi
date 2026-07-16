@@ -216,6 +216,12 @@ export async function serve({
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
   let publicPort = port;
 
+  // Same-origin write guard, evaluated at request time so it reads the actual
+  // listening `publicPort` (which is only known after listen for port: 0). The
+  // trusted set is the server's CONFIGURED address, never the request's Host header,
+  // which defeats DNS-rebinding (see isSameOriginRequest / serverTrustedOrigins).
+  const guardSameOrigin = (req) => isSameOriginRequest(req, serverTrustedOrigins(linkHostName, publicPort, host));
+
   // Whiteboard sidecar files live next to state.json, keyed by session + diagram.
   const whiteboardStateRoot = path.dirname(stateFile);
 
@@ -474,7 +480,7 @@ export async function serve({
   // loopback server.
   app.post("/api/:key/share", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!guardSameOrigin(req)) {
         res.status(403).json({ error: "cross-origin share request rejected" });
         return;
       }
@@ -749,7 +755,7 @@ export async function serve({
 
   app.post("/api/:key/whiteboard-channel", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!guardSameOrigin(req)) {
         res.status(403).json({ error: "cross-origin whiteboard channel request rejected" });
         return;
       }
@@ -774,7 +780,7 @@ export async function serve({
   // loopback server.
   app.put("/api/:key/whiteboard/:index", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!guardSameOrigin(req)) {
         res.status(403).json({ error: "cross-origin whiteboard write rejected" });
         return;
       }
@@ -801,7 +807,7 @@ export async function serve({
   // target. Files stay on this machine; the prompt carries only the paths.
   app.post("/api/:key/whiteboard/:index/feedback-files", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!guardSameOrigin(req)) {
         res.status(403).json({ error: "cross-origin whiteboard write rejected" });
         return;
       }
@@ -830,7 +836,7 @@ export async function serve({
   // like the whiteboard writes - a hostile cross-origin page must not drive them.
   app.post("/api/:key/attachments", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!guardSameOrigin(req)) {
         res.status(403).json({ error: "cross-origin attachment upload rejected" });
         return;
       }
@@ -847,13 +853,21 @@ export async function serve({
         res.status(413).json({ error: `attachment exceeds the ${attachmentConfig.maxBytes} byte limit` });
         return;
       }
-      // Finalize under the lifecycle lock so the dedup mtime refresh (B3) and the
-      // dims sidecar write can't interleave with a concurrent sweep/delete.
-      const attachment = await store.runExclusive(() =>
-        writeAttachment(attachmentStateRoot, req.params.key, buffer, {
+      // Finalize under the lifecycle lock so the dedup mtime refresh (B3), the dims
+      // sidecar write, AND the disk-cap admission (reference snapshot + reclaim +
+      // write) are one atomic critical section. Admission is a HARD cap: a new object
+      // that can't fit after evicting unreferenced files is refused with 507, so
+      // concurrent pages can never push committed storage past `maxDiskBytes` via
+      // queued references (the sweep alone never evicts referenced files).
+      const attachment = await store.runExclusive(async () => {
+        const referenced = await store.referencedAttachmentIds();
+        return writeAttachment(attachmentStateRoot, req.params.key, buffer, {
           maxBytes: attachmentConfig.maxBytes,
-        }),
-      );
+          maxDiskBytes: attachmentConfig.maxDiskBytes,
+          ttlMs: attachmentConfig.ttlMs,
+          referenced,
+        });
+      });
       res.json({ status: "stored", attachment });
     } catch (error) {
       next(error);
@@ -880,7 +894,7 @@ export async function serve({
 
   app.delete("/api/:key/attachments/:id", async (req, res, next) => {
     try {
-      if (!isSameOriginRequest(req)) {
+      if (!guardSameOrigin(req)) {
         res.status(403).json({ error: "cross-origin attachment delete rejected" });
         return;
       }
@@ -1084,14 +1098,17 @@ function encodeRfc5987Value(value) {
 
 // Guard state-changing, outward-facing routes (publishing to a third-party host) against CSRF: a
 // browser attaches an Origin/Referer that must match this server's own origin.
-function isSameOriginRequest(req) {
-  const expectedOrigin = `${req.protocol}://${req.get("host")}`;
-  const origin = req.get("origin");
-  if (origin) {
-    return normalizeOrigin(origin) === expectedOrigin;
-  }
-  const referer = req.get("referer");
-  return Boolean(referer) && normalizeOrigin(referer) === expectedOrigin;
+// Whether a state-changing request came from the chrome page this server serves.
+// The expected origin is the server's CONFIGURED address, NEVER the request's own
+// Host header: deriving it from `req.get("host")` let a DNS-rebinding page send a
+// matching (attacker-controlled) Host and Origin that agreed with each other and
+// passed while the server was loopback-bound. `trustedOrigins` is built once from the
+// bind/link host + the actual listening port (see `serverTrustedOrigins`).
+function isSameOriginRequest(req, trustedOrigins) {
+  const source = req.get("origin") || req.get("referer");
+  if (!source) return false;
+  const origin = normalizeOrigin(source);
+  return Boolean(origin) && trustedOrigins.has(origin);
 }
 
 function normalizeOrigin(value) {
@@ -1100,6 +1117,30 @@ function normalizeOrigin(value) {
   } catch {
     return "";
   }
+}
+
+const LOOPBACK_ORIGIN_HOSTS = ["127.0.0.1", "localhost", "[::1]"];
+
+// The origins the chrome page is legitimately served under, for the same-origin
+// write guard. The page is opened at the link host + this port, so that origin is
+// always trusted; when the server is loopback-bound the page may equally be reached
+// via any loopback alias, so those are trusted too. An attacker domain (DNS-rebinding
+// or otherwise) is never in this set, so its requests are rejected regardless of the
+// Host header it forges.
+export function serverTrustedOrigins(linkHostName, port, bindHostName = linkHostName) {
+  const origins = new Set([`http://${hostForUrl(linkHostName)}:${port}`]);
+  if (isLoopbackHostName(bindHostName) || isLoopbackHostName(linkHostName)) {
+    for (const alias of LOOPBACK_ORIGIN_HOSTS) origins.add(`http://${alias}:${port}`);
+  }
+  return origins;
+}
+
+function isLoopbackHostName(host) {
+  const value = String(host || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  return value === "127.0.0.1" || value === "localhost" || value === "::1" || value === "";
 }
 
 function optionalBodyString(value) {
