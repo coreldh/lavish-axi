@@ -21,6 +21,7 @@ import {
   isNativeInteractiveControl,
   isNearTotalOcclusion,
   isTrustedAttachmentResult,
+  attachmentSizeError,
   partitionDroppedFiles,
   MODE_TOGGLE_HOTKEY_KEY,
 } from "./artifact-sdk.js";
@@ -659,9 +660,12 @@ export async function serve({
   });
 
   app.get("/sdk.js", (req, res) => {
-    res
-      .type("application/javascript")
-      .send(createSdkJs(String(req.query.key || ""), { maxAttachmentCount: attachmentConfig.maxPerPrompt }));
+    res.type("application/javascript").send(
+      createSdkJs(String(req.query.key || ""), {
+        maxAttachmentCount: attachmentConfig.maxPerPrompt,
+        maxAttachmentBytes: attachmentConfig.maxBytes,
+      }),
+    );
   });
 
   // The whiteboard frame page. Hosted by the chrome in a dedicated sandboxed
@@ -1001,6 +1005,7 @@ export async function serve({
         return sweepAttachments(attachmentStateRoot, {
           ttlMs: attachmentConfig.ttlMs,
           maxDiskBytes: attachmentConfig.maxDiskBytes,
+          maxObjects: attachmentConfig.maxObjects,
           referenced,
         });
       });
@@ -1404,9 +1409,9 @@ export function createWhiteboardFrameHtml(channelToken = "") {
 
 /**
  * @param {string} key
- * @param {{ maxAttachmentCount?: number }} [options]
+ * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number }} [options]
  */
-export function createSdkJs(key, { maxAttachmentCount } = {}) {
+export function createSdkJs(key, { maxAttachmentCount, maxAttachmentBytes } = {}) {
   // Serialize every helper exported by mermaid-node.js as a same-scope const so
   // cross-helper calls (e.g. mermaidNodeFrom → mermaidNodeElement) resolve in the
   // browser. Deriving this from the module's exports — rather than a hand-kept
@@ -1418,7 +1423,10 @@ export function createSdkJs(key, { maxAttachmentCount } = {}) {
   // pass it to the SDK so the annotation card's local count guard matches the server
   // limit instead of a hardcoded literal (W1). The card is still only a UX guide - the
   // server re-enforces the cap on /prompts and rejects the whole batch on a mismatch.
-  const sdkOptions = { maxAttachmentCount: Number.isFinite(maxAttachmentCount) ? maxAttachmentCount : undefined };
+  const sdkOptions = {
+    maxAttachmentCount: Number.isFinite(maxAttachmentCount) ? maxAttachmentCount : undefined,
+    maxAttachmentBytes: Number.isFinite(maxAttachmentBytes) ? maxAttachmentBytes : undefined,
+  };
   return `(() => {
 const key=${JSON.stringify(key)};
 void key;
@@ -1431,6 +1439,7 @@ const classifyMaterialRectEscape=${classifyMaterialRectEscape.toString()};
 const isMaterialPageOverflow=${isMaterialPageOverflow.toString()};
 const findStableLayoutFindings=${findStableLayoutFindings.toString()};
 const isNearTotalOcclusion=${isNearTotalOcclusion.toString()};
+const attachmentSizeError=${attachmentSizeError.toString()};
 const partitionDroppedFiles=${partitionDroppedFiles.toString()};
 const isTrustedAttachmentResult=${isTrustedAttachmentResult.toString()};
 const deriveAttachmentNoticeState=${deriveAttachmentNoticeState.toString()};
