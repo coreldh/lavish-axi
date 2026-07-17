@@ -5,15 +5,11 @@
 // Image acquisition - the file picker, paste, and drop - and every byte read run
 // here, in a CHROME-SERVED, sandboxed iframe (opaque origin, no `allow-same-origin`).
 //
-// R12 provenance: the chrome CREATES this iframe in its OWN capture overlay (its top
+// The chrome CREATES this iframe in its OWN capture overlay (its top
 // document), never in the artifact realm, and binds the capture channel ONLY to the
-// exact frame window it created (an `event.source` identity check). A hostile artifact
-// can still create its own `/attachment-frame` iframe and post `ready`, but the chrome
-// never holds that window as its capture frame, so it is ignored - the capability is
-// no longer mintable by the artifact. Earlier the frame was embedded in the annotation
-// card (artifact realm) and authenticated with a signed token the artifact could also
-// obtain by loading the same route, so any authenticated frame bound: THAT was the
-// trust-boundary hole this redesign closes.
+// exact frame window it created (an `event.source` identity check). The route's
+// `frame-ancestors 'self'` policy blocks the artifact from embedding it; messages from
+// any other window are ignored even if they carry valid-looking correlation fields.
 //
 // The frame has NO server access: it reads bytes locally and hands them to
 // `window.parent` (the chrome, its direct parent - never `window.top`, which a page

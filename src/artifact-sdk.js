@@ -356,15 +356,11 @@ export function deriveAttachmentNoticeState(state = {}) {
 
 /**
  * Whether a chrome-relayed capture-frame state applies to the card that owns this
- * mirror (round 11, extending the root-A trust boundary). Each open card mints a
- * fresh `cardNonce`, threaded into its capture frame via the iframe query string
- * and echoed on every relayed state; the mirror applies a state ONLY when the
- * stamped nonce matches its own card's nonce. Without this, a late state from a
- * RETIRED frame (a card the user just closed, whose bound channel had not yet been
- * replaced) relays onto the freshly opened card's mirror - so card B could pick up
- * and queue card A's screenshot onto the wrong annotation. The relay's `cardNonce`
- * is minted by this artifact realm, so the mirror can authoritatively reject a
- * mismatch regardless of chrome-side binding timing.
+ * mirror. Each open card mints a fresh `cardNonce` and includes it when requesting
+ * the chrome-owned picker. The chrome records that nonce, passes it to the capture
+ * frame, and stamps it from its own record onto every relayed state; the mirror
+ * applies a state ONLY when that stamp matches its card. Without this, a late state
+ * from a retired frame could make a fresh card queue the prior card's screenshot.
  *
  * @param {Record<string, unknown> | null | undefined} state the relayed state
  * @param {string} cardNonce this card's nonce
@@ -415,10 +411,10 @@ export function createArtifactSdk(
   // previous card's, never be unguessable.
   let attachmentCardCounter = 0;
 
-  // Per-card image attachment MIRROR (root A, R10). Image acquisition and every
-  // byte now live in a chrome-served, sandboxed capture frame embedded in the card
-  // (the chrome-owned capture picker, R12); this artifact-realm controller never
-  // touches a File, an ArrayBuffer, or an object URL. It only holds the non-sensitive
+  // Per-card image attachment MIRROR. Image acquisition and every byte live in a
+  // chrome-served, sandboxed capture frame inside the chrome-owned picker associated
+  // with this card; this artifact-realm controller never touches a File, an
+  // ArrayBuffer, or an object URL. It only holds the non-sensitive
   // per-item state the chrome relays (`lavish:attachmentState`: name, status,
   // server-vetted id), so the card can render NAME-ONLY chips, gate queuing, and
   // collect the ready refs to ride along with the prompt.
