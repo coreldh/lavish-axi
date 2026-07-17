@@ -1468,6 +1468,13 @@ async function uploadAttachment(message, reply) {
 // time, so a single slot suffices; a fresh card mints a fresh token and re-binds.
 /** @type {{ window: Window, channelId: string } | null} */
 let attachmentChannel = null;
+// The token of the most recent `ready` we've begun authenticating. Set
+// synchronously on each ready so that when the async auth resolves we only bind if
+// no newer frame has since announced itself - otherwise two overlapping cards whose
+// auth fetches resolve out of order could clobber the binding back to a closed
+// card's dead frame, wedging the live one (mirrors the whiteboard channel's
+// post-await staleness re-check). Tokens are unique per frame load.
+let attachmentPendingToken = null;
 
 async function authenticateAttachmentChannel(token) {
   try {
@@ -1497,8 +1504,11 @@ function handleAttachmentFrameMessage(event, message) {
   if (type === "lavish-attachment:ready") {
     const token = String(message.channelToken || "");
     if (!token) return true;
+    attachmentPendingToken = token;
     authenticateAttachmentChannel(token).then((authenticated) => {
-      if (authenticated && !ended) {
+      // Only bind if this is still the newest ready (last-writer-wins on the frame,
+      // not on auth-resolution order) and the session is live.
+      if (authenticated && !ended && attachmentPendingToken === token) {
         attachmentChannel = { window: source, channelId: token };
         // Ack so the frame reports its initial state and the card reveals it. Stamp
         // the AUTHENTICATED token as channelId (the `ready` message carries only

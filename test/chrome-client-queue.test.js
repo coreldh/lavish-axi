@@ -447,6 +447,46 @@ test("the chrome ignores attachment uploads from an unauthenticated (unbound) fr
   assert.equal(af.result("x"), undefined, "and gets no result echoed back");
 });
 
+test("a newer capture frame wins the channel even if an older frame's auth resolves last (root A rebind race)", async () => {
+  // Two overlapping cards: frame A announces, then A closes and frame B announces,
+  // then A's channel-auth fetch resolves AFTER B's. Binding must stay on B (the live
+  // card), not clobber back to A's dead frame - else B's uploads wedge.
+  const resolvers = {};
+  const chrome = await createChromeHarness({
+    fetchImpl: (url, init) => {
+      if (!String(url).includes("/attachment-channel")) return Promise.resolve({ ok: true, json: async () => ({}) });
+      const token = JSON.parse(init.body).token;
+      return new Promise((resolve) => {
+        resolvers[token] = () => resolve(/** @type {any} */ ({ ok: true }));
+      });
+    },
+  });
+  const a = chrome.createAttachmentFrame("token-A");
+  const b = chrome.createAttachmentFrame("token-B");
+  a.ready();
+  b.ready();
+  // Resolve B first (it is the newest), then A (out of order).
+  resolvers["token-B"]();
+  await flushPromises();
+  resolvers["token-A"]();
+  await flushPromises();
+
+  // B is bound: an upload from B is accepted, an upload from the stale A is ignored.
+  let uploadFetches = 0;
+  chrome.eventSource; // touch to avoid unused lint if any
+  b.send({ type: "lavish-attachment:state", channelId: "token-B", items: [], height: 40 });
+  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState");
+  assert.ok(relayed.length > 0, "the newest frame's state is relayed (it holds the channel)");
+  a.send({
+    type: "lavish-attachment:state",
+    channelId: "token-A",
+    items: [{ localId: "x", status: "ready", id: "y" }],
+  });
+  const relayedAfterA = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState");
+  assert.equal(relayedAfterA.length, relayed.length, "the stale frame cannot drive state through the channel");
+  void uploadFetches;
+});
+
 test("the chrome ignores an upload carrying the wrong channel token (root A)", async () => {
   let fetches = 0;
   const chrome = await createChromeHarness({
