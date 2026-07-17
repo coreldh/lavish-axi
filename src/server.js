@@ -543,6 +543,13 @@ export async function serve({
         return;
       }
       await watchSession(session, watchers, events, logEvent);
+      // Anti-framing (R12): the chrome must not be embeddable by another page. If a
+      // hostile page framed the whole session it would become window.top for the
+      // capture frame; forbidding framing keeps the chrome the true top document and
+      // the capture frame's parent. (This is the one place Lavish sets a CSP - a
+      // frame-ancestors directive on its OWN trusted pages, not a content policy.)
+      res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+      res.setHeader("X-Frame-Options", "DENY");
       const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
       const { faviconTag, title } = extractArtifactHead(artifactHtml);
       res.type("html").send(
@@ -691,17 +698,20 @@ export async function serve({
     res.type("html").send(createWhiteboardFrameHtml(createWhiteboardChannelToken(whiteboardChannelSecret)));
   });
 
-  // The attachment-capture frame page (root A). Served by the chrome into a
-  // sandboxed, opaque-origin iframe the CHROME creates in its own capture overlay
-  // (R12): the chrome, not the artifact, owns this frame's creation and binds the
-  // capture channel to the exact window it created. This static page carries NO
-  // capability token - loading it grants nothing, since the chrome binds by frame
-  // identity, not by any credential the page hands out. The per-open session id and
-  // card nonce ride in the query string the chrome sets. Image acquisition and byte
-  // reading run OUTSIDE the artifact realm; the frame reports to window.top (the
-  // chrome, its direct parent).
+  // The attachment-capture frame page (root A / R12). The CHROME creates this frame
+  // in its own capture overlay and binds the capture channel to the exact window it
+  // created (event.source identity). The page carries NO capability token - loading
+  // it grants nothing. CRITICAL anti-exfiltration guard: `frame-ancestors 'self'`
+  // means ONLY the same-origin chrome (the loopback top document) may embed this
+  // page. The artifact iframe is a sandboxed OPAQUE origin, so the browser refuses
+  // to render `/attachment-frame` inside it - a hostile artifact cannot embed its own
+  // capture frame and read the user's file bytes off `window.parent`. The frame reads
+  // bytes only in itself and posts them to window.parent, which - given this guard -
+  // can only be the chrome that created it.
   app.get("/attachment-frame", (req, res) => {
     res.setHeader("cache-control", "no-store");
+    res.setHeader("Content-Security-Policy", "frame-ancestors 'self'");
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
     res.type("html").send(
       createAttachmentFrameHtml({
         maxCount: attachmentConfig.maxPerPrompt,

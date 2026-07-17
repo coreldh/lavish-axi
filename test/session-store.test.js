@@ -924,20 +924,33 @@ test("attachment resolution short-circuits after the first rejection - no wasted
         ? null
         : { id: attachmentId, type: "image", path: "/vetted/p.png", mime: "image/png", bytes: 1, width: 1, height: 1 };
     };
-    // Prompt 1 references a missing id (rejects). The batch fails atomically, so prompt
-    // 2's id must NEVER be resolved - resolving it would be pure wasted I/O under the mutex.
+    // Prompt 1's FIRST ref is missing (rejects), followed by many more refs in the same
+    // prompt, and a second prompt. The batch fails atomically, so NOTHING after the
+    // first rejection is resolved - not the rest of prompt 1's refs (inner loop breaks),
+    // not prompt 2 (outer loop breaks). Only the single missing id is read.
     const result = await store.queuePrompts(
       session.key,
       {
         prompts: [
-          { uid: "1", prompt: "bad", selector: "h1", tag: "h1", text: "Hi", attachments: [{ id: missing }] },
+          {
+            uid: "1",
+            prompt: "bad",
+            selector: "h1",
+            tag: "h1",
+            text: "Hi",
+            attachments: [{ id: missing }, ...Array.from({ length: 200 }, () => ({ id: laterId }))],
+          },
           { uid: "2", prompt: "good", selector: "h1", tag: "h1", text: "Hi", attachments: [{ id: laterId }] },
         ],
       },
-      { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
+      { resolveAttachment, maxPerPrompt: 256, maxPromptBytes: 25 * 1024 * 1024 },
     );
     assert.deepEqual(result.rejected, [{ id: missing, name: "", reason: "not-found" }]);
-    assert.deepEqual(readIds, [missing], "only the rejecting prompt was resolved; later prompts were not read");
+    assert.deepEqual(
+      readIds,
+      [missing],
+      "resolution stopped at the first rejection - no wasted reads within or across prompts",
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

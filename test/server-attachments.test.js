@@ -531,3 +531,28 @@ test("the attachment-frame route serves an INERT capture page with NO capability
     assert.equal(gone.status, 404, "the attachment-channel authenticate route no longer exists");
   });
 });
+
+test("anti-framing headers prevent a hostile artifact from embedding the capture frame (R12)", async () => {
+  // The capture frame reads user file bytes and posts them to window.parent. If a
+  // hostile ARTIFACT could embed /attachment-frame itself, window.parent would be the
+  // artifact and the bytes would leak. frame-ancestors 'self' lets only the same-origin
+  // chrome embed it; the sandboxed opaque-origin artifact is refused by the browser.
+  // The chrome session page forbids framing entirely so it stays the true top document.
+  await withSession(async ({ base, key }) => {
+    const frame = await fetch(`${base}/attachment-frame`);
+    assert.match(
+      frame.headers.get("content-security-policy") || "",
+      /frame-ancestors 'self'/,
+      "the capture frame may be embedded only by the same-origin chrome",
+    );
+    assert.match(frame.headers.get("x-frame-options") || "", /SAMEORIGIN/i);
+
+    const chrome = await fetch(`${base}/session/${key}`);
+    assert.match(
+      chrome.headers.get("content-security-policy") || "",
+      /frame-ancestors 'none'/,
+      "the chrome session page cannot be framed at all",
+    );
+    assert.match(chrome.headers.get("x-frame-options") || "", /DENY/i);
+  });
+});

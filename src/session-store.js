@@ -490,10 +490,13 @@ async function resolvePromptAttachments(refs, key, options = {}, metaCache = new
   const resolved = [];
   const rejected = [];
   let totalBytes = 0;
+  // Any rejection fails the whole batch atomically (C4), so STOP at the first one
+  // (break, not continue): resolving the remaining refs - up to the request cap - would
+  // be pure wasted filesystem I/O while the global store mutex is held (R12).
   for (const ref of refs) {
     if (resolved.length >= maxPerPrompt) {
       rejected.push({ id: ref.id, name: ref.name || "", reason: "too-many" });
-      continue;
+      break;
     }
     // Content-addressed id -> the file's metadata is immutable, so cache it per batch:
     // repeated references to the same id (in this prompt or another) never re-read the
@@ -505,12 +508,12 @@ async function resolvePromptAttachments(refs, key, options = {}, metaCache = new
     }
     if (!metadata) {
       rejected.push({ id: ref.id, name: ref.name || "", reason: "not-found" });
-      continue;
+      break;
     }
     const bytes = Number(metadata.bytes) || 0;
     if (totalBytes + bytes > maxPromptBytes) {
       rejected.push({ id: ref.id, name: ref.name || "", reason: "prompt-bytes-exceeded" });
-      continue;
+      break;
     }
     totalBytes += bytes;
     resolved.push(ref.name ? { ...metadata, name: ref.name } : metadata);
