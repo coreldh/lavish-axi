@@ -21,6 +21,7 @@ import {
   isNativeInteractiveControl,
   isNearTotalOcclusion,
   attachmentSizeError,
+  attachmentStateAppliesToCard,
   classifyAttachmentBatch,
   partitionDroppedFiles,
   MODE_TOGGLE_HOTKEY_KEY,
@@ -1580,6 +1581,7 @@ const isMaterialPageOverflow=${isMaterialPageOverflow.toString()};
 const findStableLayoutFindings=${findStableLayoutFindings.toString()};
 const isNearTotalOcclusion=${isNearTotalOcclusion.toString()};
 const deriveAttachmentNoticeState=${deriveAttachmentNoticeState.toString()};
+const attachmentStateAppliesToCard=${attachmentStateAppliesToCard.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };
 (${createArtifactSdk.toString()})(deriveQueueKey, isNativeInteractiveControl, mermaidHelpers, ${JSON.stringify(sdkOptions)});

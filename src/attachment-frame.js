@@ -36,6 +36,11 @@
 export function createAttachmentFrame(config, helpers) {
   const { classifyAttachmentBatch, partitionDroppedFiles, deriveAttachmentNoticeState } = helpers;
   const channelToken = String(config.channelToken || "");
+  // The nonce of the card that opened this frame, threaded in via the iframe query
+  // string by the SDK. Echoed on every relayed state so the artifact card's mirror
+  // can drop a late state from a retired frame (R11) instead of applying it to a
+  // freshly opened card.
+  const cardNonce = new URLSearchParams(window.location.search).get("card") || "";
   const MAX_COUNT = Number.isFinite(config.maxCount) && config.maxCount > 0 ? config.maxCount : 4;
   const MAX_BYTES = Number.isFinite(config.maxBytes) && config.maxBytes > 0 ? config.maxBytes : 0;
   const ACCEPTED_MIME = { "image/png": true, "image/jpeg": true, "image/webp": true };
@@ -117,6 +122,7 @@ export function createAttachmentFrame(config, helpers) {
       {
         type: "lavish-attachment:state",
         channelId: channelToken,
+        cardNonce,
         capRejected,
         // The card sizes the iframe to this content height, so a grown chip list is
         // never clipped. Measure `body.scrollHeight` (true content: the frame CSS

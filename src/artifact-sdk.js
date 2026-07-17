@@ -355,6 +355,26 @@ export function deriveAttachmentNoticeState(state = {}) {
 }
 
 /**
+ * Whether a chrome-relayed capture-frame state applies to the card that owns this
+ * mirror (round 11, extending the root-A trust boundary). Each open card mints a
+ * fresh `cardNonce`, threaded into its capture frame via the iframe query string
+ * and echoed on every relayed state; the mirror applies a state ONLY when the
+ * stamped nonce matches its own card's nonce. Without this, a late state from a
+ * RETIRED frame (a card the user just closed, whose bound channel had not yet been
+ * replaced) relays onto the freshly opened card's mirror - so card B could pick up
+ * and queue card A's screenshot onto the wrong annotation. The relay's `cardNonce`
+ * is minted by this artifact realm, so the mirror can authoritatively reject a
+ * mismatch regardless of chrome-side binding timing.
+ *
+ * @param {Record<string, unknown> | null | undefined} state the relayed state
+ * @param {string} cardNonce this card's nonce
+ * @returns {boolean}
+ */
+export function attachmentStateAppliesToCard(state, cardNonce) {
+  return typeof cardNonce === "string" && cardNonce !== "" && state?.cardNonce === cardNonce;
+}
+
+/**
  * @param {*} deriveQueueKey
  * @param {*} [isNativeInteractive]
  * @param {*} [mermaid]
@@ -389,6 +409,11 @@ export function createArtifactSdk(
   // The mirror for the currently open card's capture frame, so relayed state reaches
   // the right card. Only one card is ever open at a time.
   let activeAttachments = null;
+  // A fresh per-card nonce identifies the capture frame that belongs to the current
+  // card, so a late state from a retired frame is dropped instead of landing on a
+  // freshly opened card (R11). Monotonic + random: it only needs to differ from the
+  // previous card's, never be unguessable.
+  let attachmentCardCounter = 0;
 
   // Per-card image attachment MIRROR (root A, R10). Image acquisition and every
   // byte now live in a chrome-served, sandboxed capture frame embedded in the card
@@ -399,9 +424,9 @@ export function createArtifactSdk(
   // can gate queuing and collect the ready refs to ride along with the prompt. The
   // frame owns all chip rendering; this side renders nothing.
   /**
-   * @param {{ notify?: (message: string) => void, onLayout?: (height: number) => void }} [config]
+   * @param {{ notify?: (message: string) => void, onLayout?: (height: number) => void, cardNonce?: string }} [config]
    */
-  function makeAttachmentsController({ notify = () => {}, onLayout = () => {} } = {}) {
+  function makeAttachmentsController({ notify = () => {}, onLayout = () => {}, cardNonce = "" } = {}) {
     /** @type {Array<{ name: string, status: string, id: string }>} */
     let items = [];
     let capRejected = false;
@@ -420,10 +445,14 @@ export function createArtifactSdk(
       );
     }
 
-    // Replace the mirror from a chrome-relayed frame state message. Values are
+    // Replace the mirror from a chrome-relayed frame state message. A state stamped
+    // with a DIFFERENT card's nonce (a late message from a retired frame the user
+    // just closed) is dropped, never applied - so a freshly opened card can never
+    // pick up the previous card's screenshot (R11, extends root A). Values are
     // coerced to primitives so a hostile relay (the chrome is trusted, but defense
     // in depth) can never wedge collect/gating with non-strings.
     function applyState(state) {
+      if (!attachmentStateAppliesToCard(state, cardNonce)) return;
       const list = Array.isArray(state?.items) ? state.items : [];
       items = list.map((item) => ({
         name: typeof item?.name === "string" ? item.name : "image",
@@ -1731,6 +1760,10 @@ export function createArtifactSdk(
           ? "Tell the agent what to change about this diagram node..."
           : "Tell the agent what to change about this element...";
     const sendNowHint = /Mac|iP(hone|ad|od)/.test(navigator.platform) ? "⌘" : "Ctrl";
+    // A fresh nonce for THIS card, threaded into its capture frame via the iframe
+    // query string; the frame echoes it on every relayed state so the mirror can
+    // drop a late state from the previous (retired) card's frame (R11).
+    const cardNonce = "c" + ++attachmentCardCounter + Math.random().toString(36).slice(2);
     // The attach control is a CHROME-SERVED, sandboxed iframe (root A): image
     // acquisition and every byte live in `/attachment-frame`, never in this
     // artifact realm. It carries an initial CSS height that shows the attach zone
@@ -1742,7 +1775,9 @@ export function createArtifactSdk(
       heading +
       '</div><textarea placeholder="' +
       placeholder +
-      '"></textarea><iframe class="lavish-attach-frame" title="Attach image" sandbox="allow-scripts allow-popups" src="/attachment-frame"></iframe>' +
+      '"></textarea><iframe class="lavish-attach-frame" title="Attach image" sandbox="allow-scripts allow-popups" src="/attachment-frame?card=' +
+      encodeURIComponent(cardNonce) +
+      '"></iframe>' +
       '<div class="lavish-hint">Enter to queue &middot; ' +
       sendNowHint +
       "+Enter to send &middot; attach an image below" +
@@ -1786,6 +1821,7 @@ export function createArtifactSdk(
     };
     const attachments = makeAttachmentsController({
       notify,
+      cardNonce,
       onLayout: (height) => {
         // Size the capture frame to its reported content height so a grown chip list
         // is never clipped. The iframe is always laid out (an initial CSS height

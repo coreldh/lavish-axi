@@ -1579,6 +1579,49 @@ test("chrome relays only non-sensitive capture-frame state to the artifact card 
   assert.equal(JSON.stringify(relayed).includes("lavish-attachment:upload"), false);
 });
 
+test("chrome carries the frame's cardNonce through so the mirror can correlate (R11)", async () => {
+  const chrome = await createChromeHarness();
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises();
+  af.state({ cardNonce: "cardA", items: [], height: 40 });
+  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
+  assert.equal(relayed.state.cardNonce, "cardA", "the relay carries the frame's card nonce for mirror correlation");
+});
+
+test("a retired frame cannot relay its state once a new card's frame announces (R11)", async () => {
+  // Card A binds and can relay. Card B's frame then announces (a new card opened):
+  // the chrome retires A's channel that instant, so A's late state carrying its
+  // screenshot is dropped and never reaches the artifact card - even before B's
+  // async auth resolves. (The artifact-side per-card nonce is the authoritative
+  // drop; this pins the chrome-side retire.)
+  const chrome = await createChromeHarness();
+  const a = chrome.createAttachmentFrame("token-A");
+  a.ready();
+  await flushPromises();
+  // A relays legitimately while it is the bound channel.
+  a.state({
+    cardNonce: "cardA",
+    items: [{ localId: "att-1", status: "ready", id: "x".repeat(64) + ".png" }],
+    height: 60,
+  });
+  const beforeSwitch = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
+  assert.ok(beforeSwitch > 0, "A relays while bound");
+
+  // Card B opens: its frame announces. Auth is still pending (not flushed), but the
+  // prior channel must already be retired.
+  const b = chrome.createAttachmentFrame("token-B");
+  b.ready();
+  // A's still-live frame fires a LATE state carrying its screenshot.
+  a.state({
+    cardNonce: "cardA",
+    items: [{ localId: "att-1", name: "secret.png", status: "ready", id: "x".repeat(64) + ".png" }],
+    height: 60,
+  });
+  const afterSwitch = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
+  assert.equal(afterSwitch, beforeSwitch, "the retired frame's late state is NOT relayed to the card");
+});
+
 test("chrome reports an upload failure back to the capture frame", async () => {
   const chrome = await createChromeHarness({
     fetchImpl: async (url) => {

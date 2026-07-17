@@ -1504,6 +1504,12 @@ function handleAttachmentFrameMessage(event, message) {
   if (type === "lavish-attachment:ready") {
     const token = String(message.channelToken || "");
     if (!token) return true;
+    // Retire the prior channel the instant a new frame announces (a card opened or
+    // switched), so a just-closed card's still-bound frame cannot relay its late
+    // state onto the new card during this frame's auth round trip (R11). The
+    // artifact-side per-card nonce is the authoritative drop; this closes the
+    // chrome-side window as well.
+    attachmentChannel = null;
     attachmentPendingToken = token;
     authenticateAttachmentChannel(token).then((authenticated) => {
       // Only bind if this is still the newest ready (last-writer-wins on the frame,
@@ -1526,10 +1532,13 @@ function handleAttachmentFrameMessage(event, message) {
     uploadAttachment(message, replyTo);
   } else if (type === "lavish-attachment:state") {
     // Relay ONLY the non-sensitive per-item state to the artifact card's mirror
-    // (never bytes) so it can gate queuing and collect ready refs (root A).
+    // (never bytes) so it can gate queuing and collect ready refs (root A). Carry
+    // the frame's `cardNonce` through so the mirror applies the state only to the
+    // card that owns this frame, dropping a retired frame's late state (R11).
     postToFrame({
       type: "lavish:attachmentState",
       state: {
+        cardNonce: String(message.cardNonce || ""),
         items: Array.isArray(message.items) ? message.items : [],
         capRejected: Boolean(message.capRejected),
         height: Number(message.height) || 0,

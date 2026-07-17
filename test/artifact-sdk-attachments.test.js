@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   attachmentSizeError,
+  attachmentStateAppliesToCard,
   classifyAttachmentBatch,
   deriveAttachmentNoticeState,
   partitionDroppedFiles,
@@ -32,7 +33,7 @@ test("the SDK bundle has NO attachment byte path or write/delete (root A invaria
   assert.doesNotMatch(sdk, /lavish:uploadAttachment/, "the artifact realm never ships bytes to the chrome");
   assert.doesNotMatch(sdk, /method:\s*"DELETE"/, "the artifact realm invokes no delete");
   // The capture surface is a chrome-served, sandboxed frame - not artifact DOM.
-  assert.match(sdk, /src="\/attachment-frame"/);
+  assert.match(sdk, /src="\/attachment-frame\?card=/);
   assert.match(sdk, /sandbox="allow-scripts allow-popups"/);
 });
 
@@ -44,6 +45,40 @@ test("the SDK bundle embeds the chrome-served capture frame and mirrors its stat
   // The mirror is coerced to primitives - never the relayed objects by reference.
   assert.match(sdk, /function applyState\(state\)/);
   assert.match(sdk, /typeof item\?\.id === "string"/);
+});
+
+test("the SDK bundle correlates every relayed state with the active card (R11, stale-frame drop)", () => {
+  // Each card mints a fresh nonce, threads it into its frame's iframe query string,
+  // and applyState drops any relayed state whose nonce does not match this card's -
+  // so a retired frame's late state never lands on a freshly opened card.
+  assert.match(sdk, /const attachmentStateAppliesToCard=/);
+  assert.match(sdk, /if \(!attachmentStateAppliesToCard\(state, cardNonce\)\) return;/);
+  assert.match(sdk, /\/attachment-frame\?card=['"] \+\s*\n?\s*encodeURIComponent\(cardNonce\)/);
+  assert.match(sdk, /makeAttachmentsController\(\{\s*\n?\s*notify,\s*\n?\s*cardNonce,/);
+});
+
+test("a freshly opened card cannot pick up a retired frame's screenshot via a stale token (R11)", () => {
+  // The defect: card A attaches a screenshot; the user closes A and opens card B;
+  // A's still-bound frame relays its late state, which (unfiltered) lands on B's
+  // mirror - so B queues A's screenshot onto the wrong annotation. The fix
+  // correlates every relayed state with the ACTIVE card's nonce.
+  const aShot = {
+    cardNonce: "cardA",
+    items: [{ localId: "att-1", name: "secret.png", status: "ready", id: "a".repeat(64) + ".png" }],
+  };
+  // Card B (nonce "cardB") must DROP card A's late state - it never sees the shot.
+  assert.equal(attachmentStateAppliesToCard(aShot, "cardB"), false);
+  // The legitimate flow is intact: a card applies its OWN frame's state.
+  assert.equal(attachmentStateAppliesToCard({ cardNonce: "cardB", items: [] }, "cardB"), true);
+  assert.equal(
+    attachmentStateAppliesToCard({ cardNonce: "cardA", items: aShot.items }, "cardA"),
+    true,
+    "card A applies its own frame's state",
+  );
+  // A state with no nonce, or a card with no nonce, never applies (fail-closed).
+  assert.equal(attachmentStateAppliesToCard({ items: [] }, "cardB"), false);
+  assert.equal(attachmentStateAppliesToCard(aShot, ""), false);
+  assert.equal(attachmentStateAppliesToCard(null, "cardB"), false);
 });
 
 test("the SDK bundle carries ready attachment refs on the queued prompt", () => {

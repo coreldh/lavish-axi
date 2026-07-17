@@ -51,7 +51,7 @@ function makeElement() {
   };
 }
 
-function bootFrame({ channelToken = "tok-1", maxCount = 4, maxBytes = 0 } = {}) {
+function bootFrame({ channelToken = "tok-1", maxCount = 4, maxBytes = 0, cardNonce = "cardA" } = {}) {
   const elements = {
     list: makeElement(),
     notice: makeElement(),
@@ -71,10 +71,12 @@ function bootFrame({ channelToken = "tok-1", maxCount = 4, maxBytes = 0 } = {}) 
     console,
     window: {
       top: topWindow,
+      location: { search: cardNonce ? "?card=" + encodeURIComponent(cardNonce) : "" },
       addEventListener(type, handler) {
         windowListeners.set(type, handler);
       },
     },
+    URLSearchParams,
     document: {
       // The frame reports body.scrollHeight (true content), NOT
       // documentElement.scrollHeight (floored at the iframe viewport).
