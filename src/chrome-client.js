@@ -110,6 +110,10 @@ const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
 const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardError"));
+const attachOverlay = /** @type {HTMLDivElement} */ (document.getElementById("attachOverlay"));
+const attachFrameHost = /** @type {HTMLDivElement} */ (document.getElementById("attachFrameHost"));
+const attachCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("attachClose"));
+const attachDoneButton = /** @type {HTMLButtonElement} */ (document.getElementById("attachDone"));
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const queued = loadQueuedPrompts();
@@ -1377,12 +1381,14 @@ window.addEventListener("message", (event) => {
     handleLayoutWarningsForGate(msg.layout_warnings);
     submitLayoutWarnings(msg.layout_warnings).catch(() => {});
   }
-  // Image bytes never arrive from the artifact frame (root A): acquisition and
-  // byte handling live in the isolated capture frame, which talks to the chrome
-  // directly via handleAttachmentFrameMessage. There is also deliberately no
-  // attachment-delete message - the iframe cannot be trusted to decide a delete,
-  // and the chrome cannot see every live reference, so reclamation is the
-  // sweeper's job (see removeAttachment's note below).
+  // Image bytes never arrive from the artifact frame (root A): acquisition and byte
+  // handling live in the CHROME-OWNED capture frame (R12). The artifact card may only
+  // REQUEST the picker; the chrome creates and owns it. There is also deliberately no
+  // attachment-delete message - the iframe cannot be trusted to decide a delete, and
+  // the chrome cannot see every live reference, so reclamation is the sweeper's job
+  // (see removeAttachment's note below).
+  if (msg.type === "lavish:openAttachPicker") openAttachPicker(msg.cardNonce);
+  if (msg.type === "lavish:closeAttachPicker") closeAttachPicker();
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
   if (msg.type === "lavish:endSession") endSession();
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
@@ -1464,87 +1470,97 @@ async function uploadAttachment(message, reply) {
   }
 }
 
-// The bound capture-frame channel (root A). Only one annotation card is open at a
-// time, so a single slot suffices; a fresh card mints a fresh token and re-binds.
-/** @type {{ window: Window, channelId: string } | null} */
-let attachmentChannel = null;
-// The token of the most recent `ready` we've begun authenticating. Set
-// synchronously on each ready so that when the async auth resolves we only bind if
-// no newer frame has since announced itself - otherwise two overlapping cards whose
-// auth fetches resolve out of order could clobber the binding back to a closed
-// card's dead frame, wedging the live one (mirrors the whiteboard channel's
-// post-await staleness re-check). Tokens are unique per frame load.
-let attachmentPendingToken = null;
+// R12 capture-frame provenance. The CHROME creates the capture frame in its own
+// capture overlay (its top document) and binds the capture channel to the EXACT
+// window it created - an `event.source` identity the artifact realm cannot forge.
+// There is no capability token to mint: a hostile artifact can still load
+// `/attachment-frame` and post `ready` to window.top, but its window is not
+// `captureFrame.contentWindow`, so it is ignored. This is the fix for the round-12
+// finding (the old design bound ANY frame that presented a valid server-minted
+// token, which the artifact could obtain by loading the same route).
+/** @type {HTMLIFrameElement | null} */
+let captureFrame = null;
+// A fresh per-open correlation id, echoed by the frame; paired with the source
+// identity check it tags this capture session's messages. NOT a security boundary -
+// the source identity is.
+let captureSession = "";
+// The nonce of the card that opened the picker; the chrome stamps it on relayed
+// state so the card's mirror applies it only to that card (R11).
+let captureCardNonce = "";
 
-async function authenticateAttachmentChannel(token) {
+function newCaptureSession() {
   try {
-    const response = await fetch("/api/" + key + "/attachment-channel", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token }),
-    });
-    return response.ok;
+    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
   } catch {
-    return false;
+    // fall through to the non-crypto id below
   }
+  return "s" + Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
-// Route a message from a nested sandboxed frame that is (or wants to become) the
-// attachment capture channel. Returns true if it was an attachment-frame message
-// so other frame handlers can skip it. Binds on an authenticated `ready`; every
-// later message must come from the bound window AND carry the bound token, so a
-// hostile artifact posting to window.top cannot drive an upload or a state relay
-// (it lacks a valid, server-minted token and cannot read the real frame's token
-// cross-origin - `authenticateAttachmentChannel` 403s a forged token, so it never
-// binds). The one thing a forged `ready` CAN do is retire the current channel
-// (below), leaving the user's own attach control unbound until the card reopens -
-// a self-inflicted availability DoS by an artifact the user is already reviewing,
-// with no byte access, no upload, and no misroute. The confidentiality/integrity
-// boundary (bytes never enter the artifact realm; no unauthorized write) holds.
+// Open the chrome-owned capture picker for a card. The artifact card only REQUESTS
+// this (lavish:openAttachPicker); the chrome owns the frame's CREATION, so the
+// artifact can neither create the trusted picker nor position it (no clickjacking).
+function openAttachPicker(cardNonce) {
+  if (ended) return;
+  closeAttachPicker();
+  captureCardNonce = String(cardNonce || "");
+  captureSession = newCaptureSession();
+  const params = new URLSearchParams({ session: captureSession, card: captureCardNonce });
+  const iframe = /** @type {HTMLIFrameElement} */ (document.createElement("iframe"));
+  iframe.className = "attach-frame";
+  iframe.title = "Attach image";
+  iframe.setAttribute("sandbox", "allow-scripts allow-popups");
+  iframe.src = "/attachment-frame?" + params.toString();
+  attachFrameHost.innerHTML = "";
+  attachFrameHost.appendChild(iframe);
+  captureFrame = iframe;
+  attachOverlay.hidden = false;
+}
+
+function closeAttachPicker() {
+  if (captureFrame) {
+    try {
+      captureFrame.src = "about:blank";
+    } catch {
+      // best effort teardown
+    }
+    captureFrame.remove();
+  }
+  captureFrame = null;
+  captureSession = "";
+  captureCardNonce = "";
+  if (attachFrameHost) attachFrameHost.innerHTML = "";
+  if (attachOverlay) attachOverlay.hidden = true;
+}
+
+// Route a message that CLAIMS to be from the capture frame. PROVENANCE (R12): honored
+// ONLY when it comes from the exact window this chrome created (captureFrame.content-
+// Window) AND carries this session's id. A frame the ARTIFACT created - even one that
+// loaded /attachment-frame and posted `ready` - has a different source window, so it
+// can never bind, drive an upload, or relay state. Returns true if it was an
+// attachment-frame message so other frame handlers skip it.
 function handleAttachmentFrameMessage(event, message) {
   const type = String(message.type || "");
   if (!type.startsWith("lavish-attachment:")) return false;
+  if (!captureFrame || event.source !== captureFrame.contentWindow || message.session !== captureSession) {
+    return true;
+  }
   const source = event.source;
-  if (!source) return true;
-  const replyTo = (payload) => source.postMessage({ ...payload, channelId: message.channelId }, "*");
+  const replyTo = (payload) => source.postMessage({ ...payload, session: captureSession }, "*");
   if (type === "lavish-attachment:ready") {
-    const token = String(message.channelToken || "");
-    if (!token) return true;
-    // Retire the prior channel the instant a new frame announces (a card opened or
-    // switched), so a just-closed card's still-bound frame cannot relay its late
-    // state onto the new card during this frame's auth round trip (R11). The
-    // artifact-side per-card nonce is the authoritative drop; this closes the
-    // chrome-side window as well.
-    attachmentChannel = null;
-    attachmentPendingToken = token;
-    authenticateAttachmentChannel(token).then((authenticated) => {
-      // Only bind if this is still the newest ready (last-writer-wins on the frame,
-      // not on auth-resolution order) and the session is live.
-      if (authenticated && !ended && attachmentPendingToken === token) {
-        attachmentChannel = { window: source, channelId: token };
-        // Ack so the frame reports its initial state and the card reveals it. Stamp
-        // the AUTHENTICATED token as channelId (the `ready` message carries only
-        // `channelToken`, not `channelId`, so `replyTo` would send `undefined` and
-        // the frame's channel guard would drop the ack, leaving the card hidden).
-        source.postMessage({ type: "lavish-attachment:bound", channelId: token }, "*");
-      }
-    });
-    return true;
-  }
-  if (!attachmentChannel || source !== attachmentChannel.window || message.channelId !== attachmentChannel.channelId) {
-    return true;
-  }
-  if (type === "lavish-attachment:upload") {
+    // Ack so the frame reports its initial state and the overlay reveals the picker.
+    replyTo({ type: "lavish-attachment:bound" });
+  } else if (type === "lavish-attachment:upload") {
     uploadAttachment(message, replyTo);
   } else if (type === "lavish-attachment:state") {
-    // Relay ONLY the non-sensitive per-item state to the artifact card's mirror
-    // (never bytes) so it can gate queuing and collect ready refs (root A). Carry
-    // the frame's `cardNonce` through so the mirror applies the state only to the
-    // card that owns this frame, dropping a retired frame's late state (R11).
+    // Relay ONLY the non-sensitive per-item state to the artifact card's mirror (never
+    // bytes). Stamp the card nonce THIS picker was opened for (the chrome's own record,
+    // not a value the artifact can influence) so the mirror applies it only to that
+    // card (R11).
     postToFrame({
       type: "lavish:attachmentState",
       state: {
-        cardNonce: String(message.cardNonce || ""),
+        cardNonce: captureCardNonce,
         items: Array.isArray(message.items) ? message.items : [],
         capRejected: Boolean(message.capRejected),
         height: Number(message.height) || 0,
@@ -1608,9 +1624,18 @@ document.addEventListener("mousedown", (event) => {
   if (!moreMenu.hidden && !moreWrap.contains(target)) setMenuOpen(moreButton, moreMenu, false);
 });
 whiteboardCloseButton.onclick = closeWhiteboard;
+if (attachCloseButton) attachCloseButton.onclick = closeAttachPicker;
+if (attachDoneButton) attachDoneButton.onclick = closeAttachPicker;
+if (attachOverlay)
+  attachOverlay.addEventListener("click", (event) => {
+    // Click the backdrop (not the shell) to dismiss.
+    if (event.target === attachOverlay) closeAttachPicker();
+  });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    if (!whiteboardOverlay.hidden) {
+    if (attachOverlay && !attachOverlay.hidden) {
+      closeAttachPicker();
+    } else if (!whiteboardOverlay.hidden) {
       closeWhiteboard();
     } else if (!shareDialog.hidden) {
       closeShareDialog();

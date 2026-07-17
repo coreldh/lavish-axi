@@ -417,16 +417,15 @@ export function createArtifactSdk(
 
   // Per-card image attachment MIRROR (root A, R10). Image acquisition and every
   // byte now live in a chrome-served, sandboxed capture frame embedded in the card
-  // (see createAttachmentFrame / the `/attachment-frame` route); this artifact-realm
-  // controller never touches a File, an ArrayBuffer, or an object URL. It only holds
-  // the non-sensitive per-item state the chrome relays from that frame
-  // (`lavish:attachmentState`: localId, name, status, server-vetted id), so the card
-  // can gate queuing and collect the ready refs to ride along with the prompt. The
-  // frame owns all chip rendering; this side renders nothing.
+  // (the chrome-owned capture picker, R12); this artifact-realm controller never
+  // touches a File, an ArrayBuffer, or an object URL. It only holds the non-sensitive
+  // per-item state the chrome relays (`lavish:attachmentState`: name, status,
+  // server-vetted id), so the card can render NAME-ONLY chips, gate queuing, and
+  // collect the ready refs to ride along with the prompt.
   /**
-   * @param {{ notify?: (message: string) => void, onLayout?: (height: number) => void, cardNonce?: string }} [config]
+   * @param {{ notify?: (message: string) => void, onRender?: (items: Array<{ name: string, status: string, id: string }>) => void, cardNonce?: string }} [config]
    */
-  function makeAttachmentsController({ notify = () => {}, onLayout = () => {}, cardNonce = "" } = {}) {
+  function makeAttachmentsController({ notify = () => {}, onRender = () => {}, cardNonce = "" } = {}) {
     /** @type {Array<{ name: string, status: string, id: string }>} */
     let items = [];
     let capRejected = false;
@@ -445,12 +444,11 @@ export function createArtifactSdk(
       );
     }
 
-    // Replace the mirror from a chrome-relayed frame state message. A state stamped
-    // with a DIFFERENT card's nonce (a late message from a retired frame the user
-    // just closed) is dropped, never applied - so a freshly opened card can never
-    // pick up the previous card's screenshot (R11, extends root A). Values are
-    // coerced to primitives so a hostile relay (the chrome is trusted, but defense
-    // in depth) can never wedge collect/gating with non-strings.
+    // Replace the mirror from a chrome-relayed capture state message. A state stamped
+    // with a DIFFERENT card's nonce (a late relay for a card the user just closed) is
+    // dropped, never applied - so a freshly opened card can never pick up the previous
+    // card's screenshot (R11). Values are coerced to primitives so a hostile relay
+    // (the chrome is trusted, but defense in depth) can never wedge collect/gating.
     function applyState(state) {
       if (!attachmentStateAppliesToCard(state, cardNonce)) return;
       const list = Array.isArray(state?.items) ? state.items : [];
@@ -462,8 +460,7 @@ export function createArtifactSdk(
       capRejected = Boolean(state?.capRejected);
       if (!hasPending() && !hasErrors()) queueBlocked = false;
       refreshNotice();
-      const height = Number(state?.height);
-      onLayout(Number.isFinite(height) && height > 0 ? height : 0);
+      onRender(items.map((item) => ({ name: item.name, status: item.status, id: item.id })));
     }
 
     function collectReady() {
@@ -1709,9 +1706,35 @@ export function createArtifactSdk(
 
     shadow = host.attachShadow({ mode: "open" });
     const style = document.createElement("style");
-    style.textContent = `:host{all:initial;position:fixed;z-index:2147483647;left:0;top:0;color-scheme:dark;--ink-900:#0f1115;--ink-800:#11141a;--ink-700:#171a21;--ink-600:#1c212b;--steel-700:#2a2f3a;--steel-600:#303745;--steel-500:#3c4557;--steel-400:#8c96aa;--steel-300:#aeb6c6;--steel-200:#b9c0cf;--steel-100:#d8deea;--cream-50:#fffbf3;--cream-100:#f7f3ea;--cream-200:#e8e1cf;--brass-500:#f4c95d;--brass-400:#ffd877;--brass-ink:#17130a;--bg:var(--ink-900);--bg-panel:var(--ink-800);--bg-elevated:var(--ink-600);--fg:var(--cream-100);--fg-faint:var(--steel-300);--border:var(--steel-600);--accent:#f4c95d;--accent-hover:#ffd877;--font-sans:Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;--font-mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--radius-md:10px;--radius-xl:14px;--shadow-floating:0 20px 70px rgba(0,0,0,.35);font-family:var(--font-sans)}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.lavish-text-highlight{position:fixed;pointer-events:none;background:rgba(244,201,93,.28);border-radius:2px;box-shadow:0 0 0 1px rgba(244,201,93,.45)}.lavish-annotation-card{position:fixed;width:min(320px,calc(100vw - 24px));padding:12px;border-radius:var(--radius-xl);background:var(--bg-panel);color:var(--fg);border:1px solid var(--accent);box-shadow:var(--shadow-floating);font:14px/1.4 var(--font-sans)}.lavish-heading{font-weight:700;margin-bottom:6px}.lavish-annotation-card textarea{width:100%;min-height:86px;resize:vertical;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--bg);color:var(--fg);padding:9px;font:inherit;font-family:var(--font-sans)}.lavish-annotation-card textarea::placeholder{color:var(--fg-faint)}.lavish-annotation-card .lavish-hint{margin-top:6px;font-size:11px;color:var(--fg-faint)}.lavish-annotation-card .lavish-hint-alert{color:#ff9d7a;font-weight:700}.lavish-annotation-card .lavish-row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}.lavish-annotation-card button{border:0;border-radius:var(--radius-md);padding:8px 10px;font-family:var(--font-sans);font-size:13px;font-weight:700;cursor:pointer}.lavish-annotation-card button:active{opacity:.85}.lavish-annotation-card .lavish-send{background:var(--accent);color:var(--brass-ink)}.lavish-annotation-card .lavish-send:hover{background:var(--accent-hover)}.lavish-annotation-card .lavish-cancel{background:var(--steel-700);color:var(--fg)}.lavish-annotation-card .lavish-attach-frame{display:block;width:100%;height:40px;margin-top:8px;border:0;background:transparent;color-scheme:dark}`;
+    style.textContent = `:host{all:initial;position:fixed;z-index:2147483647;left:0;top:0;color-scheme:dark;--ink-900:#0f1115;--ink-800:#11141a;--ink-700:#171a21;--ink-600:#1c212b;--steel-700:#2a2f3a;--steel-600:#303745;--steel-500:#3c4557;--steel-400:#8c96aa;--steel-300:#aeb6c6;--steel-200:#b9c0cf;--steel-100:#d8deea;--cream-50:#fffbf3;--cream-100:#f7f3ea;--cream-200:#e8e1cf;--brass-500:#f4c95d;--brass-400:#ffd877;--brass-ink:#17130a;--bg:var(--ink-900);--bg-panel:var(--ink-800);--bg-elevated:var(--ink-600);--fg:var(--cream-100);--fg-faint:var(--steel-300);--border:var(--steel-600);--accent:#f4c95d;--accent-hover:#ffd877;--font-sans:Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;--font-mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--radius-md:10px;--radius-xl:14px;--shadow-floating:0 20px 70px rgba(0,0,0,.35);font-family:var(--font-sans)}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.lavish-text-highlight{position:fixed;pointer-events:none;background:rgba(244,201,93,.28);border-radius:2px;box-shadow:0 0 0 1px rgba(244,201,93,.45)}.lavish-annotation-card{position:fixed;width:min(320px,calc(100vw - 24px));padding:12px;border-radius:var(--radius-xl);background:var(--bg-panel);color:var(--fg);border:1px solid var(--accent);box-shadow:var(--shadow-floating);font:14px/1.4 var(--font-sans)}.lavish-heading{font-weight:700;margin-bottom:6px}.lavish-annotation-card textarea{width:100%;min-height:86px;resize:vertical;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--bg);color:var(--fg);padding:9px;font:inherit;font-family:var(--font-sans)}.lavish-annotation-card textarea::placeholder{color:var(--fg-faint)}.lavish-annotation-card .lavish-hint{margin-top:6px;font-size:11px;color:var(--fg-faint)}.lavish-annotation-card .lavish-hint-alert{color:#ff9d7a;font-weight:700}.lavish-annotation-card .lavish-row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}.lavish-annotation-card button{border:0;border-radius:var(--radius-md);padding:8px 10px;font-family:var(--font-sans);font-size:13px;font-weight:700;cursor:pointer}.lavish-annotation-card button:active{opacity:.85}.lavish-annotation-card .lavish-send{background:var(--accent);color:var(--brass-ink)}.lavish-annotation-card .lavish-send:hover{background:var(--accent-hover)}.lavish-annotation-card .lavish-cancel{background:var(--steel-700);color:var(--fg)}.lavish-attach-row{margin-top:8px}.lavish-annotation-card .lavish-attach{display:inline-flex;align-items:center;gap:6px;padding:6px 9px;background:var(--steel-700);color:var(--fg);font-size:12px}.lavish-annotation-card .lavish-attach:hover{background:var(--steel-600)}.lavish-attach-chips{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:132px;overflow-y:auto}.lavish-attach-chip{display:flex;align-items:center;gap:8px;padding:6px;border-radius:var(--radius-md);background:var(--bg);border:1px solid var(--border)}.lavish-attach-ico{flex:0 0 auto;color:var(--fg-faint)}.lavish-attach-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1 1 auto;min-width:0}.lavish-attach-status{font-size:11px;color:var(--fg-faint);flex:0 0 auto}.lavish-attach-status.is-err{color:#ff9d7a}`;
     shadow.appendChild(style);
     return shadow;
+  }
+
+  // Render NAME-ONLY chips for the attached images (R12). This artifact realm never
+  // renders the image pixels (an <img> here could be canvas-read); the real
+  // thumbnails live only in the trusted chrome picker and the conversation pills.
+  function renderAttachChips(container, items) {
+    if (!container) return;
+    container.innerHTML = (items || [])
+      .map((item) => {
+        const name = escapeAnnotationText(item.name || "image");
+        let status = "";
+        if (item.status === "uploading") status = '<span class="lavish-attach-status">Uploading…</span>';
+        else if (item.status === "error") status = '<span class="lavish-attach-status is-err">Couldn’t attach</span>';
+        else if (item.status === "ready") status = '<span class="lavish-attach-status">Attached</span>';
+        return (
+          '<div class="lavish-attach-chip"><svg class="lavish-attach-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span class="lavish-attach-name" title="' +
+          name +
+          '">' +
+          name +
+          "</span>" +
+          status +
+          "</div>"
+        );
+      })
+      .join("");
+    container.hidden = (items || []).length === 0;
   }
 
   function closeCard() {
@@ -1722,6 +1745,8 @@ export function createArtifactSdk(
     if (shadow) {
       for (const el of [...shadow.querySelectorAll(".lavish-annotation-card")]) el.remove();
     }
+    // Tell the chrome to close its capture picker if it was open for this card (R12).
+    parent.postMessage({ type: "lavish:closeAttachPicker" }, "*");
     clearHighlight(hovered);
     clearHighlight(selected);
     hovered = null;
@@ -1760,27 +1785,27 @@ export function createArtifactSdk(
           ? "Tell the agent what to change about this diagram node..."
           : "Tell the agent what to change about this element...";
     const sendNowHint = /Mac|iP(hone|ad|od)/.test(navigator.platform) ? "⌘" : "Ctrl";
-    // A fresh nonce for THIS card, threaded into its capture frame via the iframe
-    // query string; the frame echoes it on every relayed state so the mirror can
-    // drop a late state from the previous (retired) card's frame (R11).
+    // A fresh nonce for THIS card. The chrome stamps it on the relayed capture state
+    // so the mirror drops a late state from a previous (retired) card (R11).
     const cardNonce = "c" + ++attachmentCardCounter + Math.random().toString(36).slice(2);
-    // The attach control is a CHROME-SERVED, sandboxed iframe (root A): image
-    // acquisition and every byte live in `/attachment-frame`, never in this
-    // artifact realm. It carries an initial CSS height that shows the attach zone
-    // immediately (never display:none - a hidden iframe can measure its own content
-    // as 0 and never resize), and the card fine-tunes that height to the frame's
-    // reported content height as chips are added or removed.
+    // R12: the capture UI is CHROME-OWNED. This artifact-realm card never hosts the
+    // picker or any image bytes - it only REQUESTS the chrome's picker (the button
+    // posts `lavish:openAttachPicker`) and shows NAME-ONLY chips derived from the
+    // non-sensitive state the chrome relays. It deliberately renders no image pixels:
+    // an <img> of the attachment in this realm could be canvas-read by a hostile
+    // artifact, so the real thumbnails live only in trusted chrome surfaces.
     card.innerHTML =
       '<div class="lavish-heading">' +
       heading +
       '</div><textarea placeholder="' +
       placeholder +
-      '"></textarea><iframe class="lavish-attach-frame" title="Attach image" sandbox="allow-scripts allow-popups" src="/attachment-frame?card=' +
-      encodeURIComponent(cardNonce) +
-      '"></iframe>' +
+      '"></textarea><div class="lavish-attach-chips" data-attach-chips hidden></div>' +
+      '<div class="lavish-attach-row"><button class="lavish-attach" type="button">' +
+      '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>' +
+      "<span>Attach image</span></button></div>" +
       '<div class="lavish-hint">Enter to queue &middot; ' +
       sendNowHint +
-      "+Enter to send &middot; attach an image below" +
+      "+Enter to send &middot; attach an image" +
       '</div><div class="lavish-row"><button class="lavish-cancel" type="button">Cancel</button><button class="lavish-send" type="button">Queue</button></div>';
     root.appendChild(card);
 
@@ -1799,15 +1824,16 @@ export function createArtifactSdk(
     const textarea = /** @type {HTMLTextAreaElement | null} */ (card.querySelector("textarea"));
     const cancelButton = /** @type {HTMLButtonElement | null} */ (card.querySelector(".lavish-cancel"));
     const sendButton = /** @type {HTMLButtonElement | null} */ (card.querySelector(".lavish-send"));
-    const attachFrame = /** @type {HTMLIFrameElement | null} */ (card.querySelector(".lavish-attach-frame"));
+    const attachButton = /** @type {HTMLButtonElement | null} */ (card.querySelector(".lavish-attach"));
+    const chipsEl = /** @type {HTMLDivElement | null} */ (card.querySelector("[data-attach-chips]"));
     const attachNotice = /** @type {HTMLDivElement | null} */ (card.querySelector(".lavish-hint"));
-    if (!textarea || !cancelButton || !sendButton || !attachFrame) return;
+    if (!textarea || !cancelButton || !sendButton || !attachButton || !chipsEl) return;
 
     // The card has one notice line, shared by the neutral keyboard hint and by
     // a queue-attempt block (waiting on an upload, or a failed one). A block is an
     // error, so it must not inherit the hint's passive gray - it renders in the
     // error color until cleared, and clearing restores the hint rather than leaving
-    // stale red text behind. (Per-image capture problems render inside the frame.)
+    // stale red text behind. (Per-image capture problems render inside the picker.)
     const defaultHintHtml = attachNotice ? attachNotice.innerHTML : "";
     const notify = (message) => {
       if (!attachNotice) return;
@@ -1822,17 +1848,18 @@ export function createArtifactSdk(
     const attachments = makeAttachmentsController({
       notify,
       cardNonce,
-      onLayout: (height) => {
-        // Size the capture frame to its reported content height so a grown chip list
-        // is never clipped. The iframe is always laid out (an initial CSS height
-        // shows the attach zone immediately, never display:none - a hidden iframe can
-        // report scrollHeight 0 and never resize), so this only ever fine-tunes the
-        // height. Re-clamp the card back inside the viewport afterwards (W3).
-        if (height > 0) attachFrame.style.height = height + "px";
+      onRender: (items) => {
+        // Render NAME-ONLY chips from the relayed mirror (never image pixels - see the
+        // card comment). Then re-clamp the card inside the viewport (W3).
+        renderAttachChips(chipsEl, items);
         positionCard();
       },
     });
     activeAttachments = attachments;
+
+    // The attach button only asks the CHROME to open its own capture picker (R12);
+    // this realm never creates or hosts the picker.
+    attachButton.onclick = () => parent.postMessage({ type: "lavish:openAttachPicker", cardNonce }, "*");
 
     // Try to queue the card. Returns true only if a prompt was actually queued, so
     // the caller knows whether a follow-up "send now" should fire. Gates on any

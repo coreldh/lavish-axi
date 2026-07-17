@@ -1,24 +1,25 @@
 /* global document, window */
 
-// The trusted attachment-capture frame (root A, R10).
+// The trusted attachment-capture frame (root A / R10; provenance redesign R12).
 //
-// Image acquisition - the file picker, paste, and drop - used to run inside the
-// artifact's own (untrusted) JS realm, so a hostile artifact could read the
-// picked File, monkey-patch `File.prototype.arrayBuffer`, or watch the open
-// shadow root and exfiltrate a user-chosen screenshot before the chrome ever
-// mediated it. This module is the ONE surface where attachment bytes are ever
-// touched by capture code, and it runs in a CHROME-SERVED, sandboxed iframe
-// (opaque origin, no `allow-same-origin`) embedded as a sibling inside the
-// annotation card. Cross-origin frame isolation means the artifact realm cannot
-// reach into this frame's document, read its variables, or patch its prototypes,
-// so the File objects and their bytes never exist in a realm the artifact can
-// observe.
+// Image acquisition - the file picker, paste, and drop - and every byte read run
+// here, in a CHROME-SERVED, sandboxed iframe (opaque origin, no `allow-same-origin`).
 //
-// The frame has NO server access (matching the whiteboard frame): it reads bytes
-// locally, hands them to `window.top` (the chrome) over postMessage with a signed
-// channel token, and the chrome performs the same-origin upload and reports the
-// server-vetted id back. The artifact SDK only ever learns the non-sensitive
-// per-item state (name, status, server id) relayed by the chrome - never bytes.
+// R12 provenance: the chrome CREATES this iframe in its OWN capture overlay (its top
+// document), never in the artifact realm, and binds the capture channel ONLY to the
+// exact frame window it created (an `event.source` identity check). A hostile artifact
+// can still create its own `/attachment-frame` iframe and post `ready`, but the chrome
+// never holds that window as its capture frame, so it is ignored - the capability is
+// no longer mintable by the artifact. Earlier the frame was embedded in the annotation
+// card (artifact realm) and authenticated with a signed token the artifact could also
+// obtain by loading the same route, so any authenticated frame bound: THAT was the
+// trust-boundary hole this redesign closes.
+//
+// The frame has NO server access: it reads bytes locally and hands them to `window.top`
+// (the chrome, which is now its direct parent) over postMessage; the chrome performs
+// the same-origin upload and reports the server-vetted id back. The artifact SDK only
+// ever learns the non-sensitive per-item state (name, status, server id) the chrome
+// relays - never bytes.
 //
 // The pure classification helpers (`classifyAttachmentBatch`, `attachmentSizeError`,
 // `partitionDroppedFiles`, `deriveAttachmentNoticeState`) are the SAME exports the
@@ -30,17 +31,22 @@
  * same-scope-const contract `createSdkJs` uses), so it can be bundled without a
  * build step.
  *
- * @param {{ channelToken: string, maxCount?: number, maxBytes?: number }} config
+ * @param {{ maxCount?: number, maxBytes?: number }} config
  * @param {{ classifyAttachmentBatch: Function, partitionDroppedFiles: Function, deriveAttachmentNoticeState: Function }} helpers
  */
 export function createAttachmentFrame(config, helpers) {
   const { classifyAttachmentBatch, partitionDroppedFiles, deriveAttachmentNoticeState } = helpers;
-  const channelToken = String(config.channelToken || "");
+  const params = new URLSearchParams(window.location.search);
+  // The chrome created THIS frame in its own DOM and stamped a fresh per-open session
+  // id into the query string; the frame echoes it on every message so the chrome can
+  // correlate them (R12). This id is NOT the security boundary - the chrome binds the
+  // capture channel ONLY to the exact frame window it created (event.source identity),
+  // which the artifact realm cannot forge - it is only a per-session correlation tag.
+  const session = params.get("session") || "";
   // The nonce of the card that opened this frame, threaded in via the iframe query
-  // string by the SDK. Echoed on every relayed state so the artifact card's mirror
-  // can drop a late state from a retired frame (R11) instead of applying it to a
-  // freshly opened card.
-  const cardNonce = new URLSearchParams(window.location.search).get("card") || "";
+  // string. Echoed on every relayed state so the artifact card's mirror can drop a
+  // late state from a retired frame (R11) instead of applying it to a fresh card.
+  const cardNonce = params.get("card") || "";
   const MAX_COUNT = Number.isFinite(config.maxCount) && config.maxCount > 0 ? config.maxCount : 4;
   const MAX_BYTES = Number.isFinite(config.maxBytes) && config.maxBytes > 0 ? config.maxBytes : 0;
   const ACCEPTED_MIME = { "image/png": true, "image/jpeg": true, "image/webp": true };
@@ -121,7 +127,7 @@ export function createAttachmentFrame(config, helpers) {
     chrome.postMessage(
       {
         type: "lavish-attachment:state",
-        channelId: channelToken,
+        session,
         cardNonce,
         capRejected,
         // The card sizes the iframe to this content height, so a grown chip list is
@@ -179,7 +185,7 @@ export function createAttachmentFrame(config, helpers) {
         chrome.postMessage(
           {
             type: "lavish-attachment:upload",
-            channelId: channelToken,
+            session,
             localId: item.localId,
             name: item.name,
             mime: item.mime,
@@ -280,19 +286,19 @@ export function createAttachmentFrame(config, helpers) {
     render();
   }
 
-  // Only the chrome (window.top) may command this frame. The artifact parent can
-  // postMessage to this iframe (it created the element), so a bare source check is
-  // not enough: bind to `window.top` and the channel token.
+  // Only the chrome (window.top) may command this frame. This frame is a direct child
+  // of the chrome's own document (R12: the chrome created it in its capture overlay),
+  // so window.top is the chrome; commands must come from it and carry this frame's
+  // session id.
   window.addEventListener("message", (event) => {
     if (event.source !== chrome) return;
     const msg = event.data || {};
-    if (msg.channelId !== channelToken) return;
+    if (msg.session !== session) return;
     if (msg.type === "lavish-attachment:uploadResult") {
       handleResult(msg.localId, msg.ok, msg.id, msg.error);
     } else if (msg.type === "lavish-attachment:bound") {
-      // The chrome authenticated our channel and can now relay our state; report the
-      // initial (empty) state so the card sizes and reveals this frame right away,
-      // rather than staying hidden until the first capture.
+      // The chrome acknowledged this frame; report the initial (empty) state so the
+      // overlay reveals the capture UI right away rather than waiting for a capture.
       reportState();
     }
   });
@@ -331,7 +337,8 @@ export function createAttachmentFrame(config, helpers) {
   });
 
   render();
-  // Announce readiness so the chrome authenticates the token and binds this
-  // frame's window as the current capture channel.
-  chrome.postMessage({ type: "lavish-attachment:ready", channelToken }, "*");
+  // Announce readiness. The chrome binds THIS frame only because it recognizes the
+  // sending window as the exact frame it created (event.source identity) - provenance
+  // the artifact realm cannot forge (R12). The session id is echoed for correlation.
+  chrome.postMessage({ type: "lavish-attachment:ready", session }, "*");
 }

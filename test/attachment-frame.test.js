@@ -51,7 +51,7 @@ function makeElement() {
   };
 }
 
-function bootFrame({ channelToken = "tok-1", maxCount = 4, maxBytes = 0, cardNonce = "cardA" } = {}) {
+function bootFrame({ session = "sess-1", maxCount = 4, maxBytes = 0, cardNonce = "cardA" } = {}) {
   const elements = {
     list: makeElement(),
     notice: makeElement(),
@@ -71,7 +71,11 @@ function bootFrame({ channelToken = "tok-1", maxCount = 4, maxBytes = 0, cardNon
     console,
     window: {
       top: topWindow,
-      location: { search: cardNonce ? "?card=" + encodeURIComponent(cardNonce) : "" },
+      location: {
+        search:
+          "?" +
+          new URLSearchParams(Object.entries({ session, card: cardNonce }).filter(([, v]) => v !== "")).toString(),
+      },
       addEventListener(type, handler) {
         windowListeners.set(type, handler);
       },
@@ -94,13 +98,13 @@ function bootFrame({ channelToken = "tok-1", maxCount = 4, maxBytes = 0, cardNon
       revokeObjectURL() {},
     },
   };
-  vm.runInNewContext(createAttachmentFrameJs({ channelToken, maxCount, maxBytes }), context, {
+  vm.runInNewContext(createAttachmentFrameJs({ maxCount, maxBytes }), context, {
     filename: "attachment-frame.js",
   });
   return {
     elements,
     postedToTop,
-    channelToken,
+    session,
     // Deliver a message "from the chrome" (event.source === window.top).
     fromTop(data) {
       const handler = windowListeners.get("message");
@@ -127,17 +131,17 @@ function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-test("the frame announces readiness with its channel token", () => {
-  const frame = bootFrame({ channelToken: "abc" });
+test("the frame announces readiness with its session id (R12)", () => {
+  const frame = bootFrame({ session: "abc" });
   const ready = frame.postedToTop.find((m) => m.type === "lavish-attachment:ready");
   assert.ok(ready);
-  assert.equal(ready.channelToken, "abc");
+  assert.equal(ready.session, "abc");
 });
 
 test("the frame reports its initial state when the chrome acks the binding (reveal)", () => {
-  const frame = bootFrame({ channelToken: "abc" });
+  const frame = bootFrame({ session: "abc" });
   const before = frame.postedToTop.filter((m) => m.type === "lavish-attachment:state").length;
-  frame.fromTop({ type: "lavish-attachment:bound", channelId: "abc" });
+  frame.fromTop({ type: "lavish-attachment:bound", session: "abc" });
   const state = frame.lastState();
   assert.ok(state, "an initial state is reported on bind");
   assert.equal(state.items.length, 0);
@@ -152,8 +156,8 @@ test("the frame reports its initial state when the chrome acks the binding (reve
 });
 
 test("the frame stamps its cardNonce on the reveal state AND every later state (R11)", async () => {
-  const frame = bootFrame({ channelToken: "abc", cardNonce: "cardA" });
-  frame.fromTop({ type: "lavish-attachment:bound", channelId: "abc" });
+  const frame = bootFrame({ session: "abc", cardNonce: "cardA" });
+  frame.fromTop({ type: "lavish-attachment:bound", session: "abc" });
   // Reveal state carries the nonce.
   assert.equal(frame.lastState().cardNonce, "cardA");
   // A capture triggers more state reports; all carry the same nonce.
@@ -169,8 +173,8 @@ test("the frame stamps its cardNonce on the reveal state AND every later state (
 });
 
 test("a frame with no ?card query param stamps an empty nonce, failing closed (R11)", () => {
-  const frame = bootFrame({ channelToken: "abc", cardNonce: "" });
-  frame.fromTop({ type: "lavish-attachment:bound", channelId: "abc" });
+  const frame = bootFrame({ session: "abc", cardNonce: "" });
+  frame.fromTop({ type: "lavish-attachment:bound", session: "abc" });
   assert.equal(frame.lastState().cardNonce, "", "no card param -> empty nonce (mirror fails closed)");
 });
 
@@ -178,8 +182,8 @@ test("a card nonce with URL-special characters round-trips through the query str
   // Real nonces are [c0-9a-z], but the encode(SDK)->decode(frame) contract must be
   // exact for any value, or a legit card's own state would fail to match.
   const weird = "c1 a&b=c%d/e";
-  const frame = bootFrame({ channelToken: "abc", cardNonce: weird });
-  frame.fromTop({ type: "lavish-attachment:bound", channelId: "abc" });
+  const frame = bootFrame({ session: "abc", cardNonce: weird });
+  frame.fromTop({ type: "lavish-attachment:bound", session: "abc" });
   assert.equal(frame.lastState().cardNonce, weird, "the nonce survives encode/decode intact");
 });
 
@@ -188,11 +192,11 @@ test("a paste captured before any bound ack still ships bytes and stamps the non
   // read bytes and post the upload/state (each carrying the card nonce). Whether the
   // chrome accepts an upload before it has bound is the chrome's concern; the frame
   // never loses the capture or the nonce.
-  const frame = bootFrame({ channelToken: "abc", cardNonce: "cardA" });
+  const frame = bootFrame({ session: "abc", cardNonce: "cardA" });
   frame.firePaste({ files: [fakeFile("paste.png", "image/png")] });
   await flush();
   assert.equal(frame.uploads().length, 1, "the paste is captured and its bytes shipped");
-  assert.equal(frame.uploads()[0].channelId, "abc");
+  assert.equal(frame.uploads()[0].session, "abc");
   assert.equal(frame.lastState().cardNonce, "cardA", "the pre-bind state still carries the nonce");
 });
 
@@ -203,7 +207,7 @@ test("a picked image is read in the frame and its bytes are shipped to window.to
   await flush();
   const uploads = frame.uploads();
   assert.equal(uploads.length, 1);
-  assert.equal(uploads[0].channelId, frame.channelToken);
+  assert.equal(uploads[0].session, frame.session);
   assert.equal(uploads[0].name, "shot.png");
   assert.ok(uploads[0].bytes instanceof ArrayBuffer, "the frame ships the raw bytes to the chrome");
   // While uploading, the relayed state marks the item pending and carries no bytes.
@@ -221,23 +225,23 @@ test("an upload result from the chrome marks the item ready with the server id",
   await flush();
   const localId = frame.uploads()[0].localId;
   const id = "a".repeat(64) + ".png";
-  frame.fromTop({ type: "lavish-attachment:uploadResult", channelId: frame.channelToken, localId, ok: true, id });
+  frame.fromTop({ type: "lavish-attachment:uploadResult", session: frame.session, localId, ok: true, id });
   const state = frame.lastState();
   assert.equal(state.items[0].status, "ready");
   assert.equal(state.items[0].id, id);
 });
 
-test("the frame ignores results not from window.top or with a wrong channel token (root A / E1)", async () => {
-  const frame = bootFrame({ channelToken: "real" });
+test("the frame ignores commands not from window.top or with a wrong session (root A / R12)", async () => {
+  const frame = bootFrame({ session: "real" });
   frame.elements.file.files = [fakeFile("shot.png", "image/png")];
   frame.elements.file.fire("change");
   await flush();
   const localId = frame.uploads()[0].localId;
   const id = "a".repeat(64) + ".png";
   // Not from window.top (e.g. the artifact parent posting into the frame).
-  frame.fromOther({ type: "lavish-attachment:uploadResult", channelId: "real", localId, ok: true, id });
-  // From top but wrong channel token.
-  frame.fromTop({ type: "lavish-attachment:uploadResult", channelId: "forged", localId, ok: true, id });
+  frame.fromOther({ type: "lavish-attachment:uploadResult", session: "real", localId, ok: true, id });
+  // From top but a mismatched session.
+  frame.fromTop({ type: "lavish-attachment:uploadResult", session: "forged", localId, ok: true, id });
   assert.equal(frame.lastState().items[0].status, "uploading", "neither hostile result marks the item ready");
 });
 
@@ -259,15 +263,18 @@ test("a pasted image is captured by the frame, not the artifact card", async () 
   assert.equal(frame.uploads()[0].name, "paste.png");
 });
 
-test("the frame HTML carries the channel token and a scripts-only sandbox posture", () => {
-  const html = createAttachmentFrameHtml("token-xyz", { maxCount: 4, maxBytes: 10 });
-  assert.match(html, /token-xyz/);
+test("the frame HTML carries NO capability token - it is inert until the chrome binds it (R12)", () => {
+  // R12: the page grants nothing on its own. The session id and card nonce ride in the
+  // query string the chrome sets; the chrome binds by frame identity, not any token in
+  // the page. So loading /attachment-frame gives an artifact no capability.
+  const html = createAttachmentFrameHtml({ maxCount: 4, maxBytes: 10 });
+  assert.doesNotMatch(html, /channelToken|"channelToken"/, "no channel token is embedded");
   assert.match(html, /accept="image\/png,image\/jpeg,image\/webp"/);
   assert.match(html, /id="zone"/);
 });
 
 test("the frame bundle gates size before reading and reads bytes ONLY here (root A)", () => {
-  const js = createAttachmentFrameJs({ channelToken: "t", maxBytes: 10 });
+  const js = createAttachmentFrameJs({ maxBytes: 10 });
   // The classifier gate runs before any createObjectURL / arrayBuffer.
   const gateAt = js.indexOf("classifyAttachmentBatch(files, {");
   const urlAt = js.indexOf("URL.createObjectURL");

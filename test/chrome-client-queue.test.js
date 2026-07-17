@@ -166,6 +166,7 @@ async function createChromeHarness({
     },
     navigator: {},
     setTimeout: fakeSetTimeout,
+    URLSearchParams,
     URL: {
       createObjectURL() {
         return "blob:lavish-test";
@@ -195,6 +196,27 @@ async function createChromeHarness({
       createElement(tag) {
         const el = element(`${tag}-${elements.size}`);
         el.tagName = tag.toUpperCase();
+        if (tag === "iframe") {
+          // R12: the chrome creates its OWN capture iframe. Give it a contentWindow
+          // (the provenance identity the chrome binds to) and a recorded src.
+          const framePosted = [];
+          el.framePosted = framePosted;
+          el.contentWindow = {
+            postMessage(message) {
+              framePosted.push(message);
+            },
+          };
+          let srcVal = "";
+          Object.defineProperty(el, "src", {
+            get() {
+              return srcVal;
+            },
+            set(value) {
+              srcVal = String(value);
+            },
+            configurable: true,
+          });
+        }
         return el;
       },
       execCommand() {
@@ -238,10 +260,46 @@ async function createChromeHarness({
       inlineWhiteboards.push(whiteboard);
       return whiteboard;
     },
-    // A nested capture frame (root A): its own source window, its own posted-message
-    // sink, and a `send` that dispatches a message to the chrome as if from that
-    // frame (event.source === this frame's window). `ready(token)` binds the channel.
-    createAttachmentFrame(token = "tok-" + Math.random().toString(36).slice(2)) {
+    // Open the CHROME-OWNED capture picker (R12): dispatch the artifact card's
+    // `lavish:openAttachPicker` so the chrome creates its own capture iframe, then
+    // return a controller for THAT frame - the one the chrome will bind by identity.
+    // `session` is read from the src the chrome stamped.
+    openCapturePicker(cardNonce = "cardA") {
+      const handlers = () => windowListeners.get("message") || [];
+      for (const handler of handlers())
+        handler({ source: frame.contentWindow, data: { type: "lavish:openAttachPicker", cardNonce } });
+      const host = element("attachFrameHost");
+      const iframe = host.lastAppendedChild;
+      assert.ok(iframe && iframe.contentWindow, "the chrome created a capture iframe");
+      const params = new URLSearchParams(String(iframe.src).split("?")[1] || "");
+      const session = params.get("session") || "";
+      const source = iframe.contentWindow;
+      const posted = iframe.framePosted;
+      const send = (data) => {
+        for (const handler of handlers()) handler({ source, data });
+      };
+      return {
+        source,
+        posted,
+        session,
+        cardNonce,
+        iframe,
+        send,
+        ready: () => send({ type: "lavish-attachment:ready", session }),
+        bound: () => send({ type: "lavish-attachment:bound", session }),
+        upload: (message) => send({ type: "lavish-attachment:upload", session, ...message }),
+        state: (message) => send({ type: "lavish-attachment:state", session, ...message }),
+        result(localId) {
+          return posted.find((m) => m.type === "lavish-attachment:uploadResult" && m.localId === localId);
+        },
+        boundAck() {
+          return posted.find((m) => m.type === "lavish-attachment:bound");
+        },
+      };
+    },
+    // A frame the chrome did NOT create - i.e. one a HOSTILE artifact minted itself.
+    // Its source is NOT the chrome's capture frame, so the chrome must ignore it (R12).
+    createHostileFrame(session = "guessed-" + Math.random().toString(36).slice(2)) {
       const posted = [];
       const source = {
         postMessage(message) {
@@ -249,18 +307,16 @@ async function createChromeHarness({
         },
       };
       const send = (data) => {
-        const handlers = windowListeners.get("message") || [];
-        assert.ok(handlers.length > 0, "chrome-client registered a message handler");
-        for (const handler of handlers) handler({ source, data });
+        for (const handler of windowListeners.get("message") || []) handler({ source, data });
       };
       return {
         source,
         posted,
-        token,
+        session,
         send,
-        ready: () => send({ type: "lavish-attachment:ready", channelToken: token }),
-        upload: (message) => send({ type: "lavish-attachment:upload", channelId: token, ...message }),
-        state: (message) => send({ type: "lavish-attachment:state", channelId: token, ...message }),
+        ready: () => send({ type: "lavish-attachment:ready", session }),
+        upload: (message) => send({ type: "lavish-attachment:upload", session, ...message }),
+        state: (message) => send({ type: "lavish-attachment:state", session, ...message }),
         result(localId) {
           return posted.find((m) => m.type === "lavish-attachment:uploadResult" && m.localId === localId);
         },
@@ -364,18 +420,16 @@ test("chrome client scrolls new chat bubbles into view above queued prompts", as
   assert.equal(panelScroll.scrollTop, 640);
 });
 
-test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confused-deputy guard)", async () => {
+test("chrome mediates uploads for its own capture picker: rate + cumulative-byte ceiling", async () => {
   let fetches = 0;
   const chrome = await createChromeHarness({
-    fetchImpl: async (url) => {
-      if (String(url).includes("/attachment-channel")) return { ok: true };
+    fetchImpl: async () => {
       fetches += 1;
       return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
-  const af = chrome.createAttachmentFrame();
-  af.ready();
-  await flushPromises(); // channel authenticated
+  const af = chrome.openCapturePicker();
+  af.ready(); // the chrome created this frame, so it binds by identity (no token)
 
   af.upload({ localId: "invalid", mime: "image/png", bytes: { byteLength: 16 } });
   await flushPromises();
@@ -392,9 +446,7 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
   assert.equal(quotaResult.ok, false);
   assert.match(quotaResult.error, /Upload limit reached/);
 
-  // Small uploads flow until the per-window rate cap (30), then are throttled. Each
-  // is let settle before the next so the in-flight bound (its own test) never blocks;
-  // here we are exercising the RATE cap, which counts uploads that reached the network.
+  // Small uploads flow until the per-window rate cap (30), then are throttled.
   for (let i = 0; i < 30; i += 1) {
     af.upload({ localId: "ok-" + i, mime: "image/png", bytes: new ArrayBuffer(16) });
     await flushPromises();
@@ -409,106 +461,74 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
   assert.match(throttled.error, /Too many uploads/);
 });
 
-test("the chrome acks a bound capture frame with its token as channelId (reveal handshake)", async () => {
-  // The `ready` message carries `channelToken`, not `channelId`. The bound ack must
-  // be stamped with the AUTHENTICATED token so the frame's channel guard accepts it
-  // and re-reports state (which reveals the otherwise-hidden capture iframe). A reply
-  // stamped with the ready message's (absent) `channelId` would ship `undefined` and
-  // the frame would silently drop it, killing the whole attach flow.
-  const chrome = await createChromeHarness({
-    fetchImpl: async (url) => (String(url).includes("/attachment-channel") ? { ok: true } : { ok: true }),
-  });
-  const af = chrome.createAttachmentFrame("the-token");
+test("the chrome acks the capture frame it created so the picker reveals (R12)", async () => {
+  const chrome = await createChromeHarness();
+  const af = chrome.openCapturePicker();
   af.ready();
-  await flushPromises();
-  const bound = af.posted.find((m) => m.type === "lavish-attachment:bound");
-  assert.ok(bound, "the chrome acks the binding back to the frame");
-  assert.equal(bound.channelId, "the-token", "the ack carries the frame's own token so its channel guard accepts it");
+  const bound = af.boundAck();
+  assert.ok(bound, "the chrome acks the frame it created");
+  assert.equal(bound.session, af.session, "the ack carries this frame's session so its guard accepts it");
 });
 
-test("the chrome ignores attachment uploads from an unauthenticated (unbound) frame (root A)", async () => {
-  // A frame that never presented a valid channel token - e.g. a hostile artifact
-  // posting to window.top pretending to be a capture frame - must not drive an
-  // upload. Only a frame the server authenticated (real, chrome-served token) binds.
+test("HOSTILE ARTIFACT cannot capture the channel via a self-minted frame (R12 fix)", async () => {
+  // THE ROUND-12 FINDING (server.js:699, blame 04491ea3 = our crew) - now FIXED.
+  // A hostile artifact can still create its own `/attachment-frame` iframe and post
+  // `ready`, but the chrome binds the capture channel ONLY to the exact frame WINDOW
+  // it created itself. A frame minted in the artifact realm has a different source
+  // window, so it can never drive an upload. This must hold whether or not the user
+  // has a legitimate picker open.
+  let uploads = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => {
+      uploads += 1;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+  // (a) No legitimate picker open: a hostile frame's ready/upload is ignored.
+  const hostile = chrome.createHostileFrame("guessed-session");
+  hostile.ready();
+  hostile.upload({ localId: "exfil", mime: "image/png", bytes: new ArrayBuffer(16) });
+  await flushPromises();
+  assert.equal(uploads, 0, "an artifact-minted frame cannot drive the channel with no picker open");
+  assert.equal(hostile.result("exfil"), undefined, "and receives no result");
+
+  // (b) A legitimate picker IS open: the hostile frame reuses the SAME session id but
+  // its source window is not the chrome's created frame, so it is still rejected.
+  const legit = chrome.openCapturePicker();
+  legit.ready();
+  const hijacker = chrome.createHostileFrame(legit.session);
+  hijacker.upload({ localId: "exfil2", mime: "image/png", bytes: new ArrayBuffer(16) });
+  await flushPromises();
+  assert.equal(uploads, 0, "even with the real session id, a non-chrome-created frame cannot drive the channel");
+  assert.equal(hijacker.result("exfil2"), undefined, "the hijacker receives no result");
+});
+
+test("the chrome ignores a message whose session mismatches its capture frame (R12)", async () => {
+  // The source-identity check is the boundary, but the session id is also required, so
+  // a stale message from a prior picker (after the user reopened) is dropped too.
   let fetches = 0;
   const chrome = await createChromeHarness({
-    fetchImpl: async (url) => {
-      if (String(url).includes("/attachment-channel")) return { ok: false };
+    fetchImpl: async () => {
       fetches += 1;
       return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker();
   af.ready();
-  await flushPromises(); // auth REJECTED, so no binding
-  af.upload({ localId: "x", mime: "image/png", bytes: new ArrayBuffer(16) });
-  await flushPromises();
-  assert.equal(fetches, 0, "an unbound frame's upload never reaches the network");
-  assert.equal(af.result("x"), undefined, "and gets no result echoed back");
-});
-
-test("a newer capture frame wins the channel even if an older frame's auth resolves last (root A rebind race)", async () => {
-  // Two overlapping cards: frame A announces, then A closes and frame B announces,
-  // then A's channel-auth fetch resolves AFTER B's. Binding must stay on B (the live
-  // card), not clobber back to A's dead frame - else B's uploads wedge.
-  const resolvers = {};
-  const chrome = await createChromeHarness({
-    fetchImpl: (url, init) => {
-      if (!String(url).includes("/attachment-channel")) return Promise.resolve({ ok: true, json: async () => ({}) });
-      const token = JSON.parse(init.body).token;
-      return new Promise((resolve) => {
-        resolvers[token] = () => resolve(/** @type {any} */ ({ ok: true }));
-      });
-    },
-  });
-  const a = chrome.createAttachmentFrame("token-A");
-  const b = chrome.createAttachmentFrame("token-B");
-  a.ready();
-  b.ready();
-  // Resolve B first (it is the newest), then A (out of order).
-  resolvers["token-B"]();
-  await flushPromises();
-  resolvers["token-A"]();
-  await flushPromises();
-
-  // B is bound: an upload from B is accepted, an upload from the stale A is ignored.
-  let uploadFetches = 0;
-  chrome.eventSource; // touch to avoid unused lint if any
-  b.send({ type: "lavish-attachment:state", channelId: "token-B", items: [], height: 40 });
-  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState");
-  assert.ok(relayed.length > 0, "the newest frame's state is relayed (it holds the channel)");
-  a.send({
-    type: "lavish-attachment:state",
-    channelId: "token-A",
-    items: [{ localId: "x", status: "ready", id: "y" }],
-  });
-  const relayedAfterA = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState");
-  assert.equal(relayedAfterA.length, relayed.length, "the stale frame cannot drive state through the channel");
-  void uploadFetches;
-});
-
-test("the chrome ignores an upload carrying the wrong channel token (root A)", async () => {
-  let fetches = 0;
-  const chrome = await createChromeHarness({
-    fetchImpl: async (url) => {
-      if (String(url).includes("/attachment-channel")) return { ok: true };
-      fetches += 1;
-      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
-    },
-  });
-  const af = chrome.createAttachmentFrame("real-token");
-  af.ready();
-  await flushPromises();
-  // Same source window, but a forged channelId: rejected.
+  // A message from the (correct) frame window but carrying a stale/forged session id.
   af.send({
     type: "lavish-attachment:upload",
-    channelId: "forged",
+    session: "stale",
     localId: "x",
     mime: "image/png",
     bytes: new ArrayBuffer(16),
   });
   await flushPromises();
-  assert.equal(fetches, 0, "an upload with a mismatched channel token never reaches the network");
+  assert.equal(fetches, 0, "a session mismatch drops the upload");
+  // The correct session still works.
+  af.upload({ localId: "y", mime: "image/png", bytes: new ArrayBuffer(16) });
+  await flushPromises();
+  assert.equal(fetches, 1, "the matching session drives the upload");
 });
 
 test("chrome client posts layout warnings from the artifact iframe", async () => {
@@ -1527,18 +1547,16 @@ test("whiteboard close stays responsive while overlay initialization is pending"
   await flushPromises();
 });
 
-test("chrome uploads captured attachment bytes and reports the server id to the capture frame", async () => {
+test("chrome uploads captured attachment bytes and reports the server id to its capture frame", async () => {
   const requests = [];
   const chrome = await createChromeHarness({
     fetchImpl: async (url, options) => {
-      if (String(url).includes("/attachment-channel")) return { ok: true };
       requests.push({ url, options });
       return { ok: true, json: async () => ({ status: "stored", attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker();
   af.ready();
-  await flushPromises();
 
   const bytes = new Uint8Array([1, 2, 3]).buffer;
   af.upload({ localId: "att-1", name: "mock.png", mime: "image/png", bytes });
@@ -1552,18 +1570,17 @@ test("chrome uploads captured attachment bytes and reports the server id to the 
   const result = af.result("att-1");
   assert.equal(result.ok, true);
   assert.equal(result.id, "a".repeat(64) + ".png");
-  assert.equal(result.channelId, af.token);
+  assert.equal(result.session, af.session);
   assert.ok(
     !chrome.postedToFrame.some((m) => m.type === "lavish:attachmentResult"),
     "no attachment bytes or result are ever posted into the artifact realm",
   );
 });
 
-test("chrome relays only non-sensitive capture-frame state to the artifact card (root A)", async () => {
+test("chrome relays only non-sensitive capture state to the artifact card (root A)", async () => {
   const chrome = await createChromeHarness();
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker("cardA");
   af.ready();
-  await flushPromises();
   const id = "a".repeat(64) + ".png";
   af.state({
     capRejected: true,
@@ -1579,185 +1596,63 @@ test("chrome relays only non-sensitive capture-frame state to the artifact card 
   assert.equal(JSON.stringify(relayed).includes("lavish-attachment:upload"), false);
 });
 
-test("chrome carries the frame's cardNonce through so the mirror can correlate (R11)", async () => {
+test("the chrome stamps the picker's OWN card nonce on the relay, not a frame-supplied one (R11/R12)", async () => {
+  // The card nonce is the chrome's own record from openAttachPicker - the artifact
+  // cannot influence it, and the mirror correlates against it (R11).
   const chrome = await createChromeHarness();
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker("cardXYZ");
   af.ready();
-  await flushPromises();
-  af.state({ cardNonce: "cardA", items: [], height: 40 });
+  // Even if the frame echoes a DIFFERENT nonce, the chrome relays its own record.
+  af.state({ cardNonce: "attacker-supplied", items: [], height: 40 });
   const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
-  assert.equal(relayed.state.cardNonce, "cardA", "the relay carries the frame's card nonce for mirror correlation");
+  assert.equal(relayed.state.cardNonce, "cardXYZ", "the relay carries the picker's own card nonce");
 });
 
-test("the chrome retires the prior channel synchronously on ready, before auth resolves (R11)", async () => {
-  // The critical window: card A is bound; card B's frame announces but its async auth
-  // has NOT resolved yet. A's still-live frame must be unable to relay in this gap -
-  // the retire happens the instant B's ready is seen, not when B binds.
-  const chrome = await createChromeHarness();
-  const a = chrome.createAttachmentFrame("token-A");
-  a.ready();
-  await flushPromises(); // A bound
-  a.state({
-    cardNonce: "cardA",
-    items: [{ localId: "att-1", status: "ready", id: "z".repeat(64) + ".png" }],
-    height: 60,
-  });
-  const before = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
-
-  const b = chrome.createAttachmentFrame("token-B");
-  b.ready(); // NOTE: no flush - B's auth is still pending
-  // A fires a late state in the pre-auth window.
-  a.state({
-    cardNonce: "cardA",
-    items: [{ localId: "att-1", name: "secret.png", status: "ready", id: "z".repeat(64) + ".png" }],
-    height: 60,
-  });
-  const after = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
-  assert.equal(after, before, "A's late state is dropped the instant B announces, before B's auth resolves");
-});
-
-test("concurrent three-card switch: only the newest frame holds the channel (R11)", async () => {
-  const chrome = await createChromeHarness();
-  const a = chrome.createAttachmentFrame("A");
-  const b = chrome.createAttachmentFrame("B");
-  const c = chrome.createAttachmentFrame("C");
-  a.ready();
-  await flushPromises();
-  b.ready();
-  await flushPromises();
-  c.ready();
-  await flushPromises();
-  const before = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
-  // A and B are retired; their late states must be dropped.
-  a.state({
-    cardNonce: "cardA",
-    items: [{ localId: "att-1", status: "ready", id: "a".repeat(64) + ".png" }],
-    height: 60,
-  });
-  b.state({
-    cardNonce: "cardB",
-    items: [{ localId: "att-1", status: "ready", id: "b".repeat(64) + ".png" }],
-    height: 60,
-  });
-  assert.equal(
-    chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length,
-    before,
-    "retired A and B cannot relay",
-  );
-  // Only C (the newest, bound) relays, carrying its own nonce.
-  c.state({ cardNonce: "cardC", items: [], height: 40 });
-  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
-  assert.equal(relayed.state.cardNonce, "cardC", "only the newest bound frame relays");
-});
-
-test("out-of-order auth across three frames binds only the newest (R11)", async () => {
-  const resolvers = {};
+test("opening a new picker retires the prior frame: it can no longer upload or relay (R12)", async () => {
+  // The R12 analog of the R11 stale-frame concern. Opening a second picker tears down
+  // the first frame and binds the new one; the OLD frame's window is no longer the
+  // capture frame, so its late upload and state are dropped.
+  let uploads = 0;
   const chrome = await createChromeHarness({
-    fetchImpl: (url, init) => {
-      if (!String(url).includes("/attachment-channel")) return Promise.resolve({ ok: true, json: async () => ({}) });
-      const token = JSON.parse(init.body).token;
-      return new Promise((resolve) => {
-        resolvers[token] = () => resolve(/** @type {any} */ ({ ok: true }));
-      });
-    },
-  });
-  const a = chrome.createAttachmentFrame("A");
-  const b = chrome.createAttachmentFrame("B");
-  const c = chrome.createAttachmentFrame("C");
-  a.ready();
-  b.ready();
-  c.ready();
-  // Resolve auth out of order: B, then C (newest), then A.
-  resolvers["B"]();
-  await flushPromises();
-  resolvers["C"]();
-  await flushPromises();
-  resolvers["A"]();
-  await flushPromises();
-  // Only C (the last ready) may hold the channel; A and B cannot relay.
-  a.state({ cardNonce: "cardA", items: [{ localId: "x", status: "ready", id: "a".repeat(64) + ".png" }] });
-  b.state({ cardNonce: "cardB", items: [{ localId: "x", status: "ready", id: "b".repeat(64) + ".png" }] });
-  const before = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
-  assert.equal(before, 0, "neither A nor B (older readys) can relay after out-of-order auth");
-  c.state({ cardNonce: "cardC", items: [], height: 40 });
-  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
-  assert.ok(relayed && relayed.state.cardNonce === "cardC", "only the newest ready binds and relays");
-});
-
-test("a state message without a cardNonce relays an empty nonce so the mirror fails closed (R11)", async () => {
-  const chrome = await createChromeHarness();
-  const af = chrome.createAttachmentFrame("A");
-  af.ready();
-  await flushPromises();
-  af.send({ type: "lavish-attachment:state", channelId: "A", items: [], height: 40 }); // no cardNonce
-  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
-  assert.equal(relayed.state.cardNonce, "", "a missing nonce is coerced to '' - the mirror will reject it");
-});
-
-test("a retired frame's upload is refused after a new frame announces (R11)", async () => {
-  let uploadFetches = 0;
-  const chrome = await createChromeHarness({
-    fetchImpl: async (url) => {
-      if (String(url).includes("/attachment-channel")) return { ok: true };
-      uploadFetches += 1;
+    fetchImpl: async () => {
+      uploads += 1;
       return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
-  const a = chrome.createAttachmentFrame("token-A");
+  const a = chrome.openCapturePicker("cardA");
   a.ready();
-  await flushPromises();
-  const b = chrome.createAttachmentFrame("token-B");
+  a.state({ items: [{ localId: "att-1", status: "ready", id: "a".repeat(64) + ".png" }], height: 40 });
+  const beforeSwitch = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
+  assert.ok(beforeSwitch > 0, "A relays while it is the current capture frame");
+
+  const b = chrome.openCapturePicker("cardB");
   b.ready();
-  await flushPromises(); // B bound, A retired
+  // A (now retired) tries to relay and upload late - both dropped (A's source is no
+  // longer the capture frame).
+  a.state({
+    items: [{ localId: "att-1", name: "secret.png", status: "ready", id: "a".repeat(64) + ".png" }],
+    height: 40,
+  });
   a.upload({ localId: "late", mime: "image/png", bytes: new ArrayBuffer(16) });
   await flushPromises();
-  assert.equal(uploadFetches, 0, "a retired frame's late upload never reaches the network");
-  assert.equal(a.result("late"), undefined, "and gets no result echoed back");
-});
-
-test("a retired frame cannot relay its state once a new card's frame announces (R11)", async () => {
-  // Card A binds and can relay. Card B's frame then announces (a new card opened):
-  // the chrome retires A's channel that instant, so A's late state carrying its
-  // screenshot is dropped and never reaches the artifact card - even before B's
-  // async auth resolves. (The artifact-side per-card nonce is the authoritative
-  // drop; this pins the chrome-side retire.)
-  const chrome = await createChromeHarness();
-  const a = chrome.createAttachmentFrame("token-A");
-  a.ready();
-  await flushPromises();
-  // A relays legitimately while it is the bound channel.
-  a.state({
-    cardNonce: "cardA",
-    items: [{ localId: "att-1", status: "ready", id: "x".repeat(64) + ".png" }],
-    height: 60,
-  });
-  const beforeSwitch = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
-  assert.ok(beforeSwitch > 0, "A relays while bound");
-
-  // Card B opens: its frame announces. Auth is still pending (not flushed), but the
-  // prior channel must already be retired.
-  const b = chrome.createAttachmentFrame("token-B");
-  b.ready();
-  // A's still-live frame fires a LATE state carrying its screenshot.
-  a.state({
-    cardNonce: "cardA",
-    items: [{ localId: "att-1", name: "secret.png", status: "ready", id: "x".repeat(64) + ".png" }],
-    height: 60,
-  });
-  const afterSwitch = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
-  assert.equal(afterSwitch, beforeSwitch, "the retired frame's late state is NOT relayed to the card");
+  assert.equal(
+    chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length,
+    beforeSwitch,
+    "A's retired state is dropped - no new relay",
+  );
+  assert.equal(uploads, 0, "A's retired upload never reaches the network");
+  // B's own state relays with B's card nonce.
+  b.state({ items: [], height: 40 });
+  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
+  assert.equal(relayed.state.cardNonce, "cardB");
 });
 
 test("chrome reports an upload failure back to the capture frame", async () => {
   const chrome = await createChromeHarness({
-    fetchImpl: async (url) => {
-      if (String(url).includes("/attachment-channel")) return { ok: true };
-      return { ok: false, json: async () => ({ error: "unsupported image type" }) };
-    },
+    fetchImpl: async () => ({ ok: false, json: async () => ({ error: "unsupported image type" }) }),
   });
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker();
   af.ready();
-  await flushPromises();
   af.upload({ localId: "att-9", name: "bad.svg", mime: "image/svg+xml", bytes: new Uint8Array([0]).buffer });
   await flushPromises();
   const result = af.result("att-9");
@@ -1827,14 +1722,12 @@ test("chrome rejects an over-cap image before it hits the network", async () => 
   const chrome = await createChromeHarness({
     sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i", attachmentMaxBytes: 4 },
     fetchImpl: async (url, options) => {
-      if (String(url).includes("/attachment-channel")) return { ok: true };
       requests.push({ url, options });
       return { ok: true, json: async () => ({ attachment: { id: "x" } }) };
     },
   });
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker();
   af.ready();
-  await flushPromises();
   const bytes = new Uint8Array([1, 2, 3, 4, 5, 6]).buffer; // 6 bytes > 4-byte cap
   af.upload({ localId: "att-x", name: "big.png", mime: "image/png", bytes });
   await flushPromises();
@@ -1975,17 +1868,15 @@ test("the chrome bounds concurrent in-flight uploads (D8)", async () => {
     releaseAll = resolve;
   });
   const chrome = await createChromeHarness({
-    fetchImpl: async (url) => {
-      if (String(url).includes("/attachment-channel")) return { ok: true };
+    fetchImpl: async () => {
       started += 1;
       // Hang every upload so they all stay in flight until released.
       await gate;
       return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker();
   af.ready();
-  await flushPromises();
 
   // Eight small uploads at once: under the rate cap (30) and the byte quota, so only
   // an in-flight bound can stop them. Without it, all eight hit the network at once,
@@ -2014,8 +1905,7 @@ test("a settled upload frees an in-flight slot for the next (D8)", async () => {
   /** @type {Array<() => void>} */
   const resolvers = [];
   const chrome = await createChromeHarness({
-    fetchImpl: (url) => {
-      if (String(url).includes("/attachment-channel")) return Promise.resolve({ ok: true });
+    fetchImpl: () => {
       return new Promise((resolve) => {
         resolvers.push(() =>
           resolve(
@@ -2025,9 +1915,8 @@ test("a settled upload frees an in-flight slot for the next (D8)", async () => {
       });
     },
   });
-  const af = chrome.createAttachmentFrame();
+  const af = chrome.openCapturePicker();
   af.ready();
-  await flushPromises();
 
   // Fill the in-flight bound.
   for (let i = 0; i < 4; i += 1) {

@@ -212,10 +212,10 @@ export async function serve({
   const deliveredFeedback = new Set();
   const sseClients = new Set();
   const whiteboardChannelSecret = crypto.randomBytes(32);
-  // A distinct secret for the attachment-capture frame channel (root A). Same
-  // signed, short-lived token scheme as the whiteboard channel; a separate secret
-  // keeps the two channels from cross-authenticating.
-  const attachmentChannelSecret = crypto.randomBytes(32);
+  // The attachment-capture frame carries NO capability token (R12): the chrome binds
+  // the capture channel to the exact frame window it created, so there is no
+  // artifact-mintable credential to authenticate. (Contrast the whiteboard frame,
+  // which the chrome cannot create in its own DOM and so still uses a signed token.)
   const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
   const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
@@ -692,42 +692,22 @@ export async function serve({
   });
 
   // The attachment-capture frame page (root A). Served by the chrome into a
-  // sandboxed, opaque-origin iframe the artifact SDK embeds inside the annotation
-  // card, so image acquisition (picker/paste/drop) and byte reading run OUTSIDE
-  // the artifact realm. Carries a signed channel token; the frame reports to
-  // window.top (the chrome), never to its artifact parent.
+  // sandboxed, opaque-origin iframe the CHROME creates in its own capture overlay
+  // (R12): the chrome, not the artifact, owns this frame's creation and binds the
+  // capture channel to the exact window it created. This static page carries NO
+  // capability token - loading it grants nothing, since the chrome binds by frame
+  // identity, not by any credential the page hands out. The per-open session id and
+  // card nonce ride in the query string the chrome sets. Image acquisition and byte
+  // reading run OUTSIDE the artifact realm; the frame reports to window.top (the
+  // chrome, its direct parent).
   app.get("/attachment-frame", (req, res) => {
     res.setHeader("cache-control", "no-store");
     res.type("html").send(
-      createAttachmentFrameHtml(createWhiteboardChannelToken(attachmentChannelSecret), {
+      createAttachmentFrameHtml({
         maxCount: attachmentConfig.maxPerPrompt,
         maxBytes: attachmentConfig.maxBytes,
       }),
     );
-  });
-
-  // Authenticate an attachment-frame channel token (same guard/scheme as the
-  // whiteboard channel): a state-changing capability, so it is same-origin
-  // guarded, and the token must be one this server minted.
-  app.post("/api/:key/attachment-channel", async (req, res, next) => {
-    try {
-      if (!guardSameOrigin(req)) {
-        res.status(403).json({ error: "cross-origin attachment channel request rejected" });
-        return;
-      }
-      const session = await store.findByKey(req.params.key);
-      if (!session) {
-        res.status(404).json({ error: "session not found" });
-        return;
-      }
-      if (!isValidWhiteboardChannelToken(req.body?.token, attachmentChannelSecret)) {
-        res.status(403).json({ error: "invalid attachment channel" });
-        return;
-      }
-      res.json({ status: "authenticated" });
-    } catch (error) {
-      next(error);
-    }
   });
 
   // Whiteboard bundle, stylesheet, and vendored Excalidraw fonts. The frame
@@ -1482,6 +1462,7 @@ ${faviconTag}
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
 <div class="whiteboard-overlay" id="whiteboardOverlay" hidden><div class="whiteboard-shell"><div class="whiteboard-error" id="whiteboardError" hidden></div><button class="whiteboard-close" id="whiteboardClose" type="button" aria-label="Close whiteboard"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button><iframe id="whiteboardFrame" title="Excalidraw whiteboard" sandbox="allow-scripts allow-popups"></iframe></div></div>
+<div class="attach-overlay" id="attachOverlay" role="dialog" aria-modal="true" aria-labelledby="attachTitle" hidden><div class="attach-shell"><div class="attach-head"><h2 id="attachTitle">Attach image</h2><button class="attach-close" id="attachClose" type="button" aria-label="Close attach dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="attach-note">Add reference images (PNG, JPEG, WebP) for this annotation. Files are read here in the editor, never by the artifact.</p><div class="attach-frame-host" id="attachFrameHost"></div><div class="attach-actions"><button class="button" id="attachDone" type="button">Done</button></div></div></div>
 <script id="lavish-session" type="application/json">${sessionJson}</script>
 <script src="/chrome-client.js"></script>
 </body>
@@ -1521,12 +1502,12 @@ const deriveAttachmentNoticeState=${deriveAttachmentNoticeState.toString()};
 }
 
 /**
- * @param {string} channelToken
+ * The capture frame carries no capability token (R12): the session id and card nonce
+ * ride in the query string the chrome sets, and the chrome binds by frame identity.
  * @param {{ maxCount?: number, maxBytes?: number }} [limits]
  */
-export function createAttachmentFrameHtml(channelToken = "", limits = {}) {
+export function createAttachmentFrameHtml(limits = {}) {
   const config = {
-    channelToken,
     maxCount: Number.isFinite(limits.maxCount) ? limits.maxCount : undefined,
     maxBytes: Number.isFinite(limits.maxBytes) ? limits.maxBytes : undefined,
   };

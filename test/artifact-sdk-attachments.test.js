@@ -22,7 +22,7 @@ const sdk = createSdkJs("0123456789abcdef");
 // ROOT A INVARIANT (R10): no path reachable from the artifact/untrusted realm can
 // obtain raw image bytes or invoke a write/delete. The SDK bundle is the entire
 // artifact-realm surface, so this is checkable directly on the serialized text.
-test("the SDK bundle has NO attachment byte path or write/delete (root A invariant)", () => {
+test("the SDK bundle has NO byte path, no capture frame, and no image pixels (root A / R12 invariant)", () => {
   // No byte reads of a captured file, no object URLs of raw bytes, no file input.
   assert.doesNotMatch(sdk, /\.arrayBuffer\(\)/, "the artifact realm never reads file bytes");
   assert.doesNotMatch(sdk, /createObjectURL/, "the artifact realm never materializes raw image bytes");
@@ -32,28 +32,35 @@ test("the SDK bundle has NO attachment byte path or write/delete (root A invaria
   assert.doesNotMatch(sdk, /fetch\(/, "the artifact realm makes no server requests");
   assert.doesNotMatch(sdk, /lavish:uploadAttachment/, "the artifact realm never ships bytes to the chrome");
   assert.doesNotMatch(sdk, /method:\s*"DELETE"/, "the artifact realm invokes no delete");
-  // The capture surface is a chrome-served, sandboxed frame - not artifact DOM.
-  assert.match(sdk, /src="\/attachment-frame\?card=/);
-  assert.match(sdk, /sandbox="allow-scripts allow-popups"/);
+  // R12: the artifact realm no longer CREATES the capture frame - it only requests the
+  // chrome-owned picker, so there is no `/attachment-frame` iframe minted here.
+  assert.doesNotMatch(sdk, /attachment-frame/, "the artifact realm never creates the capture frame");
+  assert.match(sdk, /type: "lavish:openAttachPicker"/, "the card only requests the chrome picker");
+  // The card renders NAME-ONLY chips - never an image tag of an attachment (a same-
+  // origin image in this realm could be canvas-read by a hostile artifact). Match an
+  // img element inside a rendered string literal, not the word in comments.
+  assert.doesNotMatch(sdk, /['"]<img/, "the artifact realm renders no attachment image pixels");
 });
 
-test("the SDK bundle embeds the chrome-served capture frame and mirrors its state (root A)", () => {
-  // The card embeds the isolated frame and reacts only to chrome-relayed state.
-  assert.match(sdk, /class="lavish-attach-frame"/);
+test("the SDK bundle requests the chrome picker and mirrors relayed state (root A / R12)", () => {
+  // The card asks the chrome to open its picker and reacts only to relayed state.
+  assert.match(sdk, /class="lavish-attach"/, "the card has an Attach image button");
+  assert.match(sdk, /parent\.postMessage\(\{ type: "lavish:openAttachPicker", cardNonce \}/);
   assert.match(sdk, /if \(msg\.type === "lavish:attachmentState"\)/);
   assert.match(sdk, /activeAttachments\?\.applyState\(msg\.state \|\| \{\}\)/);
   // The mirror is coerced to primitives - never the relayed objects by reference.
   assert.match(sdk, /function applyState\(state\)/);
   assert.match(sdk, /typeof item\?\.id === "string"/);
+  // closeCard tells the chrome to dismiss the picker.
+  assert.match(sdk, /type: "lavish:closeAttachPicker"/);
 });
 
-test("the SDK bundle correlates every relayed state with the active card (R11, stale-frame drop)", () => {
-  // Each card mints a fresh nonce, threads it into its frame's iframe query string,
-  // and applyState drops any relayed state whose nonce does not match this card's -
-  // so a retired frame's late state never lands on a freshly opened card.
+test("the SDK bundle correlates every relayed state with the active card (R11, stale drop)", () => {
+  // Each card mints a fresh nonce; applyState drops any relayed state whose nonce does
+  // not match this card's - so a retired card's late relay never lands on a fresh card.
   assert.match(sdk, /const attachmentStateAppliesToCard=/);
   assert.match(sdk, /if \(!attachmentStateAppliesToCard\(state, cardNonce\)\) return;/);
-  assert.match(sdk, /\/attachment-frame\?card=['"] \+\s*\n?\s*encodeURIComponent\(cardNonce\)/);
+  assert.match(sdk, /const cardNonce = "c" \+ \+\+attachmentCardCounter/);
   assert.match(sdk, /makeAttachmentsController\(\{\s*\n?\s*notify,\s*\n?\s*cardNonce,/);
 });
 

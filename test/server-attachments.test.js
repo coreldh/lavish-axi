@@ -513,38 +513,21 @@ test("the orphan reap runs even with the TTL AND disk cap both disabled (R10-B, 
   }
 });
 
-test("the attachment-frame route serves the isolated capture frame with a channel token (root A)", async () => {
+test("the attachment-frame route serves an INERT capture page with NO capability token (R12)", async () => {
+  // R12: the finding was that /attachment-frame handed out a signed token any frame
+  // (including one the artifact minted) could authenticate with. The route now serves
+  // a token-free static page; the chrome binds the frame it created by identity, so
+  // loading this page grants an artifact nothing. There is no attachment-channel route.
   await withSession(async ({ base, key }) => {
     const html = await fetch(`${base}/attachment-frame`).then((res) => res.text());
-    const token = /"channelToken":"([^"]+)"/.exec(html)?.[1] || "";
-    assert.ok(token, "the frame HTML carries a signed channel token");
-    assert.match(html, /id="zone"/);
-    // A same-origin authenticate with the frame's own token is accepted.
-    const accepted = await fetch(`${base}/api/${key}/attachment-channel`, {
+    assert.doesNotMatch(html, /channelToken/, "the page carries no capability token");
+    assert.match(html, /id="zone"/, "it is still the capture UI");
+    // The old authenticate route is gone (no mintable capability to authenticate).
+    const gone = await fetch(`${base}/api/${key}/attachment-channel`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: base },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token: "anything" }),
     });
-    assert.equal(accepted.status, 200);
-    // A forged token is rejected.
-    const forged = await fetch(`${base}/api/${key}/attachment-channel`, {
-      method: "POST",
-      headers: { "content-type": "application/json", origin: base },
-      body: JSON.stringify({ token: "forged" }),
-    });
-    assert.equal(forged.status, 403);
-  });
-});
-
-test("the attachment-channel authenticate is same-origin guarded (root A)", async () => {
-  await withSession(async ({ base, key }) => {
-    const html = await fetch(`${base}/attachment-frame`).then((res) => res.text());
-    const token = /"channelToken":"([^"]+)"/.exec(html)?.[1] || "";
-    const crossOrigin = await fetch(`${base}/api/${key}/attachment-channel`, {
-      method: "POST",
-      headers: { "content-type": "application/json", origin: "http://evil.example" },
-      body: JSON.stringify({ token }),
-    });
-    assert.equal(crossOrigin.status, 403, "a cross-origin page cannot authenticate a capture channel");
+    assert.equal(gone.status, 404, "the attachment-channel authenticate route no longer exists");
   });
 });
