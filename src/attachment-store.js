@@ -346,6 +346,11 @@ async function admitAttachmentCharge(stateDir, newCharge, { ttlMs, maxDiskBytes,
     maxObjects,
     referenced,
   });
+  // BYTES are the admission invariant (`maxDiskBytes`). The object bound is a
+  // derived inode backstop, not reserved here: a new object can transiently sit at
+  // `maxObjects + 1` until the next sweep, but since `maxObjects = floor(cap / 8192)`
+  // and every object costs >= one block, the byte cap always binds first - the
+  // committed-byte total (checked below) can never exceed the cap.
   return swept.chargedBytes + newCharge <= maxDiskBytes;
 }
 

@@ -409,6 +409,23 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
   assert.match(throttled.error, /Too many uploads/);
 });
 
+test("the chrome acks a bound capture frame with its token as channelId (reveal handshake)", async () => {
+  // The `ready` message carries `channelToken`, not `channelId`. The bound ack must
+  // be stamped with the AUTHENTICATED token so the frame's channel guard accepts it
+  // and re-reports state (which reveals the otherwise-hidden capture iframe). A reply
+  // stamped with the ready message's (absent) `channelId` would ship `undefined` and
+  // the frame would silently drop it, killing the whole attach flow.
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => (String(url).includes("/attachment-channel") ? { ok: true } : { ok: true }),
+  });
+  const af = chrome.createAttachmentFrame("the-token");
+  af.ready();
+  await flushPromises();
+  const bound = af.posted.find((m) => m.type === "lavish-attachment:bound");
+  assert.ok(bound, "the chrome acks the binding back to the frame");
+  assert.equal(bound.channelId, "the-token", "the ack carries the frame's own token so its channel guard accepts it");
+});
+
 test("the chrome ignores attachment uploads from an unauthenticated (unbound) frame (root A)", async () => {
   // A frame that never presented a valid channel token - e.g. a hostile artifact
   // posting to window.top pretending to be a capture frame - must not drive an

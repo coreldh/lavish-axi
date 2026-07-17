@@ -1500,8 +1500,11 @@ function handleAttachmentFrameMessage(event, message) {
     authenticateAttachmentChannel(token).then((authenticated) => {
       if (authenticated && !ended) {
         attachmentChannel = { window: source, channelId: token };
-        // Ack so the frame reports its initial state and the card reveals it.
-        replyTo({ type: "lavish-attachment:bound" });
+        // Ack so the frame reports its initial state and the card reveals it. Stamp
+        // the AUTHENTICATED token as channelId (the `ready` message carries only
+        // `channelToken`, not `channelId`, so `replyTo` would send `undefined` and
+        // the frame's channel guard would drop the ack, leaving the card hidden).
+        source.postMessage({ type: "lavish-attachment:bound", channelId: token }, "*");
       }
     });
     return true;
