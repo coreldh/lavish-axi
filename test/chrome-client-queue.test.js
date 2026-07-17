@@ -1589,6 +1589,132 @@ test("chrome carries the frame's cardNonce through so the mirror can correlate (
   assert.equal(relayed.state.cardNonce, "cardA", "the relay carries the frame's card nonce for mirror correlation");
 });
 
+test("the chrome retires the prior channel synchronously on ready, before auth resolves (R11)", async () => {
+  // The critical window: card A is bound; card B's frame announces but its async auth
+  // has NOT resolved yet. A's still-live frame must be unable to relay in this gap -
+  // the retire happens the instant B's ready is seen, not when B binds.
+  const chrome = await createChromeHarness();
+  const a = chrome.createAttachmentFrame("token-A");
+  a.ready();
+  await flushPromises(); // A bound
+  a.state({
+    cardNonce: "cardA",
+    items: [{ localId: "att-1", status: "ready", id: "z".repeat(64) + ".png" }],
+    height: 60,
+  });
+  const before = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
+
+  const b = chrome.createAttachmentFrame("token-B");
+  b.ready(); // NOTE: no flush - B's auth is still pending
+  // A fires a late state in the pre-auth window.
+  a.state({
+    cardNonce: "cardA",
+    items: [{ localId: "att-1", name: "secret.png", status: "ready", id: "z".repeat(64) + ".png" }],
+    height: 60,
+  });
+  const after = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
+  assert.equal(after, before, "A's late state is dropped the instant B announces, before B's auth resolves");
+});
+
+test("concurrent three-card switch: only the newest frame holds the channel (R11)", async () => {
+  const chrome = await createChromeHarness();
+  const a = chrome.createAttachmentFrame("A");
+  const b = chrome.createAttachmentFrame("B");
+  const c = chrome.createAttachmentFrame("C");
+  a.ready();
+  await flushPromises();
+  b.ready();
+  await flushPromises();
+  c.ready();
+  await flushPromises();
+  const before = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
+  // A and B are retired; their late states must be dropped.
+  a.state({
+    cardNonce: "cardA",
+    items: [{ localId: "att-1", status: "ready", id: "a".repeat(64) + ".png" }],
+    height: 60,
+  });
+  b.state({
+    cardNonce: "cardB",
+    items: [{ localId: "att-1", status: "ready", id: "b".repeat(64) + ".png" }],
+    height: 60,
+  });
+  assert.equal(
+    chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length,
+    before,
+    "retired A and B cannot relay",
+  );
+  // Only C (the newest, bound) relays, carrying its own nonce.
+  c.state({ cardNonce: "cardC", items: [], height: 40 });
+  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
+  assert.equal(relayed.state.cardNonce, "cardC", "only the newest bound frame relays");
+});
+
+test("out-of-order auth across three frames binds only the newest (R11)", async () => {
+  const resolvers = {};
+  const chrome = await createChromeHarness({
+    fetchImpl: (url, init) => {
+      if (!String(url).includes("/attachment-channel")) return Promise.resolve({ ok: true, json: async () => ({}) });
+      const token = JSON.parse(init.body).token;
+      return new Promise((resolve) => {
+        resolvers[token] = () => resolve(/** @type {any} */ ({ ok: true }));
+      });
+    },
+  });
+  const a = chrome.createAttachmentFrame("A");
+  const b = chrome.createAttachmentFrame("B");
+  const c = chrome.createAttachmentFrame("C");
+  a.ready();
+  b.ready();
+  c.ready();
+  // Resolve auth out of order: B, then C (newest), then A.
+  resolvers["B"]();
+  await flushPromises();
+  resolvers["C"]();
+  await flushPromises();
+  resolvers["A"]();
+  await flushPromises();
+  // Only C (the last ready) may hold the channel; A and B cannot relay.
+  a.state({ cardNonce: "cardA", items: [{ localId: "x", status: "ready", id: "a".repeat(64) + ".png" }] });
+  b.state({ cardNonce: "cardB", items: [{ localId: "x", status: "ready", id: "b".repeat(64) + ".png" }] });
+  const before = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").length;
+  assert.equal(before, 0, "neither A nor B (older readys) can relay after out-of-order auth");
+  c.state({ cardNonce: "cardC", items: [], height: 40 });
+  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
+  assert.ok(relayed && relayed.state.cardNonce === "cardC", "only the newest ready binds and relays");
+});
+
+test("a state message without a cardNonce relays an empty nonce so the mirror fails closed (R11)", async () => {
+  const chrome = await createChromeHarness();
+  const af = chrome.createAttachmentFrame("A");
+  af.ready();
+  await flushPromises();
+  af.send({ type: "lavish-attachment:state", channelId: "A", items: [], height: 40 }); // no cardNonce
+  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
+  assert.equal(relayed.state.cardNonce, "", "a missing nonce is coerced to '' - the mirror will reject it");
+});
+
+test("a retired frame's upload is refused after a new frame announces (R11)", async () => {
+  let uploadFetches = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).includes("/attachment-channel")) return { ok: true };
+      uploadFetches += 1;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+  const a = chrome.createAttachmentFrame("token-A");
+  a.ready();
+  await flushPromises();
+  const b = chrome.createAttachmentFrame("token-B");
+  b.ready();
+  await flushPromises(); // B bound, A retired
+  a.upload({ localId: "late", mime: "image/png", bytes: new ArrayBuffer(16) });
+  await flushPromises();
+  assert.equal(uploadFetches, 0, "a retired frame's late upload never reaches the network");
+  assert.equal(a.result("late"), undefined, "and gets no result echoed back");
+});
+
 test("a retired frame cannot relay its state once a new card's frame announces (R11)", async () => {
   // Card A binds and can relay. Card B's frame then announces (a new card opened):
   // the chrome retires A's channel that instant, so A's late state carrying its

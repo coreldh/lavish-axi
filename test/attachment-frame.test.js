@@ -151,6 +151,51 @@ test("the frame reports its initial state when the chrome acks the binding (reve
   );
 });
 
+test("the frame stamps its cardNonce on the reveal state AND every later state (R11)", async () => {
+  const frame = bootFrame({ channelToken: "abc", cardNonce: "cardA" });
+  frame.fromTop({ type: "lavish-attachment:bound", channelId: "abc" });
+  // Reveal state carries the nonce.
+  assert.equal(frame.lastState().cardNonce, "cardA");
+  // A capture triggers more state reports; all carry the same nonce.
+  frame.elements.file.files = [fakeFile("shot.png", "image/png")];
+  frame.elements.file.fire("change");
+  await flush();
+  const states = frame.postedToTop.filter((m) => m.type === "lavish-attachment:state");
+  assert.ok(states.length >= 2, "capture produced additional state reports");
+  assert.ok(
+    states.every((s) => s.cardNonce === "cardA"),
+    "every state report carries the card's nonce",
+  );
+});
+
+test("a frame with no ?card query param stamps an empty nonce, failing closed (R11)", () => {
+  const frame = bootFrame({ channelToken: "abc", cardNonce: "" });
+  frame.fromTop({ type: "lavish-attachment:bound", channelId: "abc" });
+  assert.equal(frame.lastState().cardNonce, "", "no card param -> empty nonce (mirror fails closed)");
+});
+
+test("a card nonce with URL-special characters round-trips through the query string (R11)", () => {
+  // Real nonces are [c0-9a-z], but the encode(SDK)->decode(frame) contract must be
+  // exact for any value, or a legit card's own state would fail to match.
+  const weird = "c1 a&b=c%d/e";
+  const frame = bootFrame({ channelToken: "abc", cardNonce: weird });
+  frame.fromTop({ type: "lavish-attachment:bound", channelId: "abc" });
+  assert.equal(frame.lastState().cardNonce, weird, "the nonce survives encode/decode intact");
+});
+
+test("a paste captured before any bound ack still ships bytes and stamps the nonce (R11)", async () => {
+  // The frame captures autonomously - it does not wait for the chrome's bound ack to
+  // read bytes and post the upload/state (each carrying the card nonce). Whether the
+  // chrome accepts an upload before it has bound is the chrome's concern; the frame
+  // never loses the capture or the nonce.
+  const frame = bootFrame({ channelToken: "abc", cardNonce: "cardA" });
+  frame.firePaste({ files: [fakeFile("paste.png", "image/png")] });
+  await flush();
+  assert.equal(frame.uploads().length, 1, "the paste is captured and its bytes shipped");
+  assert.equal(frame.uploads()[0].channelId, "abc");
+  assert.equal(frame.lastState().cardNonce, "cardA", "the pre-bind state still carries the nonce");
+});
+
 test("a picked image is read in the frame and its bytes are shipped to window.top", async () => {
   const frame = bootFrame();
   frame.elements.file.files = [fakeFile("shot.png", "image/png")];

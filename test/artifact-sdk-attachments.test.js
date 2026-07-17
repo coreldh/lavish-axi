@@ -81,6 +81,54 @@ test("a freshly opened card cannot pick up a retired frame's screenshot via a st
   assert.equal(attachmentStateAppliesToCard(null, "cardB"), false);
 });
 
+test("attachmentStateAppliesToCard is a strict identity gate over adversarial inputs (R11 property)", () => {
+  // The correlation must be exact string identity: only a state whose nonce equals
+  // THIS card's non-empty nonce applies. Everything else fails closed - a foreign
+  // nonce, a coerced/truthy shape, a missing nonce, or an unset card nonce.
+  const nonce = "c7abc123";
+  // The one accepting case.
+  assert.equal(attachmentStateAppliesToCard({ cardNonce: nonce, items: [] }, nonce), true);
+  // Foreign / near-miss nonces never apply.
+  for (const foreign of ["c7abc124", "c7abc12", "c7abc123 ", " c7abc123", "C7ABC123", nonce + "x"]) {
+    assert.equal(attachmentStateAppliesToCard({ cardNonce: foreign }, nonce), false, `foreign ${foreign}`);
+  }
+  // Non-string / coercion / truthiness games never pass (no ==, no prefix).
+  for (const hostile of [
+    { cardNonce: true },
+    { cardNonce: 1 },
+    { cardNonce: [nonce] },
+    { cardNonce: { toString: () => nonce } },
+    { cardNonce: null },
+    { cardNonce: undefined },
+    {},
+    { items: [] },
+  ]) {
+    assert.equal(attachmentStateAppliesToCard(hostile, nonce), false, `hostile ${JSON.stringify(hostile)}`);
+  }
+  // A missing/blank card nonce accepts nothing (fail-closed), even a blank match.
+  assert.equal(attachmentStateAppliesToCard({ cardNonce: "" }, ""), false);
+  assert.equal(attachmentStateAppliesToCard({ cardNonce: nonce }, ""), false);
+  // Null/undefined state never throws and never applies.
+  assert.equal(attachmentStateAppliesToCard(null, nonce), false);
+  assert.equal(attachmentStateAppliesToCard(undefined, nonce), false);
+});
+
+test("across many distinct cards, only the exact-nonce frame's state applies (R11 property)", () => {
+  // Simulate N cards, each with a state carrying a screenshot stamped with its own
+  // nonce. Every card's mirror must accept ONLY its own state and reject the other
+  // N-1 - no cross-card pickup for any pair, in either direction.
+  const nonces = Array.from({ length: 25 }, (_, i) => "c" + (i + 1) + "r" + (i * 7 + 3).toString(36));
+  const states = nonces.map((n, i) => ({
+    cardNonce: n,
+    items: [{ localId: "att-1", name: "shot-" + i + ".png", status: "ready", id: String(i).repeat(64) + ".png" }],
+  }));
+  for (let card = 0; card < nonces.length; card += 1) {
+    for (let s = 0; s < states.length; s += 1) {
+      assert.equal(attachmentStateAppliesToCard(states[s], nonces[card]), card === s, `card ${card} vs state ${s}`);
+    }
+  }
+});
+
 test("the SDK bundle carries ready attachment refs on the queued prompt", () => {
   assert.match(sdk, /options\.attachments/);
   assert.match(sdk, /item\.attachments = attachments/);

@@ -1493,8 +1493,14 @@ async function authenticateAttachmentChannel(token) {
 // attachment capture channel. Returns true if it was an attachment-frame message
 // so other frame handlers can skip it. Binds on an authenticated `ready`; every
 // later message must come from the bound window AND carry the bound token, so a
-// hostile artifact posting to window.top cannot drive uploads (it lacks a valid,
-// server-minted token and cannot read the real frame's token cross-origin).
+// hostile artifact posting to window.top cannot drive an upload or a state relay
+// (it lacks a valid, server-minted token and cannot read the real frame's token
+// cross-origin - `authenticateAttachmentChannel` 403s a forged token, so it never
+// binds). The one thing a forged `ready` CAN do is retire the current channel
+// (below), leaving the user's own attach control unbound until the card reopens -
+// a self-inflicted availability DoS by an artifact the user is already reviewing,
+// with no byte access, no upload, and no misroute. The confidentiality/integrity
+// boundary (bytes never enter the artifact realm; no unauthorized write) holds.
 function handleAttachmentFrameMessage(event, message) {
   const type = String(message.type || "");
   if (!type.startsWith("lavish-attachment:")) return false;
