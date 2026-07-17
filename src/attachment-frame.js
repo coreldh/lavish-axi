@@ -50,12 +50,12 @@ export function createAttachmentFrame(config, helpers) {
   const MAX_COUNT = Number.isFinite(config.maxCount) && config.maxCount > 0 ? config.maxCount : 4;
   const MAX_BYTES = Number.isFinite(config.maxBytes) && config.maxBytes > 0 ? config.maxBytes : 0;
   const ACCEPTED_MIME = { "image/png": true, "image/jpeg": true, "image/webp": true };
-  // The chrome is `window.top`, reached by bypassing the artifact frame (our
-  // `parent`) entirely. Messages the chrome sends back arrive with
-  // `event.source === window.top`; a message forged by the artifact parent has
-  // `event.source === window.parent` and is ignored, so the artifact cannot drive
-  // this frame.
-  const chrome = window.top;
+  // The chrome is this frame's DIRECT parent (R12: the chrome created this iframe in
+  // its own overlay), so `window.parent` is the chrome. Use `window.parent`, NOT
+  // `window.top`: if a hostile page were to frame the whole Lavish session, `window.top`
+  // would be that attacker page and would receive the image bytes, whereas `window.parent`
+  // is always the chrome that created this frame. Commands are honored only from it.
+  const chrome = window.parent;
 
   const items = [];
   let capRejected = false;

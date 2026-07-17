@@ -297,6 +297,20 @@ async function createChromeHarness({
         },
       };
     },
+    // Request the picker again (e.g. a reopen) without grabbing a new frame handle.
+    requestPicker(cardNonce = "cardA") {
+      for (const handler of windowListeners.get("message") || [])
+        handler({ source: frame.contentWindow, data: { type: "lavish:openAttachPicker", cardNonce } });
+    },
+    clickAttachDone() {
+      element("attachDone").click();
+    },
+    attachOverlayHidden() {
+      return element("attachOverlay").hidden;
+    },
+    currentCaptureFrame() {
+      return element("attachFrameHost").lastAppendedChild;
+    },
     // A frame the chrome did NOT create - i.e. one a HOSTILE artifact minted itself.
     // Its source is NOT the chrome's capture frame, so the chrome must ignore it (R12).
     createHostileFrame(session = "guessed-" + Math.random().toString(36).slice(2)) {
@@ -1645,6 +1659,42 @@ test("opening a new picker retires the prior frame: it can no longer upload or r
   b.state({ items: [], height: 40 });
   const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
   assert.equal(relayed.state.cardNonce, "cardB");
+});
+
+test("Done hides the picker but preserves the frame + attached state across reopen (R12 state)", async () => {
+  // The gate found that tearing the frame down on Done destroyed the only authoritative
+  // attachment state: reopening created an empty frame whose initial state cleared the
+  // card's already-attached refs. Done now HIDES (keeps the frame); reopening the same
+  // card reuses it, so nothing is lost.
+  const chrome = await createChromeHarness();
+  const af = chrome.openCapturePicker("cardA");
+  af.ready();
+  af.state({
+    items: [{ localId: "att-1", name: "shot.png", status: "ready", id: "a".repeat(64) + ".png" }],
+    height: 40,
+  });
+  const frameAfterOpen = chrome.currentCaptureFrame();
+
+  // Done: the overlay hides, but the frame stays alive.
+  chrome.clickAttachDone();
+  assert.equal(chrome.attachOverlayHidden(), true, "Done dismisses the modal");
+  assert.equal(chrome.currentCaptureFrame(), frameAfterOpen, "the capture frame is NOT destroyed on Done");
+
+  // Reopen the SAME card: the existing frame is reused (no new frame, no empty state
+  // relay clearing the refs), and the overlay shows again.
+  chrome.requestPicker("cardA");
+  assert.equal(chrome.attachOverlayHidden(), false, "reopening shows the modal again");
+  assert.equal(chrome.currentCaptureFrame(), frameAfterOpen, "the same frame is reused, so attached state survives");
+});
+
+test("a DIFFERENT card's picker tears down the prior frame (R12)", async () => {
+  const chrome = await createChromeHarness();
+  const a = chrome.openCapturePicker("cardA");
+  a.ready();
+  const frameA = chrome.currentCaptureFrame();
+  const b = chrome.openCapturePicker("cardB");
+  b.ready();
+  assert.notEqual(chrome.currentCaptureFrame(), frameA, "a different card gets a fresh capture frame");
 });
 
 test("chrome reports an upload failure back to the capture frame", async () => {

@@ -4,9 +4,9 @@ import vm from "node:vm";
 
 import { createAttachmentFrameHtml, createAttachmentFrameJs } from "../src/server.js";
 
-// The capture frame (root A) runs the real serialized bundle in a fake DOM, so
-// these assertions exercise the exact shipped code that reads image bytes OUTSIDE
-// the artifact realm and reports to window.top (the chrome).
+// The capture frame (root A / R12) runs the real serialized bundle in a fake DOM, so
+// these assertions exercise the exact shipped code that reads image bytes OUTSIDE the
+// artifact realm and reports to window.parent (the chrome that created it).
 
 function fakeFile(name, type, size = 8) {
   return {
@@ -59,9 +59,18 @@ function bootFrame({ session = "sess-1", maxCount = 4, maxBytes = 0, cardNonce =
     zone: makeElement(),
   };
   const postedToTop = [];
-  const topWindow = {
+  // The chrome is the frame's DIRECT parent (R12). A separate, DISTINCT window models
+  // a hostile page that framed the whole session and became window.top - the frame
+  // must never post to it or accept commands from it.
+  const parentWindow = {
     postMessage(message) {
       postedToTop.push(message);
+    },
+  };
+  const hostilePostedToTop = [];
+  const hostileTopWindow = {
+    postMessage(message) {
+      hostilePostedToTop.push(message);
     },
   };
   const windowListeners = new Map();
@@ -70,7 +79,8 @@ function bootFrame({ session = "sess-1", maxCount = 4, maxBytes = 0, cardNonce =
   const context = {
     console,
     window: {
-      top: topWindow,
+      parent: parentWindow,
+      top: hostileTopWindow,
       location: {
         search:
           "?" +
@@ -104,12 +114,19 @@ function bootFrame({ session = "sess-1", maxCount = 4, maxBytes = 0, cardNonce =
   return {
     elements,
     postedToTop,
+    hostilePostedToTop,
+    hostileTopWindow,
     session,
-    // Deliver a message "from the chrome" (event.source === window.top).
+    // Deliver a message "from the chrome" (the frame's direct parent).
     fromTop(data) {
       const handler = windowListeners.get("message");
       assert.ok(handler, "the frame registered a message listener");
-      handler({ source: topWindow, data });
+      handler({ source: parentWindow, data });
+    },
+    // Deliver a message from the hostile window.top (a page that framed the session).
+    fromHostileTop(data) {
+      const handler = windowListeners.get("message");
+      handler({ source: hostileTopWindow, data });
     },
     fromOther(data) {
       const handler = windowListeners.get("message");
@@ -136,6 +153,34 @@ test("the frame announces readiness with its session id (R12)", () => {
   const ready = frame.postedToTop.find((m) => m.type === "lavish-attachment:ready");
   assert.ok(ready);
   assert.equal(ready.session, "abc");
+});
+
+test("the frame posts bytes to window.parent (the chrome), NEVER window.top (anti-framing)", async () => {
+  // A hostile page could frame the whole Lavish session, becoming window.top. The
+  // capture frame must send image bytes only to its DIRECT parent (the chrome that
+  // created it), never to window.top, or those bytes would be exfiltrated to the
+  // framing attacker. It must also ignore commands from window.top.
+  const frame = bootFrame({ session: "abc" });
+  frame.elements.file.files = [fakeFile("shot.png", "image/png")];
+  frame.elements.file.fire("change");
+  await flush();
+  // The upload (with bytes) went to the parent (postedToTop), and NOTHING went to the
+  // hostile window.top.
+  assert.ok(
+    frame.postedToTop.some((m) => m.type === "lavish-attachment:upload" && m.bytes),
+    "bytes are posted to the chrome (direct parent)",
+  );
+  assert.equal(frame.hostilePostedToTop.length, 0, "no message - and no bytes - ever reach window.top");
+  // A command from the hostile window.top is ignored (not the direct parent).
+  const localId = frame.postedToTop.find((m) => m.type === "lavish-attachment:upload").localId;
+  frame.fromHostileTop({
+    type: "lavish-attachment:uploadResult",
+    session: "abc",
+    localId,
+    ok: true,
+    id: "a".repeat(64) + ".png",
+  });
+  assert.equal(frame.lastState().items[0].status, "uploading", "a result from window.top does not mark the item ready");
 });
 
 test("the frame reports its initial state when the chrome acks the binding (reveal)", () => {

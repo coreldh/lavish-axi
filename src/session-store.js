@@ -141,9 +141,24 @@ export class SessionStore {
     // and the chrome would clear its queue believing they were delivered.
     const rejected = boundAttachmentRefs(normalized, options);
     if (!rejected.length) {
+      // Resolve under the store mutex, so keep the work minimal: (1) a per-batch
+      // metadata cache keyed by content-addressed id, so a prompt (or several) that
+      // reference the SAME id resolve it once instead of re-reading a multi-MB image
+      // per reference; (2) short-circuit on the first rejection - the batch already
+      // fails atomically (C4), so resolving the remaining prompts is pure wasted I/O
+      // while every poll and mutation blocks on the mutex.
+      const metaCache = new Map();
       for (const prompt of normalizedPrompts) {
-        const { resolved, rejected: promptRejected } = await resolvePromptAttachments(prompt.attachments, key, options);
-        if (promptRejected.length) rejected.push(...promptRejected);
+        const { resolved, rejected: promptRejected } = await resolvePromptAttachments(
+          prompt.attachments,
+          key,
+          options,
+          metaCache,
+        );
+        if (promptRejected.length) {
+          rejected.push(...promptRejected);
+          break;
+        }
         if (resolved.length > 0) prompt.attachments = resolved;
         else delete prompt.attachments;
       }
@@ -467,7 +482,7 @@ function boundAttachmentRefs(normalized, options) {
 // is reported in `rejected` with a machine-readable `reason` rather than silently
 // dropped, so the caller can fail the batch atomically (C4). The display `name` is
 // the only client value carried through (it never touches a filesystem path).
-async function resolvePromptAttachments(refs, key, options = {}) {
+async function resolvePromptAttachments(refs, key, options = {}, metaCache = new Map()) {
   const { resolveAttachment, maxPerPrompt = Infinity, maxPromptBytes = Infinity } = options;
   if (!Array.isArray(refs) || refs.length === 0 || typeof resolveAttachment !== "function") {
     return { resolved: [], rejected: [] };
@@ -480,7 +495,14 @@ async function resolvePromptAttachments(refs, key, options = {}) {
       rejected.push({ id: ref.id, name: ref.name || "", reason: "too-many" });
       continue;
     }
-    const metadata = await resolveAttachment(key, ref.id);
+    // Content-addressed id -> the file's metadata is immutable, so cache it per batch:
+    // repeated references to the same id (in this prompt or another) never re-read the
+    // image. A `null` (not-found) is cached too, so a missing id is statted once.
+    let metadata = metaCache.get(ref.id);
+    if (metadata === undefined) {
+      metadata = await resolveAttachment(key, ref.id);
+      metaCache.set(ref.id, metadata);
+    }
     if (!metadata) {
       rejected.push({ id: ref.id, name: ref.name || "", reason: "not-found" });
       continue;

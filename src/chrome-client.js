@@ -1500,10 +1500,17 @@ function newCaptureSession() {
 // Open the chrome-owned capture picker for a card. The artifact card only REQUESTS
 // this (lavish:openAttachPicker); the chrome owns the frame's CREATION, so the
 // artifact can neither create the trusted picker nor position it (no clickjacking).
+// Reopening for the SAME card REUSES the existing frame so its already-attached state
+// survives a Done->reopen round trip; a DIFFERENT card tears the old frame down first.
 function openAttachPicker(cardNonce) {
   if (ended) return;
+  const nonce = String(cardNonce || "");
+  if (captureFrame && captureCardNonce === nonce) {
+    attachOverlay.hidden = false;
+    return;
+  }
   closeAttachPicker();
-  captureCardNonce = String(cardNonce || "");
+  captureCardNonce = nonce;
   captureSession = newCaptureSession();
   const params = new URLSearchParams({ session: captureSession, card: captureCardNonce });
   const iframe = /** @type {HTMLIFrameElement} */ (document.createElement("iframe"));
@@ -1517,6 +1524,16 @@ function openAttachPicker(cardNonce) {
   attachOverlay.hidden = false;
 }
 
+// Dismiss the modal but KEEP the capture frame and its state alive: reopening the same
+// card shows the same attachments, and an in-flight upload keeps running to completion
+// (its result still relays), so nothing is lost or stuck. Done / Escape / backdrop use
+// this, not the full teardown.
+function hideAttachPicker() {
+  if (attachOverlay) attachOverlay.hidden = true;
+}
+
+// Full teardown: destroy the frame and its state. Only when the card is closed
+// (lavish:closeAttachPicker on queue/cancel) or a DIFFERENT card opens its picker.
 function closeAttachPicker() {
   if (captureFrame) {
     try {
@@ -1624,17 +1641,20 @@ document.addEventListener("mousedown", (event) => {
   if (!moreMenu.hidden && !moreWrap.contains(target)) setMenuOpen(moreButton, moreMenu, false);
 });
 whiteboardCloseButton.onclick = closeWhiteboard;
-if (attachCloseButton) attachCloseButton.onclick = closeAttachPicker;
-if (attachDoneButton) attachDoneButton.onclick = closeAttachPicker;
+// Done / X / Escape / backdrop only DISMISS the modal - the frame and its attached
+// state stay alive so reopening preserves them (see hideAttachPicker). Full teardown
+// happens when the card closes (lavish:closeAttachPicker).
+if (attachCloseButton) attachCloseButton.onclick = hideAttachPicker;
+if (attachDoneButton) attachDoneButton.onclick = hideAttachPicker;
 if (attachOverlay)
   attachOverlay.addEventListener("click", (event) => {
     // Click the backdrop (not the shell) to dismiss.
-    if (event.target === attachOverlay) closeAttachPicker();
+    if (event.target === attachOverlay) hideAttachPicker();
   });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     if (attachOverlay && !attachOverlay.hidden) {
-      closeAttachPicker();
+      hideAttachPicker();
     } else if (!whiteboardOverlay.hidden) {
       closeWhiteboard();
     } else if (!shareDialog.hidden) {

@@ -856,6 +856,93 @@ test("duplicate attachment ids preserve logical refs and count toward prompt cap
   }
 });
 
+test("attachment resolution caches per batch: repeated ids are read once, not once per ref (R12)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hi</h1>");
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const id = "a".repeat(64) + ".png";
+    let reads = 0;
+    const resolveAttachment = async (_key, attachmentId) => {
+      reads += 1; // stands in for reading the image (expensive when the sidecar is missing)
+      return {
+        id: attachmentId,
+        type: "image",
+        path: "/vetted/p.png",
+        mime: "image/png",
+        bytes: 1,
+        width: 1,
+        height: 1,
+      };
+    };
+    // One prompt, 200 references to the SAME content-addressed id, plus a second prompt
+    // referencing it once more - the id's metadata must be read exactly ONCE for the batch.
+    await store.queuePrompts(
+      session.key,
+      {
+        prompts: [
+          {
+            uid: "1",
+            prompt: "many",
+            selector: "h1",
+            tag: "h1",
+            text: "Hi",
+            attachments: Array.from({ length: 200 }, () => ({ id })),
+          },
+          { uid: "2", prompt: "again", selector: "h1", tag: "h1", text: "Hi", attachments: [{ id }] },
+        ],
+      },
+      { resolveAttachment, maxPerPrompt: 256, maxPromptBytes: 25 * 1024 * 1024 },
+    );
+    assert.equal(reads, 1, "the content-addressed id is resolved once per batch, not once per reference");
+    // The refs are still all preserved (each is a logical reference).
+    const delivered = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(delivered.prompts[0].attachments.length, 200);
+    assert.equal(delivered.prompts[1].attachments.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("attachment resolution short-circuits after the first rejection - no wasted reads (R12)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hi</h1>");
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const missing = "b".repeat(64) + ".png";
+    const laterId = "a".repeat(64) + ".png";
+    const readIds = [];
+    const resolveAttachment = async (_key, attachmentId) => {
+      readIds.push(attachmentId);
+      return attachmentId === missing
+        ? null
+        : { id: attachmentId, type: "image", path: "/vetted/p.png", mime: "image/png", bytes: 1, width: 1, height: 1 };
+    };
+    // Prompt 1 references a missing id (rejects). The batch fails atomically, so prompt
+    // 2's id must NEVER be resolved - resolving it would be pure wasted I/O under the mutex.
+    const result = await store.queuePrompts(
+      session.key,
+      {
+        prompts: [
+          { uid: "1", prompt: "bad", selector: "h1", tag: "h1", text: "Hi", attachments: [{ id: missing }] },
+          { uid: "2", prompt: "good", selector: "h1", tag: "h1", text: "Hi", attachments: [{ id: laterId }] },
+        ],
+      },
+      { resolveAttachment, maxPerPrompt: 4, maxPromptBytes: 25 * 1024 * 1024 },
+    );
+    assert.deepEqual(result.rejected, [{ id: missing, name: "", reason: "not-found" }]);
+    assert.deepEqual(readIds, [missing], "only the rejecting prompt was resolved; later prompts were not read");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("queuePrompts rejects the batch atomically when the count or byte cap is exceeded (C4)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
