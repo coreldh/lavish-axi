@@ -1733,8 +1733,10 @@ export function createArtifactSdk(
     const sendNowHint = /Mac|iP(hone|ad|od)/.test(navigator.platform) ? "⌘" : "Ctrl";
     // The attach control is a CHROME-SERVED, sandboxed iframe (root A): image
     // acquisition and every byte live in `/attachment-frame`, never in this
-    // artifact realm. It boots hidden and is revealed once it reports its content
-    // height, so an empty card shows no blank frame band.
+    // artifact realm. It carries an initial CSS height that shows the attach zone
+    // immediately (never display:none - a hidden iframe can measure its own content
+    // as 0 and never resize), and the card fine-tunes that height to the frame's
+    // reported content height as chips are added or removed.
     card.innerHTML =
       '<div class="lavish-heading">' +
       heading +
