@@ -76,7 +76,10 @@ function bootFrame({ channelToken = "tok-1", maxCount = 4, maxBytes = 0 } = {}) 
       },
     },
     document: {
-      documentElement: { scrollHeight: 176 },
+      // The frame reports body.scrollHeight (true content), NOT
+      // documentElement.scrollHeight (floored at the iframe viewport).
+      documentElement: { scrollHeight: 2029 },
+      body: { scrollHeight: 43 },
       getElementById(id) {
         return elements[id] || null;
       },
@@ -136,7 +139,10 @@ test("the frame reports its initial state when the chrome acks the binding (reve
   const state = frame.lastState();
   assert.ok(state, "an initial state is reported on bind");
   assert.equal(state.items.length, 0);
-  assert.ok(state.height > 0, "the reported height lets the card size and reveal the frame");
+  // The reported height is the true CONTENT height (body.scrollHeight, 43), not the
+  // viewport-floored documentElement.scrollHeight (2029) — else the iframe would
+  // inflate to its own viewport and never shrink back when chips are removed.
+  assert.equal(state.height, 43, "the reported height is body content height, not the viewport");
   assert.ok(
     frame.postedToTop.filter((m) => m.type === "lavish-attachment:state").length > before,
     "the bind ack triggers a fresh state report",

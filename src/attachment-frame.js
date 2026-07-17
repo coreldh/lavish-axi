@@ -118,9 +118,13 @@ export function createAttachmentFrame(config, helpers) {
         type: "lavish-attachment:state",
         channelId: channelToken,
         capRejected,
-        // The card sizes and reveals the iframe to this content height, so an empty
-        // card shows no blank frame band and a grown chip list is never clipped.
-        height: document.documentElement.scrollHeight,
+        // The card sizes the iframe to this content height, so a grown chip list is
+        // never clipped. Measure `body.scrollHeight` (true content: the frame CSS
+        // zeroes html/body margins), NOT `documentElement.scrollHeight` — the latter
+        // is floored at the iframe's own viewport height, so it would inflate to
+        // whatever height the card last set and never shrink back when chips are
+        // removed.
+        height: document.body.scrollHeight,
         items: items.map((item) => ({
           localId: item.localId,
           name: item.name,
