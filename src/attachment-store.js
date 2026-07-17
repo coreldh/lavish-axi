@@ -266,9 +266,9 @@ function sidecarPath(file) {
   return `${file}.meta`;
 }
 
-async function writeSidecar(file, meta) {
+async function writeSidecar(file, serializedMeta) {
   try {
-    await writeFileAtomically(sidecarPath(file), JSON.stringify(meta));
+    await writeFileAtomically(sidecarPath(file), serializedMeta);
   } catch {
     // Dimensions are a display hint only; a sidecar write miss just means
     // resolveAttachment falls back to a one-off header parse.
@@ -324,6 +324,31 @@ function statusError(message, statusCode) {
   return error;
 }
 
+// ROUND 10 (root B): THE single disk-admission chokepoint. Every write path that
+// can ADD bytes to attachment storage must route its charge through here before
+// touching disk - new image+sidecar, and the dedup sidecar repair (a pre-D6 or
+// crash-orphaned image whose `.meta` is missing). The dedup mtime-refresh rewrite
+// replaces identical bytes in place (net-zero charge) and the sweep only removes,
+// so those are the only two byte-adding paths; a "retry" is just the same upload
+// route again. The charge is the SAME allocated accounting the sweep/cap use, so
+// there is no separate counter and no undercount: `sweepAttachments` first
+// reclaims unreferenced/expired down toward (cap - newCharge) and returns the
+// committed `chargedBytes` that survived (including in-grace/undeletable orphan
+// debris - ATTACH-003), so a second crawl is avoided. Returns false when the
+// remainder plus the new charge still exceeds the cap (everything left is
+// referenced). The caller MUST hold the lifecycle lock so the reference snapshot,
+// the reclaim, and the write are one atomic critical section.
+async function admitAttachmentCharge(stateDir, newCharge, { ttlMs, maxDiskBytes, maxObjects, referenced }) {
+  if (maxDiskBytes == null || newCharge <= 0) return true;
+  const swept = await sweepAttachments(stateDir, {
+    ttlMs,
+    maxDiskBytes: Math.max(0, maxDiskBytes - newCharge),
+    maxObjects,
+    referenced,
+  });
+  return swept.chargedBytes + newCharge <= maxDiskBytes;
+}
+
 // Validate (size + magic bytes, magic bytes authoritative), content-hash, and
 // write the bytes atomically. Identical content dedupes to the same file. Errors
 // carry an HTTP statusCode so the server's error handler surfaces 413/415/400.
@@ -335,6 +360,7 @@ export async function writeAttachment(
     maxBytes = DEFAULT_MAX_ATTACHMENT_BYTES,
     touchFile = utimes,
     maxDiskBytes = null,
+    maxObjects = null,
     ttlMs = null,
     referenced = new Set(),
   } = {},
@@ -347,32 +373,32 @@ export async function writeAttachment(
   const id = `${crypto.createHash("sha256").update(buffer).digest("hex")}.${type.ext}`;
   const file = attachmentFile(stateDir, key, id);
   const dims = imageDimensions(buffer, type.mime);
+  const sidecarContent = JSON.stringify({
+    v: 1,
+    mime: type.mime,
+    bytes: buffer.length,
+    width: dims?.width || 0,
+    height: dims?.height || 0,
+  });
+  // The admission sweep must never evict the very file this write dedupes into
+  // (it may be unreferenced until the prompt referencing it queues), so it is
+  // pinned alongside the caller's reference snapshot for the admission run only.
+  const protectedRefs = new Set(referenced);
+  protectedRefs.add(`${key}/${id}`);
+  const admission = { ttlMs, maxDiskBytes, maxObjects, referenced: protectedRefs };
   const isNew = !(await pathExists(file));
-  // Admission (hard cap): a NEW object must not push committed storage past the disk
-  // cap. Dedup (existing content) adds nothing, so it always admits. The charge is the
-  // SAME allocated accounting the sweep/cap use (image block(s) + one sidecar block -
-  // a sidecar is always < one block), so there is no separate counter and no 683x
-  // undercount. `sweepAttachments` first reclaims unreferenced/expired down toward
-  // (cap - newCharge) and returns the committed `chargedBytes` that survived, so a
-  // second crawl is avoided; if the remainder plus this object still exceeds the cap
-  // (everything left is referenced), the upload is refused with 507. The caller runs
-  // this under the lifecycle lock, so the reference snapshot and the write are atomic.
-  // Runs BEFORE ensureAttachmentDir: the sweep prunes empty dirs, so creating the
-  // session dir afterwards guarantees it exists for the write below.
-  if (isNew && maxDiskBytes != null) {
-    const newCharge = allocatedBytes(buffer.length) + ATTACHMENT_ALLOC_BLOCK_BYTES;
-    const swept = await sweepAttachments(stateDir, {
-      ttlMs,
-      maxDiskBytes: Math.max(0, maxDiskBytes - newCharge),
-      referenced,
-    });
-    if (swept.chargedBytes + newCharge > maxDiskBytes) {
+  if (isNew) {
+    // Admission (hard cap): a NEW object must not push committed storage past the
+    // disk cap; refused with 507 (see admitAttachmentCharge). Runs BEFORE
+    // ensureAttachmentDir: the sweep prunes empty dirs, so creating the session
+    // dir afterwards guarantees it exists for the write below.
+    const newCharge = allocatedBytes(buffer.length) + allocatedBytes(sidecarContent.length);
+    if (!(await admitAttachmentCharge(stateDir, newCharge, admission))) {
       throw statusError("attachment storage is full", 507);
     }
-  }
-  await ensureAttachmentDir(stateDir, key);
-  if (isNew) {
+    await ensureAttachmentDir(stateDir, key);
     await writeFileAtomically(file, buffer);
+    await writeSidecar(file, sidecarContent);
   } else {
     // B3: dedup re-upload of identical content must refresh the mtime so a new
     // reference restarts the TTL clock. Otherwise an aged-but-re-referenced file
@@ -388,14 +414,20 @@ export async function writeAttachment(
       // reader never observes a partial file. If that fails too, report the failure.
       await writeFileAtomically(file, buffer);
     }
+    // Sidecar repair (attachment-store.js:362 fix): a dedup hit whose `.meta` is
+    // missing (pre-D6 storage or a crashed sidecar write) would otherwise add a
+    // brand-new block with NO quota check. Route the repair through the SAME
+    // admission chokepoint; when it is refused (every remaining byte referenced,
+    // zero headroom) the repair is skipped - the sidecar is a display cache and
+    // resolveAttachment falls back to a header parse - rather than either failing
+    // the dedup upload or silently blowing the cap. An EXISTING sidecar is not
+    // rewritten at all: identical content would replace identical content.
+    if (!(await pathExists(sidecarPath(file)))) {
+      if (await admitAttachmentCharge(stateDir, allocatedBytes(sidecarContent.length), admission)) {
+        await writeSidecar(file, sidecarContent);
+      }
+    }
   }
-  await writeSidecar(file, {
-    v: 1,
-    mime: type.mime,
-    bytes: buffer.length,
-    width: dims?.width || 0,
-    height: dims?.height || 0,
-  });
   return buildMetadata(id, file, type.mime, buffer.length, dims);
 }
 

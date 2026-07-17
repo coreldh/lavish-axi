@@ -686,3 +686,166 @@ test("removeAttachment removes the sidecar before the image (ATTACH-002)", async
     assert.equal(await fileExists(stored.path + ".meta"), false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ROUND 10 (root B): ONE admission chokepoint for every byte-adding write path.
+// ---------------------------------------------------------------------------
+
+// Independent on-disk accounting for the invariant tests: walk the attachments
+// tree and charge EVERY file (images, sidecars, temps) the same allocated cost
+// the cap uses. Deliberately not listAttachments, so a file the store's own
+// enumeration hides (a sidecar, an orphan temp) still counts against the cap.
+async function chargedBytesOnDisk(dir) {
+  const root = path.join(dir, "attachments");
+  let total = 0;
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const dirent of entries) {
+    if (!dirent.isDirectory()) continue;
+    const sessionDir = path.join(root, dirent.name);
+    for (const entry of await readdir(sessionDir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const info = await stat(path.join(sessionDir, entry.name));
+      total += Math.max(1, Math.ceil(info.size / ATTACHMENT_ALLOC_BLOCK_BYTES)) * ATTACHMENT_ALLOC_BLOCK_BYTES;
+    }
+  }
+  return total;
+}
+
+// A PNG-signature payload padded to occupy exactly `blocks` allocation blocks.
+function paddedPng(seed, blocks) {
+  const target = blocks * ATTACHMENT_ALLOC_BLOCK_BYTES;
+  const head = uniquePng(seed);
+  return Buffer.concat([head, Buffer.alloc(target - head.length, 0x2e)]);
+}
+
+test("a dedup upload cannot restore a missing sidecar past the disk cap (R10-B, attachment-store.js:362)", async () => {
+  await withTempDir(async (dir) => {
+    // Three-block budget: image A (1 block, sidecar lost), image B (1 block) +
+    // B's sidecar (1 block). Every file is referenced, so nothing is evictable
+    // and there is ZERO headroom left under the cap.
+    const cap = 3 * ATTACHMENT_ALLOC_BLOCK_BYTES;
+    const a = await writeAttachment(dir, KEY, uniquePng("dedup-a"), {});
+    await rm(a.path + ".meta"); // pre-D6 storage or a crashed sidecar write
+    const b = await writeAttachment(dir, KEY, uniquePng("dedup-b"), {
+      maxDiskBytes: cap,
+      ttlMs: null,
+      referenced: new Set([`${KEY}/${a.id}`]),
+    });
+    const referenced = new Set([`${KEY}/${a.id}`, `${KEY}/${b.id}`]);
+    assert.equal(await chargedBytesOnDisk(dir), cap, "the budget starts exactly full");
+
+    // Re-uploading A's exact bytes dedupes to the existing file - but the missing
+    // sidecar write is a NEW block. Unadmitted, it pushes committed storage past
+    // the cap with every byte referenced, so nothing can ever be evicted back under.
+    const again = await writeAttachment(dir, KEY, uniquePng("dedup-a"), {
+      maxDiskBytes: cap,
+      ttlMs: null,
+      referenced,
+    });
+    assert.equal(again.id, a.id, "the dedup upload itself still succeeds");
+    assert.ok(
+      (await chargedBytesOnDisk(dir)) <= cap,
+      "a refused sidecar repair must not push committed storage past maxDiskBytes",
+    );
+    assert.equal(await fileExists(a.path + ".meta"), false, "the unadmitted sidecar is skipped, not written");
+  });
+});
+
+test("a dedup upload restores a missing sidecar when the budget allows (R10-B guard)", async () => {
+  await withTempDir(async (dir) => {
+    const cap = 8 * ATTACHMENT_ALLOC_BLOCK_BYTES;
+    const a = await writeAttachment(dir, KEY, uniquePng("repair"), { maxDiskBytes: cap, ttlMs: null });
+    await rm(a.path + ".meta");
+    const again = await writeAttachment(dir, KEY, uniquePng("repair"), { maxDiskBytes: cap, ttlMs: null });
+    assert.equal(again.id, a.id);
+    assert.equal(await fileExists(a.path + ".meta"), true, "the sidecar repair is admitted and written");
+    assert.deepEqual(
+      { width: again.width, height: again.height },
+      { width: 2, height: 1 },
+      "the repaired sidecar carries real dimensions",
+    );
+  });
+});
+
+test("no write-path sequence pushes committed storage past maxDiskBytes (R10-B invariant, property)", async () => {
+  await withTempDir(async (dir) => {
+    const cap = 6 * ATTACHMENT_ALLOC_BLOCK_BYTES;
+    const referenced = new Set();
+    const stored = []; // { key, id, path, buffer }
+    let refusals = 0;
+    // Deterministic LCG so a failure reproduces exactly.
+    let state = 0xdecafbad;
+    const rand = (n) => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return state % n;
+    };
+    // The server serializes every writeAttachment through the store's lifecycle
+    // lock; mirror that here so "concurrent" batches interleave the way the real
+    // route does (admission and write are one critical section).
+    let lock = Promise.resolve();
+    const runExclusive = (fn) => {
+      const next = lock.then(fn);
+      lock = next.then(
+        () => {},
+        () => {},
+      );
+      return next;
+    };
+    const write = (key, buffer) =>
+      runExclusive(async () => {
+        try {
+          const meta = await writeAttachment(dir, key, buffer, {
+            maxDiskBytes: cap,
+            ttlMs: null,
+            referenced,
+          });
+          stored.push({ key, id: meta.id, path: meta.path, buffer });
+          return meta;
+        } catch (error) {
+          if (error && error.statusCode === 507) {
+            refusals += 1;
+            return null;
+          }
+          throw error;
+        }
+      });
+
+    for (let round = 0; round < 40; round += 1) {
+      const ops = [];
+      const width = 1 + rand(3); // 1-3 ops interleaved per round, like concurrent pages
+      for (let i = 0; i < width; i += 1) {
+        const key = rand(2) === 0 ? KEY : KEY_B;
+        const kind = rand(5);
+        if (kind === 0 && stored.length) {
+          // Dedup re-upload of existing content.
+          const pick = stored[rand(stored.length)];
+          ops.push(write(pick.key, pick.buffer));
+        } else if (kind === 1 && stored.length) {
+          // Sidecar-repair dedup: lose the sidecar, then re-upload the bytes.
+          const pick = stored[rand(stored.length)];
+          ops.push(rm(pick.path + ".meta", { force: true }).then(() => write(pick.key, pick.buffer)));
+        } else if (kind === 2 && stored.length) {
+          // Reference churn: pin or unpin a stored file.
+          const pick = stored[rand(stored.length)];
+          const ref = `${pick.key}/${pick.id}`;
+          if (referenced.has(ref) && rand(2) === 0) referenced.delete(ref);
+          else referenced.add(ref);
+        } else {
+          // A brand-new upload of 1-3 blocks (a "retry" after a 507 is just this
+          // same path again - there is no separate retry write).
+          ops.push(write(key, paddedPng(`p${round}-${i}`, 1 + rand(3))));
+        }
+      }
+      await Promise.all(ops);
+      const charged = await chargedBytesOnDisk(dir);
+      assert.ok(charged <= cap, `committed storage ${charged} exceeded maxDiskBytes ${cap} after round ${round}`);
+    }
+    assert.ok(refusals > 0, "the sequence must actually exercise 507 admission refusals");
+    assert.ok(stored.length > 0, "the sequence must actually store attachments");
+  });
+});

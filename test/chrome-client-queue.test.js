@@ -238,6 +238,34 @@ async function createChromeHarness({
       inlineWhiteboards.push(whiteboard);
       return whiteboard;
     },
+    // A nested capture frame (root A): its own source window, its own posted-message
+    // sink, and a `send` that dispatches a message to the chrome as if from that
+    // frame (event.source === this frame's window). `ready(token)` binds the channel.
+    createAttachmentFrame(token = "tok-" + Math.random().toString(36).slice(2)) {
+      const posted = [];
+      const source = {
+        postMessage(message) {
+          posted.push(message);
+        },
+      };
+      const send = (data) => {
+        const handlers = windowListeners.get("message") || [];
+        assert.ok(handlers.length > 0, "chrome-client registered a message handler");
+        for (const handler of handlers) handler({ source, data });
+      };
+      return {
+        source,
+        posted,
+        token,
+        send,
+        ready: () => send({ type: "lavish-attachment:ready", channelToken: token }),
+        upload: (message) => send({ type: "lavish-attachment:upload", channelId: token, ...message }),
+        state: (message) => send({ type: "lavish-attachment:state", channelId: token, ...message }),
+        result(localId) {
+          return posted.find((m) => m.type === "lavish-attachment:uploadResult" && m.localId === localId);
+        },
+      };
+    },
     eventSource() {
       assert.equal(eventSources.length, 1);
       return eventSources[0];
@@ -339,36 +367,28 @@ test("chrome client scrolls new chat bubbles into view above queued prompts", as
 test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confused-deputy guard)", async () => {
   let fetches = 0;
   const chrome = await createChromeHarness({
-    fetchImpl: async () => {
+    fetchImpl: async (url) => {
+      if (String(url).includes("/attachment-channel")) return { ok: true };
       fetches += 1;
       return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises(); // channel authenticated
 
-  chrome.sendFrameMessage({
-    type: "lavish:uploadAttachment",
-    localId: "invalid",
-    mime: "image/png",
-    bytes: { byteLength: 16 },
-  });
+  af.upload({ localId: "invalid", mime: "image/png", bytes: { byteLength: 16 } });
   await flushPromises();
   assert.equal(fetches, 0, "an invalid payload never hits the network");
-  const invalidResult = chrome.postedToFrame.find(
-    (m) => m.type === "lavish:attachmentResult" && m.localId === "invalid",
-  );
+  const invalidResult = af.result("invalid");
   assert.equal(invalidResult.ok, false);
   assert.equal(invalidResult.error, "invalid upload payload");
 
   // A single oversized (>256 MiB session quota) upload is refused BEFORE the network.
-  chrome.sendFrameMessage({
-    type: "lavish:uploadAttachment",
-    localId: "big",
-    mime: "image/png",
-    bytes: new ArrayBuffer(300 * 1024 * 1024),
-  });
+  af.upload({ localId: "big", mime: "image/png", bytes: new ArrayBuffer(300 * 1024 * 1024) });
   await flushPromises();
   assert.equal(fetches, 0, "quota-exceeding upload never hits the network");
-  const quotaResult = chrome.postedToFrame.find((m) => m.type === "lavish:attachmentResult" && m.localId === "big");
+  const quotaResult = af.result("big");
   assert.equal(quotaResult.ok, false);
   assert.match(quotaResult.error, /Upload limit reached/);
 
@@ -376,27 +396,62 @@ test("chrome mediates attachment uploads: rate + cumulative-byte ceiling (confus
   // is let settle before the next so the in-flight bound (its own test) never blocks;
   // here we are exercising the RATE cap, which counts uploads that reached the network.
   for (let i = 0; i < 30; i += 1) {
-    chrome.sendFrameMessage({
-      type: "lavish:uploadAttachment",
-      localId: "ok-" + i,
-      mime: "image/png",
-      bytes: new ArrayBuffer(16),
-    });
+    af.upload({ localId: "ok-" + i, mime: "image/png", bytes: new ArrayBuffer(16) });
     await flushPromises();
   }
   assert.equal(fetches, 30, "the first 30 uploads within the window are allowed");
 
-  chrome.sendFrameMessage({
-    type: "lavish:uploadAttachment",
-    localId: "throttled",
+  af.upload({ localId: "throttled", mime: "image/png", bytes: new ArrayBuffer(16) });
+  await flushPromises();
+  assert.equal(fetches, 30, "the 31st upload in the window is throttled, not sent");
+  const throttled = af.result("throttled");
+  assert.equal(throttled.ok, false);
+  assert.match(throttled.error, /Too many uploads/);
+});
+
+test("the chrome ignores attachment uploads from an unauthenticated (unbound) frame (root A)", async () => {
+  // A frame that never presented a valid channel token - e.g. a hostile artifact
+  // posting to window.top pretending to be a capture frame - must not drive an
+  // upload. Only a frame the server authenticated (real, chrome-served token) binds.
+  let fetches = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).includes("/attachment-channel")) return { ok: false };
+      fetches += 1;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises(); // auth REJECTED, so no binding
+  af.upload({ localId: "x", mime: "image/png", bytes: new ArrayBuffer(16) });
+  await flushPromises();
+  assert.equal(fetches, 0, "an unbound frame's upload never reaches the network");
+  assert.equal(af.result("x"), undefined, "and gets no result echoed back");
+});
+
+test("the chrome ignores an upload carrying the wrong channel token (root A)", async () => {
+  let fetches = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).includes("/attachment-channel")) return { ok: true };
+      fetches += 1;
+      return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+    },
+  });
+  const af = chrome.createAttachmentFrame("real-token");
+  af.ready();
+  await flushPromises();
+  // Same source window, but a forged channelId: rejected.
+  af.send({
+    type: "lavish-attachment:upload",
+    channelId: "forged",
+    localId: "x",
     mime: "image/png",
     bytes: new ArrayBuffer(16),
   });
   await flushPromises();
-  assert.equal(fetches, 30, "the 31st upload in the window is throttled, not sent");
-  const throttled = chrome.postedToFrame.find((m) => m.type === "lavish:attachmentResult" && m.localId === "throttled");
-  assert.equal(throttled.ok, false);
-  assert.match(throttled.error, /Too many uploads/);
+  assert.equal(fetches, 0, "an upload with a mismatched channel token never reaches the network");
 });
 
 test("chrome client posts layout warnings from the artifact iframe", async () => {
@@ -1415,51 +1470,71 @@ test("whiteboard close stays responsive while overlay initialization is pending"
   await flushPromises();
 });
 
-test("chrome uploads captured attachment bytes and reports the server id to the card", async () => {
+test("chrome uploads captured attachment bytes and reports the server id to the capture frame", async () => {
   const requests = [];
   const chrome = await createChromeHarness({
     fetchImpl: async (url, options) => {
+      if (String(url).includes("/attachment-channel")) return { ok: true };
       requests.push({ url, options });
       return { ok: true, json: async () => ({ status: "stored", attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises();
 
   const bytes = new Uint8Array([1, 2, 3]).buffer;
-  chrome.sendFrameMessage({
-    type: "lavish:uploadAttachment",
-    localId: "att-1",
-    name: "mock.png",
-    mime: "image/png",
-    bytes,
-  });
+  af.upload({ localId: "att-1", name: "mock.png", mime: "image/png", bytes });
   await flushPromises();
 
   assert.equal(requests[0].url, "/api/abc/attachments");
   assert.equal(requests[0].options.method, "POST");
   assert.equal(requests[0].options.headers["content-type"], "image/png");
   assert.equal(requests[0].options.body, bytes);
-  const result = chrome.postedToFrame.at(-1);
-  assert.equal(result.type, "lavish:attachmentResult");
-  assert.equal(result.localId, "att-1");
+  // The result goes back to the CAPTURE FRAME, never the artifact frame.
+  const result = af.result("att-1");
   assert.equal(result.ok, true);
   assert.equal(result.id, "a".repeat(64) + ".png");
+  assert.equal(result.channelId, af.token);
+  assert.ok(
+    !chrome.postedToFrame.some((m) => m.type === "lavish:attachmentResult"),
+    "no attachment bytes or result are ever posted into the artifact realm",
+  );
 });
 
-test("chrome reports an upload failure back to the card", async () => {
-  const chrome = await createChromeHarness({
-    fetchImpl: async () => ({ ok: false, json: async () => ({ error: "unsupported image type" }) }),
-  });
-  chrome.sendFrameMessage({
-    type: "lavish:uploadAttachment",
-    localId: "att-9",
-    name: "bad.svg",
-    mime: "image/svg+xml",
-    bytes: new Uint8Array([0]).buffer,
-  });
+test("chrome relays only non-sensitive capture-frame state to the artifact card (root A)", async () => {
+  const chrome = await createChromeHarness();
+  const af = chrome.createAttachmentFrame();
+  af.ready();
   await flushPromises();
-  const result = chrome.postedToFrame.at(-1);
-  assert.equal(result.type, "lavish:attachmentResult");
-  assert.equal(result.localId, "att-9");
+  const id = "a".repeat(64) + ".png";
+  af.state({
+    capRejected: true,
+    height: 210,
+    items: [{ localId: "att-1", name: "shot.png", status: "ready", id, bytes: "SECRET" }],
+  });
+  const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
+  assert.ok(relayed, "the chrome relays a state message to the artifact card");
+  assert.equal(relayed.state.capRejected, true);
+  assert.equal(relayed.state.height, 210);
+  assert.deepEqual(relayed.state.items, [{ localId: "att-1", name: "shot.png", status: "ready", id, bytes: "SECRET" }]);
+  // The relay carries no upload bytes of its own - only the frame's own item list.
+  assert.equal(JSON.stringify(relayed).includes("lavish-attachment:upload"), false);
+});
+
+test("chrome reports an upload failure back to the capture frame", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).includes("/attachment-channel")) return { ok: true };
+      return { ok: false, json: async () => ({ error: "unsupported image type" }) };
+    },
+  });
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises();
+  af.upload({ localId: "att-9", name: "bad.svg", mime: "image/svg+xml", bytes: new Uint8Array([0]).buffer });
+  await flushPromises();
+  const result = af.result("att-9");
   assert.equal(result.ok, false);
   assert.equal(result.error, "unsupported image type");
 });
@@ -1526,23 +1601,19 @@ test("chrome rejects an over-cap image before it hits the network", async () => 
   const chrome = await createChromeHarness({
     sessionData: { key: "abc", file: "/tmp/artifact.html", modeToggleHotkeyKey: "i", attachmentMaxBytes: 4 },
     fetchImpl: async (url, options) => {
+      if (String(url).includes("/attachment-channel")) return { ok: true };
       requests.push({ url, options });
       return { ok: true, json: async () => ({ attachment: { id: "x" } }) };
     },
   });
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises();
   const bytes = new Uint8Array([1, 2, 3, 4, 5, 6]).buffer; // 6 bytes > 4-byte cap
-  chrome.sendFrameMessage({
-    type: "lavish:uploadAttachment",
-    localId: "att-x",
-    name: "big.png",
-    mime: "image/png",
-    bytes,
-  });
+  af.upload({ localId: "att-x", name: "big.png", mime: "image/png", bytes });
   await flushPromises();
   assert.equal(requests.length, 0, "an over-cap image must not be uploaded");
-  const result = chrome.postedToFrame.at(-1);
-  assert.equal(result.type, "lavish:attachmentResult");
-  assert.equal(result.localId, "att-x");
+  const result = af.result("att-x");
   assert.equal(result.ok, false);
   assert.match(result.error, /larger than/);
 });
@@ -1678,33 +1749,32 @@ test("the chrome bounds concurrent in-flight uploads (D8)", async () => {
     releaseAll = resolve;
   });
   const chrome = await createChromeHarness({
-    fetchImpl: async () => {
+    fetchImpl: async (url) => {
+      if (String(url).includes("/attachment-channel")) return { ok: true };
       started += 1;
       // Hang every upload so they all stay in flight until released.
       await gate;
       return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
     },
   });
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises();
 
   // Eight small uploads at once: under the rate cap (30) and the byte quota, so only
   // an in-flight bound can stop them. Without it, all eight hit the network at once,
   // holding eight large bodies (structured clones + server buffers) concurrently.
   for (let i = 0; i < 8; i += 1) {
-    chrome.sendFrameMessage({
-      type: "lavish:uploadAttachment",
-      localId: "u-" + i,
-      mime: "image/png",
-      bytes: new ArrayBuffer(16),
-    });
+    af.upload({ localId: "u-" + i, mime: "image/png", bytes: new ArrayBuffer(16) });
   }
   await flushPromises();
 
   assert.ok(started <= 4, `at most the in-flight bound reach the network at once, got ${started}`);
   // The ones over the bound are refused (not left hanging "uploading" forever), so
   // the card can retry once capacity frees.
-  const refused = chrome.postedToFrame.filter(
+  const refused = af.posted.filter(
     (m) =>
-      m.type === "lavish:attachmentResult" &&
+      m.type === "lavish-attachment:uploadResult" &&
       m.ok === false &&
       /in flight|in-flight|concurrent|Wait a moment/i.test(m.error || ""),
   );
@@ -1718,24 +1788,24 @@ test("a settled upload frees an in-flight slot for the next (D8)", async () => {
   /** @type {Array<() => void>} */
   const resolvers = [];
   const chrome = await createChromeHarness({
-    fetchImpl: () =>
-      new Promise((resolve) => {
+    fetchImpl: (url) => {
+      if (String(url).includes("/attachment-channel")) return Promise.resolve({ ok: true });
+      return new Promise((resolve) => {
         resolvers.push(() =>
           resolve(
             /** @type {any} */ ({ ok: true, json: async () => ({ attachment: { id: "b".repeat(64) + ".png" } }) }),
           ),
         );
-      }),
+      });
+    },
   });
+  const af = chrome.createAttachmentFrame();
+  af.ready();
+  await flushPromises();
 
   // Fill the in-flight bound.
   for (let i = 0; i < 4; i += 1) {
-    chrome.sendFrameMessage({
-      type: "lavish:uploadAttachment",
-      localId: "a-" + i,
-      mime: "image/png",
-      bytes: new ArrayBuffer(16),
-    });
+    af.upload({ localId: "a-" + i, mime: "image/png", bytes: new ArrayBuffer(16) });
   }
   await flushPromises();
   const startedBefore = resolvers.length;
@@ -1745,12 +1815,7 @@ test("a settled upload frees an in-flight slot for the next (D8)", async () => {
   await flushPromises();
   await flushPromises();
 
-  chrome.sendFrameMessage({
-    type: "lavish:uploadAttachment",
-    localId: "next",
-    mime: "image/png",
-    bytes: new ArrayBuffer(16),
-  });
+  af.upload({ localId: "next", mime: "image/png", bytes: new ArrayBuffer(16) });
   await flushPromises();
 
   assert.equal(resolvers.length, startedBefore + 1, "a freed slot admits the next upload");

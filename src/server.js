@@ -20,12 +20,12 @@ import {
   isModeToggleHotkeyEvent,
   isNativeInteractiveControl,
   isNearTotalOcclusion,
-  isTrustedAttachmentResult,
   attachmentSizeError,
   classifyAttachmentBatch,
   partitionDroppedFiles,
   MODE_TOGGLE_HOTKEY_KEY,
 } from "./artifact-sdk.js";
+import { createAttachmentFrame } from "./attachment-frame.js";
 import * as mermaidNode from "./mermaid-node.js";
 import { extractMermaidSources, mermaidSourceHash } from "./mermaid-source.js";
 import {
@@ -211,6 +211,10 @@ export async function serve({
   const deliveredFeedback = new Set();
   const sseClients = new Set();
   const whiteboardChannelSecret = crypto.randomBytes(32);
+  // A distinct secret for the attachment-capture frame channel (root A). Same
+  // signed, short-lived token scheme as the whiteboard channel; a separate secret
+  // keeps the two channels from cross-authenticating.
+  const attachmentChannelSecret = crypto.randomBytes(32);
   const verbose = debug || process.env.LAVISH_AXI_DEBUG === "1";
   const writeLog = typeof log === "function" ? log : (line) => process.stderr.write(`${line}\n`);
   const logEvent = verbose ? (line) => writeLog(`[lavish] ${line}`) : null;
@@ -686,6 +690,45 @@ export async function serve({
     res.type("html").send(createWhiteboardFrameHtml(createWhiteboardChannelToken(whiteboardChannelSecret)));
   });
 
+  // The attachment-capture frame page (root A). Served by the chrome into a
+  // sandboxed, opaque-origin iframe the artifact SDK embeds inside the annotation
+  // card, so image acquisition (picker/paste/drop) and byte reading run OUTSIDE
+  // the artifact realm. Carries a signed channel token; the frame reports to
+  // window.top (the chrome), never to its artifact parent.
+  app.get("/attachment-frame", (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    res.type("html").send(
+      createAttachmentFrameHtml(createWhiteboardChannelToken(attachmentChannelSecret), {
+        maxCount: attachmentConfig.maxPerPrompt,
+        maxBytes: attachmentConfig.maxBytes,
+      }),
+    );
+  });
+
+  // Authenticate an attachment-frame channel token (same guard/scheme as the
+  // whiteboard channel): a state-changing capability, so it is same-origin
+  // guarded, and the token must be one this server minted.
+  app.post("/api/:key/attachment-channel", async (req, res, next) => {
+    try {
+      if (!guardSameOrigin(req)) {
+        res.status(403).json({ error: "cross-origin attachment channel request rejected" });
+        return;
+      }
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (!isValidWhiteboardChannelToken(req.body?.token, attachmentChannelSecret)) {
+        res.status(403).json({ error: "invalid attachment channel" });
+        return;
+      }
+      res.json({ status: "authenticated" });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   // Whiteboard bundle, stylesheet, and vendored Excalidraw fonts. The frame
   // runs in an opaque origin, and font fetches from an opaque origin are
   // CORS-gated, so this static, public-content route must answer with
@@ -864,6 +907,7 @@ export async function serve({
         return writeAttachment(attachmentStateRoot, req.params.key, buffer, {
           maxBytes: attachmentConfig.maxBytes,
           maxDiskBytes: attachmentConfig.maxDiskBytes,
+          maxObjects: attachmentConfig.maxObjects,
           ttlMs: attachmentConfig.ttlMs,
           referenced,
         });
@@ -1006,9 +1050,12 @@ export async function serve({
 
   // Reference-aware attachment cleanup: reap files that are both past their TTL
   // and unreferenced, plus the optional disk-cap backstop. Runs once at startup
-  // and then on a fixed interval; skipped entirely when neither a TTL nor a disk
-  // cap is configured. Never touches attachments referenced by pending prompts.
-  const attachmentSweepEnabled = attachmentConfig.ttlMs != null || attachmentConfig.maxDiskBytes != null;
+  // and then on a fixed interval - ALWAYS, even when both the TTL and the disk
+  // cap are disabled (R10-B): the orphan reap inside sweepAttachments (crash
+  // `.tmp` files, orphan `.meta` sidecars) is what reclaims debris that ID_RE
+  // hides from every cap, and with both knobs off it would otherwise never run,
+  // leaking those bytes forever. Never touches attachments referenced by
+  // pending prompts.
   let attachmentSweepTimer = null;
   async function sweepAttachmentsNow() {
     try {
@@ -1031,13 +1078,11 @@ export async function serve({
       logEvent?.(`attachment sweep failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (attachmentSweepEnabled) {
+  sweepAttachmentsNow();
+  attachmentSweepTimer = setInterval(() => {
     sweepAttachmentsNow();
-    attachmentSweepTimer = setInterval(() => {
-      sweepAttachmentsNow();
-    }, ATTACHMENT_SWEEP_INTERVAL_MS);
-    attachmentSweepTimer.unref?.();
-  }
+  }, ATTACHMENT_SWEEP_INTERVAL_MS);
+  attachmentSweepTimer.unref?.();
 
   // Arm the idle timer for a server that is spawned but never opens a session.
   refreshIdleTimer();
@@ -1458,6 +1503,50 @@ export function createWhiteboardFrameHtml(channelToken = "") {
 </html>`;
 }
 
+const ATTACHMENT_FRAME_CSS = `*{box-sizing:border-box}html,body{margin:0}body{font:13px/1.4 Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#f7f3ea;background:transparent;overflow:hidden}#zone{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;padding:8px 10px;border-radius:10px;border:1px dashed #3c4557;background:#11141a;color:#aeb6c6;font-size:12px;font-weight:600;cursor:pointer}#zone:hover{border-color:#8c96aa}#zone:focus-visible{outline:2px solid #f4c95d;outline-offset:2px}#zone.is-dropping{border-style:solid;border-color:#f4c95d;color:#f7f3ea}#zone svg{flex:0 0 auto}#notice{margin-top:6px;font-size:11px;color:#ff9d7a;font-weight:700}#list{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:150px;overflow-y:auto}.chip{display:flex;align-items:center;gap:8px;padding:6px;border-radius:10px;background:#0f1115;border:1px solid #303745}.chip.is-error{border-color:#e0623d}.thumb{width:32px;height:32px;border-radius:6px;object-fit:cover;background:#171a21;flex:0 0 auto}.thumb-empty{display:inline-block}.body{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1 1 auto}.name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{font-size:11px;color:#aeb6c6}.status-error{color:#ff9d7a}.retry{flex:0 0 auto;padding:4px 8px;font-size:11px;font-weight:700;border-radius:8px;background:#2a2f3a;color:#f7f3ea;cursor:pointer;border:0}.remove{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border-radius:50%;background:transparent;color:rgba(255,255,255,.85);cursor:pointer;border:0}.remove:hover{background:rgba(255,255,255,.14);color:#fff}`;
+
+// Serialize the capture controller and its sibling helpers into a self-contained
+// frame bundle - the same same-scope-const contract `createSdkJs` uses, so no
+// build step is needed. The helpers are the exact exports the artifact SDK used
+// to classify batches, so client and frame stay behavior-identical.
+export function createAttachmentFrameJs(config = {}) {
+  return `(() => {
+const attachmentSizeError=${attachmentSizeError.toString()};
+const classifyAttachmentBatch=${classifyAttachmentBatch.toString()};
+const partitionDroppedFiles=${partitionDroppedFiles.toString()};
+const deriveAttachmentNoticeState=${deriveAttachmentNoticeState.toString()};
+(${createAttachmentFrame.toString()})(${JSON.stringify(config)}, { classifyAttachmentBatch, partitionDroppedFiles, deriveAttachmentNoticeState });
+})();`;
+}
+
+/**
+ * @param {string} channelToken
+ * @param {{ maxCount?: number, maxBytes?: number }} [limits]
+ */
+export function createAttachmentFrameHtml(channelToken = "", limits = {}) {
+  const config = {
+    channelToken,
+    maxCount: Number.isFinite(limits.maxCount) ? limits.maxCount : undefined,
+    maxBytes: Number.isFinite(limits.maxBytes) ? limits.maxBytes : undefined,
+  };
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lavish attachment</title>
+<style>${ATTACHMENT_FRAME_CSS}</style>
+</head>
+<body>
+<div id="zone" role="button" tabindex="0" aria-label="Attach image: click, paste, or drop"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span>Attach image &middot; click, paste, or drop</span></div>
+<input id="file" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+<div id="notice" hidden></div>
+<div id="list" hidden></div>
+<script>${createAttachmentFrameJs(config)}</script>
+</body>
+</html>`;
+}
+
 /**
  * @param {string} key
  * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number }} [options]
@@ -1490,10 +1579,6 @@ const classifyMaterialRectEscape=${classifyMaterialRectEscape.toString()};
 const isMaterialPageOverflow=${isMaterialPageOverflow.toString()};
 const findStableLayoutFindings=${findStableLayoutFindings.toString()};
 const isNearTotalOcclusion=${isNearTotalOcclusion.toString()};
-const attachmentSizeError=${attachmentSizeError.toString()};
-const classifyAttachmentBatch=${classifyAttachmentBatch.toString()};
-const partitionDroppedFiles=${partitionDroppedFiles.toString()};
-const isTrustedAttachmentResult=${isTrustedAttachmentResult.toString()};
 const deriveAttachmentNoticeState=${deriveAttachmentNoticeState.toString()};
 ${mermaidHelperDecls}
 const mermaidHelpers={ ${mermaidHelperKeys} };

@@ -5,37 +5,45 @@ import {
   attachmentSizeError,
   classifyAttachmentBatch,
   deriveAttachmentNoticeState,
-  isTrustedAttachmentResult,
   partitionDroppedFiles,
 } from "../src/artifact-sdk.js";
 import { createSdkJs } from "../src/server.js";
 
 // The annotation card lives inside the sandboxed artifact iframe, so its image
 // attachment behavior can only be exercised in a real browser. These assertions
-// pin the SDK <-> chrome message contract in the serialized bundle so a refactor
-// can't silently break the paste/drop -> upload -> queue handshake.
+// pin the SDK <-> chrome message contract in the serialized bundle. Since root A,
+// image acquisition and every byte live in the chrome-served capture frame
+// (`/attachment-frame`); the artifact-realm SDK only embeds that frame and mirrors
+// the non-sensitive state the chrome relays. The invariant test below proves the
+// bundle has NO byte path at all.
 const sdk = createSdkJs("0123456789abcdef");
 
-test("the SDK bundle uploads captured images through the chrome", () => {
-  assert.match(sdk, /type: "lavish:uploadAttachment"/);
-  assert.match(sdk, /localId: item\.localId/);
-  assert.match(sdk, /item\.file\s*\n?\s*\.arrayBuffer\(\)/);
+// ROOT A INVARIANT (R10): no path reachable from the artifact/untrusted realm can
+// obtain raw image bytes or invoke a write/delete. The SDK bundle is the entire
+// artifact-realm surface, so this is checkable directly on the serialized text.
+test("the SDK bundle has NO attachment byte path or write/delete (root A invariant)", () => {
+  // No byte reads of a captured file, no object URLs of raw bytes, no file input.
+  assert.doesNotMatch(sdk, /\.arrayBuffer\(\)/, "the artifact realm never reads file bytes");
+  assert.doesNotMatch(sdk, /createObjectURL/, "the artifact realm never materializes raw image bytes");
+  assert.doesNotMatch(sdk, /type="file"/, "the artifact realm hosts no file picker");
+  assert.doesNotMatch(sdk, /FileReader/, "the artifact realm uses no FileReader");
+  // No same-origin server write/delete of attachments from the artifact realm.
+  assert.doesNotMatch(sdk, /fetch\(/, "the artifact realm makes no server requests");
+  assert.doesNotMatch(sdk, /lavish:uploadAttachment/, "the artifact realm never ships bytes to the chrome");
+  assert.doesNotMatch(sdk, /method:\s*"DELETE"/, "the artifact realm invokes no delete");
+  // The capture surface is a chrome-served, sandboxed frame - not artifact DOM.
+  assert.match(sdk, /src="\/attachment-frame"/);
+  assert.match(sdk, /sandbox="allow-scripts allow-popups"/);
 });
 
-test("the SDK bundle scopes every upload and result to this document (E1)", () => {
-  // The nonce is minted per document, sent with each upload, and required on the
-  // way back; the listener also drops anything that did not come from the chrome.
-  assert.match(sdk, /const ATTACHMENT_NONCE\s*=/);
-  assert.match(sdk, /nonce: ATTACHMENT_NONCE/);
-  assert.match(sdk, /const isTrustedAttachmentResult=/);
-  assert.match(sdk, /if \(event\.source !== parent\) return;/);
-  assert.match(sdk, /isTrustedAttachmentResult\(event, \{ parentWindow: parent, nonce: ATTACHMENT_NONCE \}\)/);
-});
-
-test("the SDK bundle applies upload results and offers a retry", () => {
-  assert.match(sdk, /lavish:attachmentResult/);
-  assert.match(sdk, /activeAttachments\?\.handleResult\(msg\.localId, msg\.ok, msg\.id, msg\.error\)/);
-  assert.match(sdk, /data-attachment-retry/);
+test("the SDK bundle embeds the chrome-served capture frame and mirrors its state (root A)", () => {
+  // The card embeds the isolated frame and reacts only to chrome-relayed state.
+  assert.match(sdk, /class="lavish-attach-frame"/);
+  assert.match(sdk, /if \(msg\.type === "lavish:attachmentState"\)/);
+  assert.match(sdk, /activeAttachments\?\.applyState\(msg\.state \|\| \{\}\)/);
+  // The mirror is coerced to primitives - never the relayed objects by reference.
+  assert.match(sdk, /function applyState\(state\)/);
+  assert.match(sdk, /typeof item\?\.id === "string"/);
 });
 
 test("the SDK bundle carries ready attachment refs on the queued prompt", () => {
@@ -44,37 +52,9 @@ test("the SDK bundle carries ready attachment refs on the queued prompt", () => 
   assert.match(sdk, /queuePrompt\(prompt, \{ \.\.\.c, queueKey: "", attachments: readyAttachments \}\)/);
 });
 
-test("the SDK bundle only accepts PNG, JPEG, and WebP images", () => {
-  assert.match(sdk, /ATTACHMENT_ACCEPTED_MIME = \{ "image\/png": true, "image\/jpeg": true, "image\/webp": true \}/);
-  assert.match(sdk, /accept="image\/png,image\/jpeg,image\/webp"/);
-});
-
-test("the SDK bundle renders chips with a thumbnail, name, and status", () => {
-  assert.match(sdk, /lavish-attachment-thumb/);
-  assert.match(sdk, /lavish-attachment-name/);
-  assert.match(sdk, /Uploading…/);
-  assert.match(sdk, /revokeObjectURL/);
-});
-
-test("the SDK bundle intercepts every drop so a non-image can't navigate the frame", () => {
-  // The drop handler calls preventDefault() unconditionally, then classifies.
-  assert.match(
-    sdk,
-    /"drop",\s*\(event\)\s*=>\s*\{\s*[\s\S]*?event\.preventDefault\(\);\s*card\.classList\.remove\("is-dropping"\)/,
-  );
-  assert.match(sdk, /dataTransferHasFiles/);
-  assert.match(sdk, /attachments\.rejectUnsupportedBatch\(unsupported\)/);
-  assert.match(sdk, /error: "UNSUPPORTED_TYPE"/);
-});
-
-test("the SDK bundle renders a visible, titled remove control on each chip", () => {
-  assert.match(sdk, /aria-label="Remove image" title="Remove"/);
-  assert.match(sdk, /lavish-attachment-remove/);
-});
-
 test("the SDK bundle gates queuing until in-flight uploads settle (R2.4)", () => {
-  // hasPending flags any still-uploading chip, and the queue path bails on it so an
-  // in-flight image is never silently dropped by collectReady/closeCard.
+  // hasPending flags any still-uploading (mirrored) chip, and the queue path bails
+  // on it so an in-flight image is never silently dropped by collectReady/closeCard.
   assert.match(sdk, /function hasPending\(\)\s*\{\s*return items\.some\(\(item\) => item\.status === "uploading"\)/);
   assert.match(sdk, /if \(attachments\.hasPending\(\)\)/);
   assert.match(sdk, /Waiting for an image to finish uploading/);
@@ -107,7 +87,7 @@ test("the count-cap notice persists until attachment capacity is created", () =>
 
   assert.match(sdk, /notify\(\s*deriveAttachmentNoticeState\(/);
   assert.match(sdk, /attachNotice\.classList\.add\("lavish-hint-alert"\)/);
-  assert.match(sdk, /if \(items\.length < ATTACHMENT_MAX_COUNT\) capRejected = false/);
+  // The mirror clears its queue-block once no relayed item is pending/errored.
   assert.match(sdk, /if \(!hasPending\(\) && !hasErrors\(\)\) queueBlocked = false/);
 });
 
@@ -116,42 +96,12 @@ test("the count-cap notice persists until attachment capacity is created", () =>
 // it: E2 removed iframe-driven deletes outright, so the chrome never honors one and
 // the reference-aware sweeper owns reclamation. See chrome-client-queue.test.js.
 
-test("an upload result is only applied to the document that asked for it (E1)", () => {
-  const parentWindow = { name: "chrome" };
-  const nonce = "doc-nonce-1";
-  const trusted = (data, source = parentWindow) => isTrustedAttachmentResult({ source, data }, { parentWindow, nonce });
-
-  // The chrome's own result for this document's upload.
-  assert.equal(trusted({ nonce, localId: "att-1", ok: true }), true);
-
-  // A stale result from BEFORE an iframe reload. Local ids restart at "att-1" on
-  // every load, so without a per-document nonce this marks a brand-new chip ready
-  // with the previous document's image.
-  assert.equal(trusted({ nonce: "doc-nonce-0", localId: "att-1", ok: true }), false);
-  assert.equal(trusted({ localId: "att-1", ok: true }), false, "a result with no nonce is not ours");
-
-  // A forged same-window message: the artifact posting to itself must never be
-  // able to hand its own chips a server id it did not upload.
-  assert.equal(trusted({ nonce, localId: "att-1", ok: true }, { name: "self" }), false);
-  assert.equal(
-    trusted({ nonce, localId: "att-1", ok: true }, null),
-    false,
-    "a sourceless message is not from the chrome",
-  );
-});
-
-test("attachment result trust survives a hostile nonce shape (E1)", () => {
-  const parentWindow = { name: "chrome" };
-  const nonce = "doc-nonce-1";
-  const trusted = (data) => isTrustedAttachmentResult({ source: parentWindow, data }, { parentWindow, nonce });
-
-  // Exact string equality only: no coercion, no prefix/truthiness games.
-  for (const hostile of [{}, { nonce: null }, { nonce: 0 }, { nonce: true }, { nonce: ["doc-nonce-1"] }]) {
-    assert.equal(trusted(hostile), false, `nonce ${JSON.stringify(hostile)} must not pass`);
-  }
-  // A document with no nonce of its own never accepts results either.
-  assert.equal(isTrustedAttachmentResult({ source: parentWindow, data: {} }, { parentWindow, nonce: "" }), false);
-});
+// E1 (cross-document result correlation) is now subsumed by the capture-frame
+// architecture (root A): an upload result is delivered by the chrome ONLY to the
+// bound frame's window carrying that frame's channel token, and a fresh card mints
+// a fresh frame + token, so a stale result can never land on a new document's chip.
+// See attachment-frame.test.js (frame-side channel binding) and
+// chrome-client-queue.test.js (the chrome refuses unbound/mismatched-token frames).
 
 const ACCEPTED = { "image/png": true, "image/jpeg": true, "image/webp": true };
 const file = (name, type) => ({ name, type });
@@ -217,13 +167,6 @@ test("an empty drop partitions to nothing (W4-a)", () => {
   assert.deepEqual(partitionDroppedFiles({}, ACCEPTED), { images: [], unsupported: [] });
 });
 
-test("the SDK bundle wires the drop handler to partial-accept (W4-a)", () => {
-  assert.match(sdk, /const partitionDroppedFiles=/);
-  assert.match(sdk, /partitionDroppedFiles\(event\.dataTransfer, ATTACHMENT_ACCEPTED_MIME\)/);
-  // Unsupported files are rejected as a single batch (D7), not one render per file.
-  assert.match(sdk, /attachments\.rejectUnsupportedBatch\(unsupported\)/);
-});
-
 test("attachmentSizeError rejects an over-limit file before it is read (round7-a)", () => {
   const cap = 10 * 1024 * 1024; // 10 MiB
   // Within the limit (and the boundary) is accepted.
@@ -245,29 +188,9 @@ test("attachmentSizeError rejects an over-limit file before it is read (round7-a
   assert.equal(attachmentSizeError(NaN, cap), "");
 });
 
-test("the SDK bundle checks the size limit before reading or cloning the file (round7-a)", () => {
-  // The limit is threaded in, and the size decision runs in classifyAttachmentBatch
-  // (called by addFiles with ATTACHMENT_MAX_BYTES) BEFORE any createObjectURL /
-  // arrayBuffer, so an oversized file is decided "error" and never materializes a
-  // buffer or a second clone. Post-D7 the gate lives in the classifier, not inline.
-  assert.match(sdk, /const ATTACHMENT_MAX_BYTES\s*=/);
-  assert.match(sdk, /const attachmentSizeError=/);
-  assert.match(sdk, /const classifyAttachmentBatch=/);
-  // The classifier is the size gate, and it does its check on file.size.
-  assert.match(sdk, /attachmentSizeError\(file\.size, maxBytes\)/);
-  // addFiles runs the classifier with the real limit, and createObjectURL only ever
-  // runs afterwards (for an "accept" decision), so nothing is read before the gate.
-  const gateAt = sdk.indexOf("classifyAttachmentBatch(files, {");
-  const threadsLimit = /classifyAttachmentBatch\(files, \{[\s\S]*?maxBytes: ATTACHMENT_MAX_BYTES/.test(sdk);
-  const createObjectUrlAt = sdk.indexOf("URL.createObjectURL");
-  assert.ok(gateAt !== -1, "addFiles routes the batch through the classifier");
-  assert.ok(threadsLimit, "the classifier is called with ATTACHMENT_MAX_BYTES");
-  assert.equal(sdk.match(/URL\.createObjectURL/g).length, 1, "createObjectURL only appears once, in the accept path");
-  assert.ok(
-    gateAt < createObjectUrlAt,
-    "the size gate (classifier) precedes createObjectURL, so nothing is read first",
-  );
-});
+// The size-gate-before-read and the batched classifier/drop wiring are now pinned
+// against the CAPTURE FRAME bundle (root A), where acquisition lives - see
+// attachment-frame.test.js. The pure classifier behavior is still pinned here.
 
 test("classifyAttachmentBatch decides a whole drop in one pass (D7)", () => {
   const accepted = { "image/png": true };
@@ -312,13 +235,5 @@ test("classifyAttachmentBatch decides a whole drop in one pass (D7)", () => {
   );
 });
 
-test("the SDK bundle renders once per multi-file batch (D7)", () => {
-  assert.match(sdk, /const classifyAttachmentBatch=/);
-  // addFiles routes the whole list through the classifier instead of per-file add().
-  assert.match(sdk, /classifyAttachmentBatch\(/);
-  // A batched unsupported-rejection path exists and the drop handler uses it...
-  assert.match(sdk, /function rejectUnsupportedBatch\(/);
-  assert.match(sdk, /attachments\.rejectUnsupportedBatch\(unsupported\)/);
-  // ...instead of the old per-file loop that rendered N times.
-  assert.doesNotMatch(sdk, /for \(const name of unsupported\) attachments\.rejectUnsupported\(name\)/);
-});
+// The batched-render (D7) wiring now lives in the capture frame - pinned in
+// attachment-frame.test.js.

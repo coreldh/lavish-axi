@@ -1304,6 +1304,9 @@ function handleOverlayWhiteboardMessage(event, message) {
 
 window.addEventListener("message", (event) => {
   const message = event.data || {};
+  // Attachment capture frames are nested sandboxed frames that report to
+  // window.top; claim their messages first so the whiteboard handlers ignore them.
+  if (handleAttachmentFrameMessage(event, message)) return;
   if (event.source === whiteboardFrame.contentWindow) {
     handleOverlayWhiteboardMessage(event, message);
   } else {
@@ -1374,25 +1377,27 @@ window.addEventListener("message", (event) => {
     handleLayoutWarningsForGate(msg.layout_warnings);
     submitLayoutWarnings(msg.layout_warnings).catch(() => {});
   }
-  if (msg.type === "lavish:uploadAttachment") uploadAttachment(msg);
-  // There is deliberately no attachment-delete message. See removeAttachment's
-  // removal note below: the iframe cannot be trusted to decide a delete, and the
-  // chrome cannot see every live reference, so reclamation is the sweeper's job.
+  // Image bytes never arrive from the artifact frame (root A): acquisition and
+  // byte handling live in the isolated capture frame, which talks to the chrome
+  // directly via handleAttachmentFrameMessage. There is also deliberately no
+  // attachment-delete message - the iframe cannot be trusted to decide a delete,
+  // and the chrome cannot see every live reference, so reclamation is the
+  // sweeper's job (see removeAttachment's note below).
   if (msg.type === "lavish:sendQueuedPrompts") sendQueued();
   if (msg.type === "lavish:endSession") endSession();
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
 });
 
-// The sandboxed artifact iframe can't reach the loopback server (opaque origin),
-// so it hands captured image bytes here and the chrome performs the same-origin
-// upload, then reports the server-vetted id back to the card.
-async function uploadAttachment(message) {
+// The sandboxed capture frame (root A) can't reach the loopback server (opaque
+// origin), so it hands captured image bytes here and the chrome performs the
+// same-origin upload, then reports the server-vetted id back to that frame. The
+// chrome is the ONE trusted mediation point: it owns every same-origin write, and
+// bytes never pass through the artifact realm. `reply` posts the result to the
+// capture frame that made the request (never the artifact frame).
+async function uploadAttachment(message, reply) {
   const localId = String(message.localId || "");
   if (!localId) return;
-  // Echoed verbatim on every result so the artifact can tell a reply to ITS upload
-  // from one still in flight for a previous document (E1). The chrome never
-  // interprets it; it only round-trips it.
-  const nonce = message.nonce;
+  const fail = (error) => reply({ type: "lavish-attachment:uploadResult", localId, ok: false, error });
   const bytes = message.bytes;
   let size;
   if (ArrayBuffer.isView(bytes)) {
@@ -1406,13 +1411,7 @@ async function uploadAttachment(message) {
     }
   }
   if (!Number.isFinite(size) || size < 0) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      nonce,
-      localId,
-      ok: false,
-      error: "invalid upload payload",
-    });
+    fail("invalid upload payload");
     return;
   }
   // Reject over-cap images before they hit the network: an over-cap upload aborts
@@ -1420,49 +1419,25 @@ async function uploadAttachment(message) {
   // the chip would never leave "uploading". Catching it here guarantees the card
   // reaches its error+retry state. The server still enforces the cap authoritatively.
   if (attachmentMaxBytes > 0 && size > attachmentMaxBytes) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      nonce,
-      localId,
-      ok: false,
-      error: "Image is larger than the " + formatByteLimit(attachmentMaxBytes) + " limit",
-    });
+    fail("Image is larger than the " + formatByteLimit(attachmentMaxBytes) + " limit");
     return;
   }
   // Confused-deputy guard: rate + cumulative-byte ceiling before touching the network.
   const now = Date.now();
   while (uploadTimestamps.length && now - uploadTimestamps[0] > UPLOAD_RATE_WINDOW_MS) uploadTimestamps.shift();
   if (uploadTimestamps.length >= UPLOAD_RATE_MAX) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      nonce,
-      localId,
-      ok: false,
-      error: "Too many uploads. Wait a moment and retry.",
-    });
+    fail("Too many uploads. Wait a moment and retry.");
     return;
   }
   if (uploadedBytesTotal + size > UPLOAD_SESSION_BYTE_QUOTA) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      nonce,
-      localId,
-      ok: false,
-      error: "Upload limit reached for this session (" + formatByteLimit(UPLOAD_SESSION_BYTE_QUOTA) + ").",
-    });
+    fail("Upload limit reached for this session (" + formatByteLimit(UPLOAD_SESSION_BYTE_QUOTA) + ").");
     return;
   }
   // In-flight ceiling: refuse rather than pile another large body onto the network
   // while the bound is full. The card keeps its retry affordance, and a settled
   // upload (below) frees a slot for the next.
   if (uploadsInFlight >= UPLOAD_MAX_IN_FLIGHT) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      nonce,
-      localId,
-      ok: false,
-      error: "Too many uploads in flight. Wait a moment and retry.",
-    });
+    fail("Too many uploads in flight. Wait a moment and retry.");
     return;
   }
   uploadTimestamps.push(now);
@@ -1476,24 +1451,79 @@ async function uploadAttachment(message) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || "Upload failed");
-    postToFrame({
-      type: "lavish:attachmentResult",
-      nonce,
+    reply({
+      type: "lavish-attachment:uploadResult",
       localId,
       ok: true,
       id: (data.attachment && data.attachment.id) || "",
     });
   } catch (error) {
-    postToFrame({
-      type: "lavish:attachmentResult",
-      nonce,
-      localId,
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    fail(error instanceof Error ? error.message : String(error));
   } finally {
     uploadsInFlight -= 1;
   }
+}
+
+// The bound capture-frame channel (root A). Only one annotation card is open at a
+// time, so a single slot suffices; a fresh card mints a fresh token and re-binds.
+/** @type {{ window: Window, channelId: string } | null} */
+let attachmentChannel = null;
+
+async function authenticateAttachmentChannel(token) {
+  try {
+    const response = await fetch("/api/" + key + "/attachment-channel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Route a message from a nested sandboxed frame that is (or wants to become) the
+// attachment capture channel. Returns true if it was an attachment-frame message
+// so other frame handlers can skip it. Binds on an authenticated `ready`; every
+// later message must come from the bound window AND carry the bound token, so a
+// hostile artifact posting to window.top cannot drive uploads (it lacks a valid,
+// server-minted token and cannot read the real frame's token cross-origin).
+function handleAttachmentFrameMessage(event, message) {
+  const type = String(message.type || "");
+  if (!type.startsWith("lavish-attachment:")) return false;
+  const source = event.source;
+  if (!source) return true;
+  const replyTo = (payload) => source.postMessage({ ...payload, channelId: message.channelId }, "*");
+  if (type === "lavish-attachment:ready") {
+    const token = String(message.channelToken || "");
+    if (!token) return true;
+    authenticateAttachmentChannel(token).then((authenticated) => {
+      if (authenticated && !ended) {
+        attachmentChannel = { window: source, channelId: token };
+        // Ack so the frame reports its initial state and the card reveals it.
+        replyTo({ type: "lavish-attachment:bound" });
+      }
+    });
+    return true;
+  }
+  if (!attachmentChannel || source !== attachmentChannel.window || message.channelId !== attachmentChannel.channelId) {
+    return true;
+  }
+  if (type === "lavish-attachment:upload") {
+    uploadAttachment(message, replyTo);
+  } else if (type === "lavish-attachment:state") {
+    // Relay ONLY the non-sensitive per-item state to the artifact card's mirror
+    // (never bytes) so it can gate queuing and collect ready refs (root A).
+    postToFrame({
+      type: "lavish:attachmentState",
+      state: {
+        items: Array.isArray(message.items) ? message.items : [],
+        capRejected: Boolean(message.capRejected),
+        height: Number(message.height) || 0,
+      },
+    });
+  }
+  return true;
 }
 
 // There is intentionally no eager attachment delete here. Removing a chip used to

@@ -459,3 +459,92 @@ test("disk-cap admission counts in-grace crash-temp/orphan bytes (ATTACH-003)", 
     { env: { LAVISH_AXI_MAX_ATTACHMENT_DISK_MB: String(16384 / (1024 * 1024)) } },
   );
 });
+
+test("the orphan reap runs even with the TTL AND disk cap both disabled (R10-B, server.js:1011)", async () => {
+  // With LAVISH_AXI_ATTACHMENT_TTL_MS=off and LAVISH_AXI_MAX_ATTACHMENT_DISK_MB=off
+  // the old scheduling condition skipped the sweep entirely - so the orphan reap
+  // (crash `.tmp` files, orphan `.meta` sidecars, both invisible to every cap)
+  // never ran and that debris leaked forever. The sweep is now ALWAYS scheduled;
+  // with both knobs off it reaps only orphans and never touches valid files.
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-attach-orphan-"));
+  const stateFile = path.join(dir, "state.json");
+  const key = "0123456789abcdef";
+  const attachmentDir = path.join(dir, "attachments", key);
+  const validFile = path.join(attachmentDir, "a".repeat(64) + ".png");
+  const orphanTemp = path.join(attachmentDir, "b".repeat(64) + ".png.777.1.tmp");
+  const orphanMeta = path.join(attachmentDir, "c".repeat(64) + ".png.meta");
+  await mkdir(attachmentDir, { recursive: true });
+  await writeFile(validFile, PNG_2x1);
+  await writeFile(orphanTemp, Buffer.alloc(4096));
+  await writeFile(orphanMeta, "{}");
+  const old = Date.now() - 60 * 60 * 1000; // long past the temp write grace
+  await utimes(validFile, new Date(old), new Date(old));
+  await utimes(orphanTemp, new Date(old), new Date(old));
+  await utimes(orphanMeta, new Date(old), new Date(old));
+
+  const saved = { ttl: process.env.LAVISH_AXI_ATTACHMENT_TTL_MS, disk: process.env.LAVISH_AXI_MAX_ATTACHMENT_DISK_MB };
+  process.env.LAVISH_AXI_ATTACHMENT_TTL_MS = "off";
+  process.env.LAVISH_AXI_MAX_ATTACHMENT_DISK_MB = "off";
+  const server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
+  try {
+    const deadline = Date.now() + 2000;
+    let orphansGone = false;
+    while (Date.now() < deadline && !orphansGone) {
+      const tempThere = await access(orphanTemp).then(
+        () => true,
+        () => false,
+      );
+      const metaThere = await access(orphanMeta).then(
+        () => true,
+        () => false,
+      );
+      orphansGone = !tempThere && !metaThere;
+      if (!orphansGone) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(orphansGone, "stale crash-temp and orphan sidecar are reaped with both knobs off");
+    await access(validFile); // throws if the sweep wrongly touched the ancient-but-valid file
+  } finally {
+    await server.close();
+    if (saved.ttl === undefined) delete process.env.LAVISH_AXI_ATTACHMENT_TTL_MS;
+    else process.env.LAVISH_AXI_ATTACHMENT_TTL_MS = saved.ttl;
+    if (saved.disk === undefined) delete process.env.LAVISH_AXI_MAX_ATTACHMENT_DISK_MB;
+    else process.env.LAVISH_AXI_MAX_ATTACHMENT_DISK_MB = saved.disk;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the attachment-frame route serves the isolated capture frame with a channel token (root A)", async () => {
+  await withSession(async ({ base, key }) => {
+    const html = await fetch(`${base}/attachment-frame`).then((res) => res.text());
+    const token = /"channelToken":"([^"]+)"/.exec(html)?.[1] || "";
+    assert.ok(token, "the frame HTML carries a signed channel token");
+    assert.match(html, /id="zone"/);
+    // A same-origin authenticate with the frame's own token is accepted.
+    const accepted = await fetch(`${base}/api/${key}/attachment-channel`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ token }),
+    });
+    assert.equal(accepted.status, 200);
+    // A forged token is rejected.
+    const forged = await fetch(`${base}/api/${key}/attachment-channel`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({ token: "forged" }),
+    });
+    assert.equal(forged.status, 403);
+  });
+});
+
+test("the attachment-channel authenticate is same-origin guarded (root A)", async () => {
+  await withSession(async ({ base, key }) => {
+    const html = await fetch(`${base}/attachment-frame`).then((res) => res.text());
+    const token = /"channelToken":"([^"]+)"/.exec(html)?.[1] || "";
+    const crossOrigin = await fetch(`${base}/api/${key}/attachment-channel`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://evil.example" },
+      body: JSON.stringify({ token }),
+    });
+    assert.equal(crossOrigin.status, 403, "a cross-origin page cannot authenticate a capture channel");
+  });
+});
