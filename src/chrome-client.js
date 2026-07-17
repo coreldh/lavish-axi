@@ -1308,8 +1308,8 @@ function handleOverlayWhiteboardMessage(event, message) {
 
 window.addEventListener("message", (event) => {
   const message = event.data || {};
-  // Attachment capture frames are nested sandboxed frames that report to
-  // window.top; claim their messages first so the whiteboard handlers ignore them.
+  // The chrome-owned capture frame reports to its parent (this chrome); claim its
+  // messages first so the whiteboard handlers ignore them.
   if (handleAttachmentFrameMessage(event, message)) return;
   if (event.source === whiteboardFrame.contentWindow) {
     handleOverlayWhiteboardMessage(event, message);
@@ -1473,9 +1473,10 @@ async function uploadAttachment(message, reply) {
 // R12 capture-frame provenance. The CHROME creates the capture frame in its own
 // capture overlay (its top document) and binds the capture channel to the EXACT
 // window it created - an `event.source` identity the artifact realm cannot forge.
-// There is no capability token to mint: a hostile artifact can still load
-// `/attachment-frame` and post `ready` to window.top, but its window is not
-// `captureFrame.contentWindow`, so it is ignored. This is the fix for the round-12
+// There is no capability token to mint, and `frame-ancestors 'self'` on
+// `/attachment-frame` stops the opaque-origin artifact from even embedding it; a
+// message that still reaches the chrome from any window that is not
+// `captureFrame.contentWindow` is ignored. This is the fix for the round-12
 // finding (the old design bound ANY frame that presented a valid server-minted
 // token, which the artifact could obtain by loading the same route).
 /** @type {HTMLIFrameElement | null} */
@@ -1570,17 +1571,23 @@ function handleAttachmentFrameMessage(event, message) {
   } else if (type === "lavish-attachment:upload") {
     uploadAttachment(message, replyTo);
   } else if (type === "lavish-attachment:state") {
-    // Relay ONLY the non-sensitive per-item state to the artifact card's mirror (never
-    // bytes). Stamp the card nonce THIS picker was opened for (the chrome's own record,
-    // not a value the artifact can influence) so the mirror applies it only to that
-    // card (R11).
+    // Relay ONLY the non-sensitive per-item state to the artifact card's mirror. Each
+    // item is PROJECTED onto exactly the allowed fields (name, status, server id) - so
+    // even if a frame put an extra field on an item (bytes, a URL, anything), it can
+    // never cross into the artifact realm (root-10). Stamp the card nonce THIS picker
+    // was opened for (the chrome's own record, not a frame-supplied value) so the mirror
+    // applies it only to that card (R11).
+    const items = Array.isArray(message.items) ? message.items : [];
     postToFrame({
       type: "lavish:attachmentState",
       state: {
         cardNonce: captureCardNonce,
-        items: Array.isArray(message.items) ? message.items : [],
+        items: items.map((item) => ({
+          name: typeof item?.name === "string" ? item.name : "",
+          status: typeof item?.status === "string" ? item.status : "",
+          id: typeof item?.id === "string" ? item.id : "",
+        })),
         capRejected: Boolean(message.capRejected),
-        height: Number(message.height) || 0,
       },
     });
   }

@@ -245,7 +245,7 @@ test("a paste captured before any bound ack still ships bytes and stamps the non
   assert.equal(frame.lastState().cardNonce, "cardA", "the pre-bind state still carries the nonce");
 });
 
-test("a picked image is read in the frame and its bytes are shipped to window.top", async () => {
+test("a picked image is read in the frame and its bytes are shipped to the chrome (window.parent)", async () => {
   const frame = bootFrame();
   frame.elements.file.files = [fakeFile("shot.png", "image/png")];
   frame.elements.file.fire("change");

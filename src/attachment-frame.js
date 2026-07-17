@@ -15,9 +15,10 @@
 // obtain by loading the same route, so any authenticated frame bound: THAT was the
 // trust-boundary hole this redesign closes.
 //
-// The frame has NO server access: it reads bytes locally and hands them to `window.top`
-// (the chrome, which is now its direct parent) over postMessage; the chrome performs
-// the same-origin upload and reports the server-vetted id back. The artifact SDK only
+// The frame has NO server access: it reads bytes locally and hands them to
+// `window.parent` (the chrome, its direct parent - never `window.top`, which a page
+// framing the whole session could occupy) over postMessage; the chrome performs the
+// same-origin upload and reports the server-vetted id back. The artifact SDK only
 // ever learns the non-sensitive per-item state (name, status, server id) the chrome
 // relays - never bytes.
 //
@@ -286,10 +287,10 @@ export function createAttachmentFrame(config, helpers) {
     render();
   }
 
-  // Only the chrome (window.top) may command this frame. This frame is a direct child
-  // of the chrome's own document (R12: the chrome created it in its capture overlay),
-  // so window.top is the chrome; commands must come from it and carry this frame's
-  // session id.
+  // Only the chrome (window.parent) may command this frame. This frame is a direct
+  // child of the chrome's own document (R12: the chrome created it in its capture
+  // overlay), so window.parent is the chrome; commands must come from it and carry
+  // this frame's session id.
   window.addEventListener("message", (event) => {
     if (event.source !== chrome) return;
     const msg = event.data || {};

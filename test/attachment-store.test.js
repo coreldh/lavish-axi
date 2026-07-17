@@ -353,11 +353,13 @@ test("disk cap evicts oldest unreferenced files first and never referenced ones"
     // enforces; all three payloads are the same length so each charges the same.
     const each = (await listAttachments(dir)).find((f) => f.id === oldest.id).chargedBytes;
     // Cap fits ~2 files; the oldest unreferenced one is evicted. TTL off so only
-    // the disk-cap backstop acts.
+    // the disk-cap backstop acts. `now` is advanced past the ready-grace so these
+    // are treated as settled (not just-uploaded) files, which the cap may evict.
     const result = await sweepAttachments(dir, {
       ttlMs: null,
       maxDiskBytes: each * 2 + 1,
       referenced: new Set([`${KEY}/${oldest.id}`]),
+      now: Date.now() + 10 * 60 * 1000,
     });
 
     assert.equal(result.deleted, 1);
@@ -453,6 +455,7 @@ test("a failed expired-orphan delete still counts toward the disk cap (W3)", pos
       const result = await sweepAttachments(dir, {
         ttlMs: 7 * 24 * 60 * 60 * 1000,
         maxDiskBytes: charged.get(stuck.id) + charged.get(fresh.id) - 1,
+        now: Date.now() + 10 * 60 * 1000, // past the ready-grace so the cap may evict
       });
 
       assert.ok(await resolveAttachment(dir, KEY, stuck.id), "the undeletable file is still on disk");
@@ -522,7 +525,7 @@ test("the disk cap evicts tiny files whose real allocation exceeds it (round7-b,
     const cap = 12 * 1024;
     assert.ok(logicalTotal < cap, "logical bytes alone would never trip the cap");
 
-    const result = await sweepAttachments(dir, { ttlMs: null, maxDiskBytes: cap });
+    const result = await sweepAttachments(dir, { ttlMs: null, maxDiskBytes: cap, now: Date.now() + 10 * 60 * 1000 });
     assert.ok(result.deleted > 0, "the cap fires on real allocation, not logical bytes");
 
     // What survives must actually be under the cap by charged cost.
@@ -548,7 +551,7 @@ test("sweepAttachments enforces an object-count bound on unreferenced files (rou
     }
     // Bytes are trivially under any cap; the inode/object dimension is what a
     // magic-prefix flood abuses. Bound the object count directly, oldest-first.
-    const result = await sweepAttachments(dir, { ttlMs: null, maxObjects: 4 });
+    const result = await sweepAttachments(dir, { ttlMs: null, maxObjects: 4, now: Date.now() + 10 * 60 * 1000 });
     assert.equal(result.deleted, 6, "evicts down to the object-count bound");
     const survivors = await listAttachments(dir);
     assert.equal(survivors.length, 4);
@@ -595,7 +598,11 @@ test("the disk cap evicts the exact minimum with running totals, oldest-first (r
     }
     const each = (await listAttachments(dir)).find((f) => f.id === uploads[0].id).chargedBytes;
     // Cap fits exactly 3 files.
-    const result = await sweepAttachments(dir, { ttlMs: null, maxDiskBytes: each * 3 });
+    const result = await sweepAttachments(dir, {
+      ttlMs: null,
+      maxDiskBytes: each * 3,
+      now: Date.now() + 10 * 60 * 1000,
+    });
 
     assert.equal(result.deleted, 5, "evicts exactly down to the cap, no more");
     const survivors = await listAttachments(dir);
@@ -686,6 +693,27 @@ test("removeAttachment removes the sidecar before the image (ATTACH-002)", async
     assert.equal(await fileExists(stored.path + ".meta"), false);
   });
 });
+
+test("a fresh ready-but-unqueued image is not evicted to fit a newer upload (R12 ready-grace)", async () => {
+  await withTempDir(async (dir) => {
+    // Cap fits exactly one image + its sidecar. Upload A (fresh, unreferenced -
+    // ready but not yet queued). Upload B needs room; the ready-grace protects A, so B
+    // is REFUSED (507) instead of evicting A - so A's id is never invalidated out from
+    // under a card the user is about to send.
+    const cap = allocatedFor(uniquePng("a")) + ATTACHMENT_ALLOC_BLOCK_BYTES;
+    const a = await writeAttachment(dir, KEY, uniquePng("a"), { maxDiskBytes: cap, ttlMs: null });
+    await assert.rejects(
+      () => writeAttachment(dir, KEY, uniquePng("b"), { maxDiskBytes: cap, ttlMs: null }),
+      (err) => /** @type {any} */ (err).statusCode === 507,
+      "the newer upload is refused rather than evicting the fresh ready image",
+    );
+    assert.ok(await resolveAttachment(dir, KEY, a.id), "the fresh ready-but-unqueued image survives");
+  });
+});
+
+function allocatedFor(buffer) {
+  return Math.max(1, Math.ceil(buffer.length / ATTACHMENT_ALLOC_BLOCK_BYTES)) * ATTACHMENT_ALLOC_BLOCK_BYTES;
+}
 
 // ---------------------------------------------------------------------------
 // ROUND 10 (root B): ONE admission chokepoint for every byte-adding write path.

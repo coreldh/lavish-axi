@@ -1591,23 +1591,28 @@ test("chrome uploads captured attachment bytes and reports the server id to its 
   );
 });
 
-test("chrome relays only non-sensitive capture state to the artifact card (root A)", async () => {
+test("chrome PROJECTS relayed items to allowed fields - no extra field crosses into the artifact (root-10)", async () => {
   const chrome = await createChromeHarness();
   const af = chrome.openCapturePicker("cardA");
   af.ready();
   const id = "a".repeat(64) + ".png";
+  // The frame's item carries an extra, sensitive-looking field. It must NOT cross into
+  // the artifact realm: the chrome projects each item onto exactly {name, status, id}.
   af.state({
     capRejected: true,
-    height: 210,
-    items: [{ localId: "att-1", name: "shot.png", status: "ready", id, bytes: "SECRET" }],
+    items: [{ localId: "att-1", name: "shot.png", status: "ready", id, bytes: "SECRET", url: "blob:x" }],
   });
   const relayed = chrome.postedToFrame.filter((m) => m.type === "lavish:attachmentState").at(-1);
   assert.ok(relayed, "the chrome relays a state message to the artifact card");
   assert.equal(relayed.state.capRejected, true);
-  assert.equal(relayed.state.height, 210);
-  assert.deepEqual(relayed.state.items, [{ localId: "att-1", name: "shot.png", status: "ready", id, bytes: "SECRET" }]);
-  // The relay carries no upload bytes of its own - only the frame's own item list.
-  assert.equal(JSON.stringify(relayed).includes("lavish-attachment:upload"), false);
+  assert.equal(relayed.state.items.length, 1);
+  // Exactly the three allowed fields cross - nothing else.
+  assert.deepEqual(Object.keys(relayed.state.items[0]).sort(), ["id", "name", "status"]);
+  assert.equal(relayed.state.items[0].name, "shot.png");
+  assert.equal(relayed.state.items[0].status, "ready");
+  assert.equal(relayed.state.items[0].id, id);
+  assert.equal(JSON.stringify(relayed).includes("SECRET"), false, "no extra field reaches the artifact realm");
+  assert.equal(JSON.stringify(relayed).includes("blob:"), false);
 });
 
 test("the chrome stamps the picker's OWN card nonce on the relay, not a frame-supplied one (R11/R12)", async () => {

@@ -62,6 +62,13 @@ const TEMP_FILE_RE = /\.\d+\.\d+\.tmp$/;
 // Only reap a temp older than this: a live atomic write renames within milliseconds,
 // so anything this stale can only be crash debris - never an in-progress write.
 const ATTACHMENT_TEMP_GRACE_MS = 5 * 60 * 1000; // 5 minutes
+// A just-uploaded image is "ready but unqueued" until the user sends the annotation
+// that references it. The disk-cap/object eviction must NOT evict such a fresh file to
+// make room for a newer upload, or the first upload's id vanishes and sending its card
+// later fails `not-found`. Within this grace the eviction skips it, so a newer upload
+// that cannot fit is REFUSED (507) instead - committed storage still never exceeds the
+// cap, but a pending attachment is never invalidated out from under the user.
+const ATTACHMENT_READY_GRACE_MS = 5 * 60 * 1000; // 5 minutes
 // A dims sidecar is `<id>.meta`; capture the image id so an orphan sidecar (image
 // gone) can be reaped. A live upload always writes the image BEFORE its sidecar, so a
 // sidecar-without-image is unambiguous crash/failed-delete debris - no grace needed
@@ -596,7 +603,9 @@ export async function sweepAttachments(stateDir, options = {}) {
   // the running totals; each removal decrements them exactly once.
   const evictOldestUnreferenced = async (overBudget) => {
     const evictable = survivors
-      .filter((file) => !file.evicted && !file.referenced)
+      // A fresh (within-grace) unreferenced file is a ready-but-unqueued upload the user
+      // just made; never evict it to fit a newer one (the newer one is refused instead).
+      .filter((file) => !file.evicted && !file.referenced && now - file.mtimeMs >= ATTACHMENT_READY_GRACE_MS)
       .sort((a, b) => a.mtimeMs - b.mtimeMs);
     for (const file of evictable) {
       if (!overBudget()) break;
