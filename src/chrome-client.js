@@ -1264,15 +1264,18 @@ async function submitQueued(submission) {
   }
 
   submitQueuedPromise = (async () => {
-    try {
-      while (pendingSubmissions.length && !ended) {
-        const next = pendingSubmissions.shift();
-        if (next) await submitQueuedOnce(next);
+    /** @type {unknown} */
+    let firstError = null;
+    while (pendingSubmissions.length && !ended) {
+      const next = pendingSubmissions.shift();
+      if (!next) continue;
+      try {
+        await submitQueuedOnce(next, firstError !== null);
+      } catch (error) {
+        if (firstError === null) firstError = error;
       }
-    } catch (error) {
-      pendingSubmissions.splice(0, pendingSubmissions.length);
-      throw error;
     }
+    if (firstError !== null) throw firstError;
   })();
   try {
     return await submitQueuedPromise;
@@ -1281,7 +1284,7 @@ async function submitQueued(submission) {
   }
 }
 
-async function submitQueuedOnce(submission) {
+async function submitQueuedOnce(submission, preserveFailureState = false) {
   const prompts = submission.prompts.filter((prompt) => !deliveredPrompts.has(prompt));
   const shouldEndSession = submission.endAfter;
   if (!prompts.length) {
@@ -1340,9 +1343,11 @@ async function submitQueuedOnce(submission) {
   }
   persistQueuedPrompts();
   render();
-  clearSendAcknowledgementWarning();
-  hideSendHint(true);
-  if (queued.length) armSendAcknowledgementWarning();
+  if (!preserveFailureState) {
+    clearSendAcknowledgementWarning();
+    hideSendHint(true);
+    if (queued.length) armSendAcknowledgementWarning();
+  }
   if (shouldEndSession) {
     markSessionEnded();
     return;

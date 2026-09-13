@@ -840,6 +840,64 @@ test("a Send started after another snapshot wins remains live while that POST is
   );
 });
 
+test("a failed in-flight POST preserves and runs a completed later Send & End", async () => {
+  const posts = [];
+  let rejectFirstPost = () => {};
+  const firstPost = new Promise((_, reject) => {
+    rejectFirstPost = () => reject(new Error("network unavailable"));
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      if (posts.length === 1) await firstPost;
+      return { ok: true };
+    },
+  });
+
+  chrome.element("chatInput").value = "First batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("uid=1 first");
+  await flushPromises();
+  assert.equal(posts.length, 1);
+
+  chrome.element("chatInput").value = "Final batch";
+  chrome.element("sendAndEnd").click();
+  const finalRequest = chrome.postedToFrame.at(-1);
+  chrome.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "uid=2 final",
+    snapshot_request_id: finalRequest.snapshot_request_id,
+  });
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Unsent later work", selector: "h2", tag: "annotation", text: "Later" },
+  });
+
+  rejectFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.deepEqual(
+    posts[1].body.prompts.map((prompt) => prompt.prompt),
+    ["First batch", "Final batch"],
+  );
+  assert.equal(posts[1].body.domSnapshot, "uid=2 final");
+  assert.equal(posts[1].body.endSession, true);
+  assert.equal(
+    posts.flatMap((post) => post.body.prompts).filter((prompt) => prompt.prompt === "Final batch").length,
+    1,
+  );
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Unsent later work"],
+  );
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not send/i);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+});
+
 test("Send & End falls back without a snapshot and preserves the atomic end intent", async () => {
   const posts = [];
   const chrome = await createChromeHarness({
