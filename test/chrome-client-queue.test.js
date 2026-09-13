@@ -1009,6 +1009,43 @@ test("Send & End reserves its terminal batch and only retries that batch after f
   assert.equal(reloaded.element("sendAndEnd").disabled, true);
 });
 
+test("a recoverable terminal layout conflict restores ordinary review controls", async () => {
+  const prompt = {
+    uid: "",
+    prompt: "Fix the stale layout issue",
+    selector: "",
+    tag: "layout-warnings",
+    text: "Layout issue: 1 selected",
+    target: { type: "layout-warnings", artifact_revision: 1, warnings: [{ id: "w1" }] },
+  };
+  const chrome = await createChromeHarness({
+    storedQueue: [prompt],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) {
+        return {
+          ok: false,
+          status: 409,
+          json: async () => ({ warnings: [warningPayload({ status: "recurring", status_label: "Still present" })] }),
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.element("sendAndEnd").click();
+  chrome.sendSnapshot("");
+  await flushPromises();
+
+  assert.deepEqual(chrome.queued(), [prompt]);
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.equal(chrome.element("annotation").disabled, false);
+  assert.equal(chrome.element("chatInput").disabled, false);
+  assert.equal(chrome.element("end").disabled, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /layout issue selection changed/i);
+});
+
 test("a failed timeout fallback keeps the queue and a timely retry sends it once", async () => {
   let promptPostAttempts = 0;
   const chrome = await createChromeHarness({
@@ -2346,6 +2383,55 @@ test("queueing a selected subset produces exactly one ordinary prompt with only 
   assert.equal(chrome.warningRows()[0].children[1].children.at(-1).children.at(-1).disabled, true);
   assert.equal(chrome.warningRows()[0].children[1].children[2].children[1].textContent, "Queued for send");
   assert.equal(chrome.element("warningsSelected").textContent, "None selected");
+});
+
+test("Send & End waits for layout feedback preparation already in flight", async () => {
+  const posts = [];
+  let finishPreparation = () => {};
+  const preparation = new Promise((resolve) => {
+    finishPreparation = () =>
+      resolve({
+        ok: true,
+        json: async () => ({
+          warnings: [],
+          prompt: {
+            prompt: "Fix the selected layout issue",
+            text: "Layout issue: 1 selected",
+            target: { type: "layout-warnings", artifact_revision: 1, warnings: [{ id: "w1" }] },
+          },
+        }),
+      });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      if (String(url).endsWith("/layout-warnings/queue")) return preparation;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+
+  chrome.element("warningsQueueButton").click();
+  chrome.element("sendAndEnd").click();
+
+  assert.equal(chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"), false);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+
+  finishPreparation();
+  await flushPromises();
+  await flushPromises();
+  chrome.sendSnapshot("layout snapshot");
+  await flushPromises();
+
+  const promptPost = posts.find((post) => String(post.url).endsWith("/prompts"));
+  assert.equal(promptPost.body.endSession, true);
+  assert.equal(promptPost.body.prompts.length, 1);
+  assert.equal(promptPost.body.prompts[0].tag, "layout-warnings");
 });
 
 test("a stale queued layout prompt remains available for user re-decision", async () => {
@@ -4917,6 +5003,60 @@ async function initializeInlineWhiteboard(chrome, token = "inline-channel") {
   await flushPromises();
   return whiteboard;
 }
+
+test("Send & End waits for whiteboard feedback preparation already in flight", async () => {
+  const posts = [];
+  let finishSceneSave = () => {};
+  const sceneSave = new Promise((resolve) => {
+    finishSceneSave = () => resolve({ ok: true, json: async () => ({}) });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      if (String(url).includes("/whiteboard-channel") || String(url).includes("/mermaid-sources")) {
+        return whiteboardFetch(url);
+      }
+      if (String(url).endsWith("/whiteboard/0") && init.method === "PUT") return sceneSave;
+      if (String(url).endsWith("/whiteboard/0/feedback-files")) {
+        return {
+          ok: true,
+          json: async () => ({ scene_path: "/tmp/review.excalidraw", preview_path: "/tmp/review.png" }),
+        };
+      }
+      return { ok: true, json: async () => ({ whiteboard: null }) };
+    },
+  });
+  const whiteboard = await initializeInlineWhiteboard(chrome);
+
+  chrome.sendInlineWhiteboardMessage(whiteboard, {
+    type: "lavish-whiteboard:queueFeedback",
+    diagramIndex: 0,
+    channelId: "inline-channel",
+    note: "Keep this edit",
+    summaryLines: ["Moved node A"],
+    sourceHash: "hash",
+    scene: { elements: [], appState: {}, files: {} },
+    pngDataUrl: "data:image/png;base64,AA==",
+  });
+  await flushPromises();
+  chrome.element("sendAndEnd").click();
+
+  assert.equal(chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"), false);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+
+  finishSceneSave();
+  await flushPromises();
+  await flushPromises();
+  chrome.sendSnapshot("whiteboard snapshot");
+  await flushPromises();
+
+  const promptPost = posts.find((post) => String(post.url).endsWith("/prompts"));
+  assert.equal(promptPost.body.endSession, true);
+  assert.equal(promptPost.body.prompts.length, 1);
+  assert.equal(promptPost.body.prompts[0].tag, "whiteboard");
+  assert.equal(whiteboard.posted.at(-1).type, "lavish-whiteboard:queueResult");
+  assert.equal(whiteboard.posted.at(-1).ok, true);
+});
 
 test("artifact relays cannot invoke whiteboard persistence", async () => {
   const calls = [];

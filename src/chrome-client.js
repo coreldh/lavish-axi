@@ -211,17 +211,21 @@ let layoutGateTimer;
 let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionData.initialLayoutWarnings : [];
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
-/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: { prompts: any[], inFlight: boolean } | null, timeout?: ReturnType<typeof setTimeout> }>} */
+/** @typedef {{ done: Promise<boolean>, finish: (succeeded: boolean) => void }} FeedbackPreparation */
+/** @typedef {{ prompts: any[], inFlight: boolean, annotationWasEnabled?: boolean }} TerminalSubmission */
+/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, timeout?: ReturnType<typeof setTimeout> }>} */
 const snapshotRequests = new Map();
 let nextSnapshotRequestId = 0;
 let workingBubble = null;
 let submitQueuedPromise = null;
 const pendingSubmissions = [];
 const deliveredPrompts = new WeakSet();
-/** @type {{ prompts: any[], inFlight: boolean } | null} */
+/** @type {Set<FeedbackPreparation>} */
+const feedbackPreparations = new Set();
+/** @type {TerminalSubmission | null} */
 let terminalSubmission =
   loadJsonState(terminalStorageKey, false) === true && queued.length
-    ? { prompts: queued.slice(), inFlight: false }
+    ? { prompts: queued.slice(), inFlight: false, annotationWasEnabled: true }
     : null;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
@@ -977,10 +981,28 @@ function promptQueueKey(prompt) {
   return prompt && typeof prompt[internalQueueKeyField] === "string" ? prompt[internalQueueKeyField].trim() : "";
 }
 
-function enqueuePrompt(rawPrompt) {
-  if (terminalSubmission) return;
+function beginFeedbackPreparation() {
+  if (ended || terminalSubmission) return null;
+  /** @type {(succeeded: boolean) => void} */
+  let finishPromise = () => {};
+  const done = new Promise((resolve) => {
+    finishPromise = resolve;
+  });
+  const preparation = {
+    done,
+    finish(succeeded) {
+      if (!feedbackPreparations.delete(preparation)) return;
+      finishPromise(succeeded);
+    },
+  };
+  feedbackPreparations.add(preparation);
+  return preparation;
+}
+
+function enqueuePrompt(rawPrompt, /** @type {FeedbackPreparation | null} */ preparation = null) {
+  if (terminalSubmission && (!preparation || !feedbackPreparations.has(preparation))) return false;
   const prompt = sanitizeQueuedPrompt(rawPrompt);
-  if (!prompt) return;
+  if (!prompt) return false;
 
   const queueKey = promptQueueKey(prompt);
   if (queueKey) {
@@ -996,6 +1018,7 @@ function enqueuePrompt(rawPrompt) {
 
   persistQueuedPrompts();
   render();
+  return true;
 }
 
 function stripInternalPromptFields(prompt) {
@@ -1273,24 +1296,56 @@ function sendQueued(endAfter) {
       chatAttachmentController.reset();
     }
   }
-  if (!queued.length) {
+  const shouldEnd = Boolean(endAfter && !chipsBlocked);
+  const preparations = shouldEnd ? [...feedbackPreparations] : [];
+  if (!queued.length && preparations.length === 0) {
     if (!chipsBlocked) showSendHint();
     return;
   }
   hideSendHint(true);
-  armSendAcknowledgementWarning();
-
-  const prompts = queued.slice();
-  const shouldEnd = Boolean(endAfter && !chipsBlocked);
   if (shouldEnd) {
-    terminalSubmission = { prompts, inFlight: true };
+    const terminal = {
+      prompts: [],
+      inFlight: true,
+      annotationWasEnabled: annotation,
+    };
+    terminalSubmission = terminal;
     persistTerminalReservation(true);
     annotation = false;
     annotationSwitch.setAttribute("aria-pressed", "false");
     postToFrame({ type: "lavish:setAnnotationMode", enabled: false });
     updateSendState();
+    finishTerminalPreparation(terminal, preparations);
+    return;
   }
-  requestSnapshot("submit", prompts, shouldEnd, terminalSubmission);
+  armSendAcknowledgementWarning();
+  requestSnapshot("submit", queued.slice(), false, null);
+}
+
+function finishTerminalPreparation(terminal, preparations) {
+  if (preparations.length === 0) {
+    completeTerminalPreparation(terminal, []);
+    return;
+  }
+  Promise.all(preparations.map((preparation) => preparation.done)).then((results) => {
+    completeTerminalPreparation(terminal, results);
+  });
+}
+
+function completeTerminalPreparation(terminal, results) {
+  if (terminalSubmission !== terminal || ended) return;
+  if (results.some((succeeded) => !succeeded)) {
+    releaseTerminalSubmission(terminal);
+    return;
+  }
+  terminal.prompts = queued.slice();
+  if (!terminal.prompts.length) {
+    releaseTerminalSubmission(terminal);
+    showSendHint();
+    return;
+  }
+  armSendAcknowledgementWarning();
+  requestSnapshot("submit", terminal.prompts, true, terminal);
 }
 
 function retryTerminalSubmission() {
@@ -1304,6 +1359,18 @@ function markTerminalSubmissionFailed(submission) {
   if (!terminalSubmission || submission.terminal !== terminalSubmission || ended) return;
   terminalSubmission.inFlight = false;
   updateSendState();
+}
+
+function releaseTerminalSubmission(terminal) {
+  if (terminalSubmission !== terminal || ended) return;
+  terminalSubmission = null;
+  persistTerminalReservation(false);
+  if (terminal.annotationWasEnabled) {
+    annotation = true;
+    annotationSwitch.setAttribute("aria-pressed", "true");
+    postToFrame({ type: "lavish:setAnnotationMode", enabled: true });
+  }
+  render();
 }
 
 async function submitQueued(submission) {
@@ -1370,7 +1437,8 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       showQueuedSendFailure(
         "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
       );
-      return false;
+      if (submission.terminal) releaseTerminalSubmission(submission.terminal);
+      return;
     }
     // C4: the server persisted nothing (atomic reject) - the queue below is left
     // intact because the splice only runs on success. Surface exactly what failed
@@ -1900,10 +1968,15 @@ async function dismissWarning(id) {
 // One queued batch = one ordinary queued prompt. The CLI cannot tell it apart from any other
 // feedback, which is exactly the point: no parallel agent protocol.
 async function queueSelectedWarningFixes() {
-  if (ended || terminalSubmission) return;
+  const preparation = beginFeedbackPreparation();
+  if (!preparation) return;
   const ids = [...selectedWarningIds];
-  if (ids.length === 0) return;
+  if (ids.length === 0) {
+    preparation.finish(true);
+    return;
+  }
   warningsQueueButton.disabled = true;
+  let succeeded = false;
   try {
     const response = await fetch("/api/" + key + "/layout-warnings/queue", {
       method: "POST",
@@ -1913,21 +1986,25 @@ async function queueSelectedWarningFixes() {
     if (!response.ok) throw new Error("failed to queue layout warning fixes");
     const data = await response.json();
     if (data.prompt) {
-      enqueuePrompt({
+      if (!enqueuePrompt({
         uid: "",
         prompt: data.prompt.prompt,
         selector: "",
         tag: "layout-warnings",
         text: data.prompt.text,
         target: data.prompt.target,
-      });
+      }, preparation)) throw new Error("failed to retain layout warning fixes");
     }
     selectedWarningIds.clear();
     persistWarningSelection();
     if (Array.isArray(data.warnings)) setLayoutWarnings(data.warnings);
     closeWarningsDrawer({ restoreFocus: true });
+    succeeded = true;
   } catch {
+    showQueuedSendFailure("Could not queue the selected layout fixes. Review the current issues and try again.");
     updateWarningSelectionState();
+  } finally {
+    preparation.finish(succeeded);
   }
 }
 
@@ -2706,7 +2783,17 @@ function whiteboardSummaryText(summaryLines) {
 }
 
 async function queueWhiteboardFeedback(index, message, mode) {
+  const preparation = beginFeedbackPreparation();
+  if (!preparation) {
+    postToWhiteboard(index, mode, {
+      type: "lavish-whiteboard:queueResult",
+      ok: false,
+      error: "Feedback delivery is already ending this review.",
+    });
+    return;
+  }
   const diagramId = whiteboardRecord(index).diagramId;
+  let succeeded = false;
   try {
     // Persist the exact reviewed state before queueing, so the paths in the
     // prompt point at what the user actually saw.
@@ -2730,7 +2817,7 @@ async function queueWhiteboardFeedback(index, message, mode) {
       "\n\nEdited scene JSON: " +
       String(files.scene_path || "") +
       (files.preview_path ? "\nPNG preview: " + String(files.preview_path) : "");
-    enqueuePrompt({
+    if (!enqueuePrompt({
       uid: "",
       prompt: promptText,
       selector: "",
@@ -2749,17 +2836,20 @@ async function queueWhiteboardFeedback(index, message, mode) {
       // Re-queueing the same diagram's whiteboard before sending replaces the
       // earlier unsent prompt instead of stacking duplicates.
       [internalQueueKeyField]: "whiteboard:" + index,
-    });
+    }, preparation)) throw new Error("failed to retain whiteboard feedback");
     // Queued from the whiteboard inside the artifact, like any other in-artifact prompt.
     pulseSheetDock();
     postToWhiteboard(index, mode, { type: "lavish-whiteboard:queueResult", ok: true });
     if (mode === "overlay") closeWhiteboard();
+    succeeded = true;
   } catch (error) {
     postToWhiteboard(index, mode, {
       type: "lavish-whiteboard:queueResult",
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    preparation.finish(succeeded);
   }
 }
 
