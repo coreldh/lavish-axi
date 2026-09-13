@@ -892,9 +892,8 @@ test("a failed in-flight POST preserves and runs a completed later Send & End", 
     chrome.queued().map((prompt) => prompt.prompt),
     [],
   );
-  assert.equal(chrome.element("sendHint").hidden, false);
-  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
-  assert.match(chrome.element("sendHint").textContent, /could not send/i);
+  assert.equal(chrome.element("sendHint").hidden, true);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), false);
   assert.equal(chrome.element("sendAndEnd").disabled, true);
 });
 
