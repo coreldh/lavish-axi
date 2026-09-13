@@ -293,7 +293,8 @@ let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
 let sendHintPersistent = false;
-let sendFailureGeneration = 0;
+/** @type {{ kind: "preparation" | "submission" | "terminal", operation: object } | null} */
+let sendFailureOwner = null;
 let sendAcknowledgementWarningVisible = false;
 
 function artifactFrameSrcForLoad(load) {
@@ -567,15 +568,20 @@ function clearSendAcknowledgementWarning() {
   sendAcknowledgementWarningVisible = false;
 }
 
-function showQueuedSendFailure(message = SEND_FAILED_COPY) {
-  showPersistentSendFailure(message, true);
+function showQueuedSendFailure(message = SEND_FAILED_COPY, owner = null) {
+  showPersistentSendFailure(message, true, owner);
 }
 
-function showPersistentSendFailure(message, requireQueuedFeedback = false) {
+function showPersistentSendFailure(message, requireQueuedFeedback = false, owner = null) {
   clearSendAcknowledgementWarning();
   if (requireQueuedFeedback && !queued.length) return;
-  sendFailureGeneration += 1;
+  sendFailureOwner = owner;
   showSendHint(message, null, false);
+}
+
+function clearPersistentSendFailure() {
+  sendFailureOwner = null;
+  hideSendHint(true);
 }
 
 function setMenuOpen(button, menu, open) {
@@ -989,7 +995,7 @@ function removeQueuedPrompt(index, event) {
   persistQueuedPrompts();
   if (!queued.length) {
     clearSendAcknowledgementWarning();
-    hideSendHint(true);
+    clearPersistentSendFailure();
   }
   render();
 }
@@ -1323,7 +1329,7 @@ function sendQueued(endAfter) {
     if (!chipsBlocked) showSendHint();
     return;
   }
-  hideSendHint(true);
+  if (!sendFailureOwner) hideSendHint(true);
   if (shouldEnd) {
     const terminal = {
       prompts: [],
@@ -1352,6 +1358,8 @@ function finishTerminalPreparation(terminal, preparations) {
     for (const preparation of preparations) preparation.finish(false);
     showPersistentSendFailure(
       "Could not finish preparing all feedback within 5 seconds. This review remains open, and existing queued feedback is still editable.",
+      false,
+      { kind: "preparation", operation: terminal },
     );
     releaseTerminalSubmission(terminal);
   }, TERMINAL_PREPARATION_TIMEOUT_MS);
@@ -1433,7 +1441,6 @@ async function submitQueued(submission) {
 }
 
 async function submitQueuedOnce(submission, preserveFailureState = false) {
-  const failureGenerationAtStart = sendFailureGeneration;
   const prompts = submission.prompts.filter((prompt) => !deliveredPrompts.has(prompt));
   const shouldEndSession = submission.endAfter;
   if (!prompts.length) {
@@ -1441,11 +1448,14 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       try {
         await endSession(submission.terminal);
       } catch (error) {
-        showPersistentSendFailure(TERMINAL_SEND_FAILED_COPY);
+        showPersistentSendFailure(TERMINAL_SEND_FAILED_COPY, false, {
+          kind: "terminal",
+          operation: submission.terminal,
+        });
         throw error;
       }
     }
-    settleAcknowledgementGuidance(submission, failureGenerationAtStart, preserveFailureState);
+    settleAcknowledgementGuidance(submission, preserveFailureState);
     return;
   }
   const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: submission.domSnapshot };
@@ -1458,7 +1468,10 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       body: JSON.stringify(body),
     });
   } catch (error) {
-    showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY);
+    showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY, {
+      kind: submission.terminal ? "terminal" : "submission",
+      operation: submission.terminal || submission,
+    });
     throw error;
   }
   if (!response.ok) {
@@ -1475,6 +1488,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
       showQueuedSendFailure(
         "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
+        { kind: "submission", operation: submission },
       );
       if (submission.terminal) releaseTerminalSubmission(submission.terminal);
       return;
@@ -1485,13 +1499,22 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
     if (response.status === 400) {
       const detail = await response.json().catch(() => ({}));
       if (Array.isArray(detail.rejected) && detail.rejected.length) {
-        showQueuedSendFailure(describeAttachmentRejection(detail.rejected, detail.caps));
+        showQueuedSendFailure(describeAttachmentRejection(detail.rejected, detail.caps), {
+          kind: "submission",
+          operation: submission,
+        });
         if (submission.terminal) releaseTerminalSubmission(submission.terminal);
       } else {
-        showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY);
+        showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY, {
+          kind: submission.terminal ? "terminal" : "submission",
+          operation: submission.terminal || submission,
+        });
       }
     } else {
-      showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY);
+      showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY, {
+        kind: submission.terminal ? "terminal" : "submission",
+        operation: submission.terminal || submission,
+      });
     }
     throw new Error("failed to submit queued prompts");
   }
@@ -1502,15 +1525,26 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   }
   persistQueuedPrompts();
   render();
-  settleAcknowledgementGuidance(submission, failureGenerationAtStart, preserveFailureState);
+  settleAcknowledgementGuidance(submission, preserveFailureState);
   if (shouldEndSession) {
     markSessionEnded();
     return;
   }
 }
 
-function settleAcknowledgementGuidance(submission, failureGenerationAtStart, preserveFailureState) {
-  if (sendFailureGeneration !== failureGenerationAtStart || (preserveFailureState && queued.length)) return;
+function submissionResolvesSendFailure(submission) {
+  if (!sendFailureOwner) return true;
+  if (sendFailureOwner.kind === "preparation") return false;
+  if (sendFailureOwner.kind === "terminal") return sendFailureOwner.operation === submission.terminal;
+  const failedSubmission = sendFailureOwner.operation;
+  return (
+    failedSubmission === submission ||
+    (Array.isArray(failedSubmission.prompts) && failedSubmission.prompts.every((prompt) => deliveredPrompts.has(prompt)))
+  );
+}
+
+function settleAcknowledgementGuidance(submission, preserveFailureState) {
+  if (!submissionResolvesSendFailure(submission) || (preserveFailureState && queued.length)) return;
   const hasLaterAcknowledgement = [...pendingAcknowledgements].some(
     (acknowledgement) => acknowledgement !== submission.acknowledgement,
   );
@@ -1519,7 +1553,7 @@ function settleAcknowledgementGuidance(submission, failureGenerationAtStart, pre
     return;
   }
   clearSendAcknowledgementWarning();
-  hideSendHint(true);
+  clearPersistentSendFailure();
 }
 
 function normalizeLayoutFindings(value) {
@@ -2050,7 +2084,11 @@ async function queueSelectedWarningFixes() {
     closeWarningsDrawer({ restoreFocus: true });
     succeeded = true;
   } catch {
-    showPersistentSendFailure("Could not prepare the selected layout fixes. Review the current issues and try again.");
+    showPersistentSendFailure(
+      "Could not prepare the selected layout fixes. Review the current issues and try again.",
+      false,
+      { kind: "preparation", operation: preparation },
+    );
     updateWarningSelectionState();
   } finally {
     preparation.finish(succeeded);

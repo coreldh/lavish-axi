@@ -2753,6 +2753,42 @@ test("a failed terminal layout preparation stays visible with an empty queue", a
   assert.equal(chrome.element("end").disabled, false);
 });
 
+test("an unrelated successful send preserves layout preparation failure guidance", async () => {
+  let failPreparation = () => {};
+  const preparation = new Promise((_, reject) => {
+    failPreparation = () => reject(new Error("preparation unavailable"));
+  });
+  const chrome = await createChromeHarness({
+    storedQueue: [{ uid: "", prompt: "Queued separately", selector: "h1", tag: "element", text: "Heading" }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/layout-warnings/queue")) return preparation;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+
+  chrome.element("warningsQueueButton").click();
+  failPreparation();
+  await flushPromises();
+  await flushPromises();
+
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+  chrome.element("send").click();
+  chrome.sendSnapshot("");
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+});
+
 test("Send & End releases after a five-second feedback preparation timeout", async () => {
   let finishPreparation = () => {};
   const preparation = new Promise((resolve) => {
