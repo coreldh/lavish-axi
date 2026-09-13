@@ -840,6 +840,53 @@ test("a Send started after another snapshot wins remains live while that POST is
   );
 });
 
+test("an older success preserves stall guidance for a later pending send", async () => {
+  const posts = [];
+  let releaseFirstPost = () => {};
+  const firstPost = new Promise((resolve) => {
+    releaseFirstPost = () => resolve({ ok: true });
+  });
+  let releaseSecondPost = () => {};
+  const secondPost = new Promise((resolve) => {
+    releaseSecondPost = () => resolve({ ok: true });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return posts.length === 1 ? firstPost : secondPost;
+    },
+  });
+
+  chrome.element("chatInput").value = "First batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("first snapshot");
+  await flushPromises();
+
+  chrome.element("chatInput").value = "Second batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("second snapshot");
+  chrome.runTimers(10_000);
+
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.match(chrome.element("sendHint").textContent, /still trying to send/i);
+
+  releaseFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /still trying to send/i);
+
+  releaseSecondPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, true);
+});
+
 test("a failed in-flight POST preserves and runs a completed later Send & End", async () => {
   const posts = [];
   let rejectFirstPost = () => {};

@@ -213,13 +213,14 @@ const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, [])
 let warningsDrawerOpen = false;
 /** @typedef {{ done: Promise<boolean>, finish: (succeeded: boolean) => void }} FeedbackPreparation */
 /** @typedef {{ prompts: any[], inFlight: boolean, annotationWasEnabled?: boolean }} TerminalSubmission */
-/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, timeout?: ReturnType<typeof setTimeout> }>} */
+/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, acknowledgement?: object, timeout?: ReturnType<typeof setTimeout> }>} */
 const snapshotRequests = new Map();
 let nextSnapshotRequestId = 0;
 let workingBubble = null;
 let submitQueuedPromise = null;
 const pendingSubmissions = [];
 const deliveredPrompts = new WeakSet();
+const pendingAcknowledgements = new Set();
 /** @type {Set<FeedbackPreparation>} */
 const feedbackPreparations = new Set();
 /** @type {TerminalSubmission | null} */
@@ -293,6 +294,7 @@ let copyHintTimer;
 let sendHintTimer;
 let sendHintPersistent = false;
 let sendFailureGeneration = 0;
+let sendAcknowledgementWarningVisible = false;
 
 function artifactFrameSrcForLoad(load) {
   const separator = artifactSrc.includes("?") ? "&" : "?";
@@ -545,19 +547,24 @@ function hideSendHint(force = false) {
   sendHint.textContent = DEFAULT_SEND_HINT;
   sendHint.classList.remove("persistent");
   sendHintPersistent = false;
+  sendAcknowledgementWarningVisible = false;
 }
 
 function armSendAcknowledgementWarning() {
-  if (sendAcknowledgementTimer || !queued.length) return;
+  if (sendAcknowledgementTimer || pendingAcknowledgements.size === 0) return;
   sendAcknowledgementTimer = setTimeout(() => {
     sendAcknowledgementTimer = undefined;
-    if (queued.length) showSendHint(SEND_STALLED_COPY, null, false);
+    if (pendingAcknowledgements.size > 0) {
+      sendAcknowledgementWarningVisible = true;
+      showSendHint(SEND_STALLED_COPY, null, false);
+    }
   }, SEND_ACKNOWLEDGEMENT_WARNING_MS);
 }
 
 function clearSendAcknowledgementWarning() {
   clearTimeout(sendAcknowledgementTimer);
   sendAcknowledgementTimer = undefined;
+  sendAcknowledgementWarningVisible = false;
 }
 
 function showQueuedSendFailure(message = SEND_FAILED_COPY) {
@@ -1047,6 +1054,9 @@ function requestSnapshot(action, prompts = [], endAfter = false, terminal = null
   const request = action === "submit" ? { action, prompts, endAfter, terminal } : { action };
   snapshotRequests.set(requestId, request);
   if (action === "submit") {
+    request.acknowledgement = {};
+    pendingAcknowledgements.add(request.acknowledgement);
+    armSendAcknowledgementWarning();
     request.timeout = setTimeout(() => completeSnapshotRequest(requestId, ""), SNAPSHOT_REQUEST_TIMEOUT_MS);
   }
   postToFrame({ type: "lavish:requestSnapshot", snapshot_request_id: requestId });
@@ -1073,6 +1083,7 @@ function completeSnapshotRequest(requestId, snapshot) {
     domSnapshot: snapshot || "",
     endAfter: request.endAfter === true,
     terminal: request.terminal || null,
+    acknowledgement: request.acknowledgement || null,
   }).catch(() => {});
 }
 
@@ -1328,7 +1339,6 @@ function sendQueued(endAfter) {
     finishTerminalPreparation(terminal, preparations);
     return;
   }
-  armSendAcknowledgementWarning();
   requestSnapshot("submit", queued.slice(), false, null);
 }
 
@@ -1363,7 +1373,6 @@ function completeTerminalPreparation(terminal, results) {
     showSendHint();
     return;
   }
-  armSendAcknowledgementWarning();
   requestSnapshot("submit", terminal.prompts, true, terminal);
 }
 
@@ -1410,6 +1419,8 @@ async function submitQueued(submission) {
       } catch (error) {
         markTerminalSubmissionFailed(next);
         if (firstError === null) firstError = error;
+      } finally {
+        if (next.acknowledgement) pendingAcknowledgements.delete(next.acknowledgement);
       }
     }
     if (firstError !== null) throw firstError;
@@ -1484,9 +1495,15 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   persistQueuedPrompts();
   render();
   if (sendFailureGeneration === failureGenerationAtStart && (!preserveFailureState || !queued.length)) {
-    clearSendAcknowledgementWarning();
-    hideSendHint(true);
-    if (queued.length) armSendAcknowledgementWarning();
+    const hasLaterAcknowledgement = [...pendingAcknowledgements].some(
+      (acknowledgement) => acknowledgement !== submission.acknowledgement,
+    );
+    if (hasLaterAcknowledgement) {
+      if (!sendAcknowledgementTimer && !sendAcknowledgementWarningVisible) armSendAcknowledgementWarning();
+    } else {
+      clearSendAcknowledgementWarning();
+      hideSendHint(true);
+    }
   }
   if (shouldEndSession) {
     markSessionEnded();
@@ -2050,6 +2067,8 @@ async function endSession(terminal = null) {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  pendingAcknowledgements.clear();
+  clearSendAcknowledgementWarning();
   terminalSubmission = null;
   persistTerminalReservation(false);
   cancelArtifactLoadRecovery();
