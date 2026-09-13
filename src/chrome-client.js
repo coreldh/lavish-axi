@@ -211,7 +211,9 @@ let layoutGateTimer;
 let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionData.initialLayoutWarnings : [];
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
-const snapshotRequests = [];
+/** @type {Map<string, { action: "copy" | "submit", timeout?: ReturnType<typeof setTimeout> }>} */
+const snapshotRequests = new Map();
+let nextSnapshotRequestId = 0;
 let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
@@ -249,6 +251,10 @@ const HEALTH_PROBE_TIMEOUT_MS = 4000;
 // batch. Bound that whole wait so a missing SDK response or a browser/network stall can never look
 // like a dead button while the user's queue remains safely stored in this tab.
 const SEND_ACKNOWLEDGEMENT_WARNING_MS = 10_000;
+// A DOM snapshot adds useful context, but the reviewer's own words are the payload.
+// If the artifact frame navigated away from the injected SDK (or otherwise stopped
+// answering), deliver those words without a snapshot instead of waiting forever.
+const SNAPSHOT_REQUEST_TIMEOUT_MS = 1500;
 const SEND_STALLED_COPY =
   "Still trying to send. Your feedback is saved in this tab. Keep this tab open while Lavish catches up, and check that the server is running.";
 const SEND_FAILED_COPY =
@@ -984,8 +990,46 @@ function postToFrame(message) {
 }
 
 function requestSnapshot(action) {
-  snapshotRequests.push(action);
-  postToFrame({ type: "lavish:requestSnapshot" });
+  const requestId = "snapshot-" + ++nextSnapshotRequestId;
+  const request = { action };
+  snapshotRequests.set(requestId, request);
+  if (action === "submit") {
+    request.timeout = setTimeout(() => completeSnapshotRequest(requestId, ""), SNAPSHOT_REQUEST_TIMEOUT_MS);
+  }
+  postToFrame({ type: "lavish:requestSnapshot", snapshot_request_id: requestId });
+}
+
+function takeSnapshotRequest(requestId) {
+  if (typeof requestId !== "string" || !requestId || !snapshotRequests.has(requestId)) return null;
+  const request = snapshotRequests.get(requestId);
+  snapshotRequests.delete(requestId);
+  if (request?.timeout) clearTimeout(request.timeout);
+  return request || null;
+}
+
+function completeSnapshotRequest(requestId, snapshot) {
+  const request = takeSnapshotRequest(requestId);
+  if (!request) return;
+  if (request.action === "copy") {
+    copyText(snapshot || "");
+    return;
+  }
+
+  // This response or timeout submits everything the user had queued up to this
+  // point, so older concurrent submit requests no longer own a batch. Retiring
+  // them now prevents a late response from sending newer, not-yet-sent work.
+  // A Send started after this synchronous pass receives a new request and stays
+  // live; Copy requests are independent and remain pending.
+  for (const [pendingId, pendingRequest] of snapshotRequests) {
+    if (pendingRequest.action !== "submit") continue;
+    snapshotRequests.delete(pendingId);
+    if (pendingRequest.timeout) clearTimeout(pendingRequest.timeout);
+  }
+  pendingSnapshot = snapshot || "";
+  // submitQueuedOnce throws to signal "nothing was delivered" - its own finally
+  // already reset the end intent and it left the queue intact for a retry, so the
+  // rejection has no remaining consumer here.
+  submitQueued().catch(() => {});
 }
 
 function createChatAttachmentsController() {
@@ -2987,16 +3031,7 @@ window.addEventListener("message", (event) => {
     pulseSheetDock();
   }
   if (msg.type === "lavish:snapshot") {
-    const snapshotAction = snapshotRequests.shift() || "submit";
-    if (snapshotAction === "copy") {
-      copyText(msg.snapshot || "");
-    } else {
-      pendingSnapshot = msg.snapshot || "";
-      // submitQueuedOnce throws to signal "nothing was delivered" - its own
-      // finally already reset the end intent and it left the queue intact for a
-      // retry, so the rejection has no remaining consumer here.
-      submitQueued().catch(() => {});
-    }
+    completeSnapshotRequest(msg.snapshot_request_id, msg.snapshot || "");
   }
   if (msg.type === "lavish:scroll") {
     lastScroll = { x: Number(msg.x) || 0, y: Number(msg.y) || 0 };

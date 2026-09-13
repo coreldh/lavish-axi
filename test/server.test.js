@@ -1005,11 +1005,12 @@ test("the share dialog hands back the site id alongside the update key it tells 
 test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard", async () => {
   const js = await chromeClientSource();
 
-  assert.match(js, /const snapshotRequests = \[\]/);
+  assert.match(js, /const snapshotRequests = new Map\(\)/);
   assert.match(js, /requestSnapshot\("copy"\)/);
-  assert.match(js, /const snapshotAction = snapshotRequests\.shift\(\) \|\| "submit"/);
-  assert.match(js, /if \(snapshotAction === "copy"\)/);
-  assert.match(js, /copyText\(msg\.snapshot \|\| ""\)/);
+  assert.match(js, /snapshotRequests\.set\(requestId, request\)/);
+  assert.match(js, /completeSnapshotRequest\(msg\.snapshot_request_id, msg\.snapshot \|\| ""\)/);
+  assert.match(js, /if \(request\.action === "copy"\)/);
+  assert.match(js, /copyText\(snapshot \|\| ""\)/);
 });
 
 test("clipboard copy falls back when navigator clipboard rejects", async () => {
