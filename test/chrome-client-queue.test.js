@@ -941,6 +941,7 @@ test("Send & End reserves its terminal batch and only retries that batch after f
   assert.equal(chrome.element("sendAndEnd").disabled, true);
   assert.equal(chrome.element("annotation").disabled, true);
   assert.equal(chrome.element("chatInput").disabled, true);
+  assert.equal(chrome.element("end").disabled, true);
   chrome.sendFrameMessage({
     type: "lavish:queuePrompt",
     prompt: { prompt: "Rejected later annotation", selector: "h2", tag: "annotation", text: "Later" },
@@ -954,6 +955,9 @@ test("Send & End reserves its terminal batch and only retries that batch after f
   });
   await flushPromises();
   assert.equal(posts.length, 1);
+  chrome.element("end").click();
+  await flushPromises();
+  assert.equal(posts.length, 1);
 
   rejectFirstPost();
   await flushPromises();
@@ -963,6 +967,7 @@ test("Send & End reserves its terminal batch and only retries that batch after f
   assert.equal(chrome.element("sendAndEnd").disabled, false);
   assert.equal(chrome.element("annotation").disabled, true);
   assert.equal(chrome.element("chatInput").disabled, true);
+  assert.equal(chrome.element("end").disabled, true);
   assert.deepEqual(
     chrome.queued().map((prompt) => prompt.prompt),
     ["Terminal batch"],
@@ -979,6 +984,7 @@ test("Send & End reserves its terminal batch and only retries that batch after f
   assert.equal(reloaded.element("sendAndEnd").disabled, false);
   assert.equal(reloaded.element("annotation").disabled, true);
   assert.equal(reloaded.element("chatInput").disabled, true);
+  assert.equal(reloaded.element("end").disabled, true);
 
   reloaded.element("sendAndEnd").click();
   const retryRequest = reloaded.postedToFrame.at(-1);

@@ -456,6 +456,7 @@ function updateSendState() {
   annotationSwitch.disabled = ended || terminalReserved;
   chatInput.disabled = ended || terminalReserved;
   chatAttachButton.disabled = ended || terminalReserved;
+  endButton.disabled = ended || terminalReserved;
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
@@ -1338,7 +1339,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   const prompts = submission.prompts.filter((prompt) => !deliveredPrompts.has(prompt));
   const shouldEndSession = submission.endAfter;
   if (!prompts.length) {
-    if (shouldEndSession && !ended) await endSession();
+    if (shouldEndSession && !ended) await endSession(submission.terminal);
     return;
   }
   const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: submission.domSnapshot };
@@ -1941,8 +1942,8 @@ async function refreshLayoutWarnings() {
   }
 }
 
-async function endSession() {
-  if (ended) return;
+async function endSession(terminal = null) {
+  if (ended || (terminalSubmission && terminal !== terminalSubmission)) return;
   const response = await fetch("/api/" + key + "/end", { method: "POST" });
   if (!response.ok) throw new Error("failed to end session");
   markSessionEnded();
