@@ -890,7 +890,7 @@ test("a failed in-flight POST preserves and runs a completed later Send & End", 
   );
   assert.deepEqual(
     chrome.queued().map((prompt) => prompt.prompt),
-    ["Unsent later work"],
+    [],
   );
   assert.equal(chrome.element("sendHint").hidden, false);
   assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
@@ -918,6 +918,89 @@ test("Send & End falls back without a snapshot and preserves the atomic end inte
   assert.equal(posts[0].body.domSnapshot, "");
   assert.equal(posts[0].body.endSession, true);
   assert.equal(chrome.element("sendAndEnd").disabled, true);
+});
+
+test("Send & End reserves its terminal batch and only retries that batch after failure", async () => {
+  const posts = [];
+  let rejectFirstPost = () => {};
+  const firstPost = new Promise((_, reject) => {
+    rejectFirstPost = () => reject(new Error("network unavailable"));
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      if (posts.length === 1) await firstPost;
+      return { ok: true };
+    },
+  });
+  chrome.element("chatInput").value = "Terminal batch";
+
+  chrome.element("sendAndEnd").click();
+  const firstRequest = chrome.postedToFrame.at(-1);
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, true);
+  assert.equal(chrome.element("annotation").disabled, true);
+  assert.equal(chrome.element("chatInput").disabled, true);
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Rejected later annotation", selector: "h2", tag: "annotation", text: "Later" },
+  });
+  chrome.element("chatInput").value = "Rejected later send";
+  chrome.element("send").click();
+  chrome.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "uid=1 terminal",
+    snapshot_request_id: firstRequest.snapshot_request_id,
+  });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+
+  rejectFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.equal(chrome.element("annotation").disabled, true);
+  assert.equal(chrome.element("chatInput").disabled, true);
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Terminal batch"],
+  );
+
+  const reloaded = await createChromeHarness({
+    storage: chrome.storage,
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+  assert.equal(reloaded.element("send").disabled, true);
+  assert.equal(reloaded.element("sendAndEnd").disabled, false);
+  assert.equal(reloaded.element("annotation").disabled, true);
+  assert.equal(reloaded.element("chatInput").disabled, true);
+
+  reloaded.element("sendAndEnd").click();
+  const retryRequest = reloaded.postedToFrame.at(-1);
+  assert.equal(typeof retryRequest.snapshot_request_id, "string");
+  assert.equal(reloaded.element("sendAndEnd").disabled, true);
+  reloaded.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "uid=2 retry",
+    snapshot_request_id: retryRequest.snapshot_request_id,
+  });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.deepEqual(
+    posts.map((post) => post.body.prompts.map((prompt) => prompt.prompt)),
+    [["Terminal batch"], ["Terminal batch"]],
+  );
+  assert.equal(posts[1].body.domSnapshot, "uid=2 retry");
+  assert.equal(posts[1].body.endSession, true);
+  assert.equal(reloaded.queued().length, 0);
+  assert.equal(reloaded.element("sendAndEnd").disabled, true);
 });
 
 test("a failed timeout fallback keeps the queue and a timely retry sends it once", async () => {

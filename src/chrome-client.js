@@ -5,6 +5,7 @@ const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
 const queueStorageKey = "lavish-axi:queued:" + key;
+const terminalStorageKey = "lavish-axi:terminal:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
 // triage can never leak into another artifact's.
 const warningSelectionStorageKey = "lavish-axi:warning-selection:" + key;
@@ -210,13 +211,18 @@ let layoutGateTimer;
 let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionData.initialLayoutWarnings : [];
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
-/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, timeout?: ReturnType<typeof setTimeout> }>} */
+/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: { prompts: any[], inFlight: boolean } | null, timeout?: ReturnType<typeof setTimeout> }>} */
 const snapshotRequests = new Map();
 let nextSnapshotRequestId = 0;
 let workingBubble = null;
 let submitQueuedPromise = null;
 const pendingSubmissions = [];
 const deliveredPrompts = new WeakSet();
+/** @type {{ prompts: any[], inFlight: boolean } | null} */
+let terminalSubmission =
+  loadJsonState(terminalStorageKey, false) === true && queued.length
+    ? { prompts: queued.slice(), inFlight: false }
+    : null;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
@@ -385,6 +391,13 @@ function persistQueuedPrompts() {
   }
 }
 
+function persistTerminalReservation(reserved) {
+  try {
+    if (reserved) sessionStorage.setItem(terminalStorageKey, "true");
+    else sessionStorage.removeItem(terminalStorageKey);
+  } catch {}
+}
+
 function promptTargetLabel(prompt) {
   if (prompt?.target?.type === "table-cell") {
     const semantic = [prompt.target.rowLabel, prompt.target.columnLabel].filter(Boolean).join(" → ");
@@ -428,6 +441,7 @@ function render() {
 
   for (const button of annotationPills.querySelectorAll(".pill-close")) {
     const closeButton = /** @type {HTMLButtonElement} */ (button);
+    closeButton.disabled = terminalSubmission !== null;
     closeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(closeButton.dataset.index), event));
   }
   updateSendState();
@@ -436,8 +450,12 @@ function render() {
 }
 
 function updateSendState() {
-  sendButton.disabled = ended;
-  sendAndEndButton.disabled = sendButton.disabled;
+  const terminalReserved = terminalSubmission !== null;
+  sendButton.disabled = ended || terminalReserved;
+  sendAndEndButton.disabled = ended || Boolean(terminalSubmission?.inFlight);
+  annotationSwitch.disabled = ended || terminalReserved;
+  chatInput.disabled = ended || terminalReserved;
+  chatAttachButton.disabled = ended || terminalReserved;
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
@@ -944,6 +962,7 @@ function scrollElementIntoView(el) {
 
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
+  if (terminalSubmission) return;
   queued.splice(index, 1);
   persistQueuedPrompts();
   if (!queued.length) {
@@ -958,6 +977,7 @@ function promptQueueKey(prompt) {
 }
 
 function enqueuePrompt(rawPrompt) {
+  if (terminalSubmission) return;
   const prompt = sanitizeQueuedPrompt(rawPrompt);
   if (!prompt) return;
 
@@ -988,9 +1008,9 @@ function postToFrame(message) {
   if (frame.contentWindow) frame.contentWindow.postMessage(message, "*");
 }
 
-function requestSnapshot(action, prompts = [], endAfter = false) {
+function requestSnapshot(action, prompts = [], endAfter = false, terminal = null) {
   const requestId = "snapshot-" + ++nextSnapshotRequestId;
-  const request = action === "submit" ? { action, prompts, endAfter } : { action };
+  const request = action === "submit" ? { action, prompts, endAfter, terminal } : { action };
   snapshotRequests.set(requestId, request);
   if (action === "submit") {
     request.timeout = setTimeout(() => completeSnapshotRequest(requestId, ""), SNAPSHOT_REQUEST_TIMEOUT_MS);
@@ -1018,6 +1038,7 @@ function completeSnapshotRequest(requestId, snapshot) {
     prompts: request.prompts || [],
     domSnapshot: snapshot || "",
     endAfter: request.endAfter === true,
+    terminal: request.terminal || null,
   }).catch(() => {});
 }
 
@@ -1221,6 +1242,10 @@ const chatAttachmentController = createChatAttachmentsController();
 
 function sendQueued(endAfter) {
   if (ended) return;
+  if (terminalSubmission) {
+    if (endAfter && !terminalSubmission.inFlight) retryTerminalSubmission();
+    return;
+  }
   closeMenus();
 
   // A pending or failed chip holds back only the COMPOSER message (and an
@@ -1254,7 +1279,30 @@ function sendQueued(endAfter) {
   hideSendHint(true);
   armSendAcknowledgementWarning();
 
-  requestSnapshot("submit", queued.slice(), Boolean(endAfter && !chipsBlocked));
+  const prompts = queued.slice();
+  const shouldEnd = Boolean(endAfter && !chipsBlocked);
+  if (shouldEnd) {
+    terminalSubmission = { prompts, inFlight: true };
+    persistTerminalReservation(true);
+    annotation = false;
+    annotationSwitch.setAttribute("aria-pressed", "false");
+    postToFrame({ type: "lavish:setAnnotationMode", enabled: false });
+    updateSendState();
+  }
+  requestSnapshot("submit", prompts, shouldEnd, terminalSubmission);
+}
+
+function retryTerminalSubmission() {
+  if (!terminalSubmission || terminalSubmission.inFlight || ended) return;
+  terminalSubmission.inFlight = true;
+  updateSendState();
+  requestSnapshot("submit", terminalSubmission.prompts, true, terminalSubmission);
+}
+
+function markTerminalSubmissionFailed(submission) {
+  if (!terminalSubmission || submission.terminal !== terminalSubmission || ended) return;
+  terminalSubmission.inFlight = false;
+  updateSendState();
 }
 
 async function submitQueued(submission) {
@@ -1270,8 +1318,10 @@ async function submitQueued(submission) {
       const next = pendingSubmissions.shift();
       if (!next) continue;
       try {
-        await submitQueuedOnce(next, firstError !== null);
+        const result = await submitQueuedOnce(next, firstError !== null);
+        if (result === false) markTerminalSubmissionFailed(next);
       } catch (error) {
+        markTerminalSubmissionFailed(next);
         if (firstError === null) firstError = error;
       }
     }
@@ -1792,7 +1842,7 @@ function updateWarningSelectionState() {
   warningsSelectAll.checked = selectable.length > 0 && selectedCount === selectable.length;
   warningsSelectAll.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
   warningsSelected.textContent = selectedCount === 0 ? "None selected" : selectedCount + " selected";
-  warningsQueueButton.disabled = selectedCount === 0 || ended;
+  warningsQueueButton.disabled = selectedCount === 0 || ended || terminalSubmission !== null;
 }
 
 function toggleSelectAllWarnings() {
@@ -1849,7 +1899,7 @@ async function dismissWarning(id) {
 // One queued batch = one ordinary queued prompt. The CLI cannot tell it apart from any other
 // feedback, which is exactly the point: no parallel agent protocol.
 async function queueSelectedWarningFixes() {
-  if (ended) return;
+  if (ended || terminalSubmission) return;
   const ids = [...selectedWarningIds];
   if (ids.length === 0) return;
   warningsQueueButton.disabled = true;
@@ -1901,6 +1951,8 @@ async function endSession() {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  terminalSubmission = null;
+  persistTerminalReservation(false);
   cancelArtifactLoadRecovery();
   closeMenus();
   closeShareDialog();
@@ -3175,7 +3227,7 @@ async function uploadAttachment(message, reportResult = postToFrame, signal) {
 loadFrame();
 
 function toggleAnnotationMode() {
-  if (ended) return;
+  if (ended || terminalSubmission) return;
   annotation = !annotation;
   annotationSwitch.setAttribute("aria-pressed", String(annotation));
   postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation });
