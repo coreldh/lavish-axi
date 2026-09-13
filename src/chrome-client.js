@@ -260,6 +260,7 @@ const HEALTH_PROBE_TIMEOUT_MS = 4000;
 // batch. Bound that whole wait so a missing SDK response or a browser/network stall can never look
 // like a dead button while the user's queue remains safely stored in this tab.
 const SEND_ACKNOWLEDGEMENT_WARNING_MS = 10_000;
+const TERMINAL_PREPARATION_TIMEOUT_MS = 5000;
 // A DOM snapshot adds useful context, but the reviewer's own words are the payload.
 // If the artifact frame navigated away from the injected SDK (or otherwise stopped
 // answering), deliver those words without a snapshot instead of waiting forever.
@@ -268,6 +269,8 @@ const SEND_STALLED_COPY =
   "Still trying to send. Your feedback is saved in this tab. Keep this tab open while Lavish catches up, and check that the server is running.";
 const SEND_FAILED_COPY =
   "Could not send. Your feedback is still queued in this tab. Check that Lavish is running, then click Send to Agent to retry.";
+const TERMINAL_SEND_FAILED_COPY =
+  "Could not send. Your terminal feedback is still queued in this tab. Check that Lavish is running, then click Send & End to retry the same batch.";
 const HEALTH_NO_ANSWER_TITLE = "Lavish did not answer.";
 const HEALTH_NO_ANSWER_COPY =
   "Lavish did not answer the check, so this page cannot tell whether it is running. Try again in a moment.";
@@ -1000,7 +1003,7 @@ function beginFeedbackPreparation() {
 }
 
 function enqueuePrompt(rawPrompt, /** @type {FeedbackPreparation | null} */ preparation = null) {
-  if (terminalSubmission && (!preparation || !feedbackPreparations.has(preparation))) return false;
+  if ((preparation && !feedbackPreparations.has(preparation)) || (terminalSubmission && !preparation)) return false;
   const prompt = sanitizeQueuedPrompt(rawPrompt);
   if (!prompt) return false;
 
@@ -1327,7 +1330,18 @@ function finishTerminalPreparation(terminal, preparations) {
     completeTerminalPreparation(terminal, []);
     return;
   }
+  const timeout = setTimeout(() => {
+    if (terminalSubmission !== terminal || ended) return;
+    for (const preparation of preparations) preparation.finish(false);
+    showSendHint(
+      "Could not finish preparing all feedback within 5 seconds. This review remains open, and existing queued feedback is still editable.",
+      null,
+      false,
+    );
+    releaseTerminalSubmission(terminal);
+  }, TERMINAL_PREPARATION_TIMEOUT_MS);
   Promise.all(preparations.map((preparation) => preparation.done)).then((results) => {
+    clearTimeout(timeout);
     completeTerminalPreparation(terminal, results);
   });
 }
@@ -1419,7 +1433,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       body: JSON.stringify(body),
     });
   } catch (error) {
-    showQueuedSendFailure();
+    showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY);
     throw error;
   }
   if (!response.ok) {
@@ -1447,11 +1461,12 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
       const detail = await response.json().catch(() => ({}));
       if (Array.isArray(detail.rejected) && detail.rejected.length) {
         showQueuedSendFailure(describeAttachmentRejection(detail.rejected, detail.caps));
+        if (submission.terminal) releaseTerminalSubmission(submission.terminal);
       } else {
-        showQueuedSendFailure();
+        showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY);
       }
     } else {
-      showQueuedSendFailure();
+      showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY);
     }
     throw new Error("failed to submit queued prompts");
   }

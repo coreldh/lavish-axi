@@ -1046,6 +1046,61 @@ test("a recoverable terminal layout conflict restores ordinary review controls",
   assert.match(chrome.element("sendHint").textContent, /layout issue selection changed/i);
 });
 
+test("an actionable terminal attachment rejection restores editable review controls", async () => {
+  const prompt = {
+    uid: "",
+    prompt: "Review this image",
+    selector: "",
+    tag: "message",
+    text: "Freeform message",
+    attachments: [{ id: "missing.png", name: "missing.png" }],
+  };
+  const chrome = await createChromeHarness({
+    storedQueue: [prompt],
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/prompts")) return { ok: true, json: async () => ({}) };
+      return {
+        ok: false,
+        status: 400,
+        json: async () => ({ rejected: [{ reason: "not-found" }] }),
+      };
+    },
+  });
+
+  chrome.element("sendAndEnd").click();
+  chrome.sendSnapshot("");
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(chrome.queued(), [prompt]);
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.equal(chrome.element("annotation").disabled, false);
+  assert.equal(chrome.element("chatInput").disabled, false);
+  assert.equal(chrome.element("end").disabled, false);
+  assert.match(chrome.element("sendHint").textContent, /no longer available/i);
+});
+
+test("a transient terminal failure names Send & End as the retry action", async () => {
+  const chrome = await createChromeHarness({
+    storedQueue: [{ uid: "", prompt: "Final feedback", selector: "", tag: "message", text: "Freeform message" }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) throw new Error("network unavailable");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.element("sendAndEnd").click();
+  chrome.sendSnapshot("");
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Send to Agent/i);
+});
+
 test("a failed timeout fallback keeps the queue and a timely retry sends it once", async () => {
   let promptPostAttempts = 0;
   const chrome = await createChromeHarness({
@@ -2432,6 +2487,63 @@ test("Send & End waits for layout feedback preparation already in flight", async
   assert.equal(promptPost.body.endSession, true);
   assert.equal(promptPost.body.prompts.length, 1);
   assert.equal(promptPost.body.prompts[0].tag, "layout-warnings");
+});
+
+test("Send & End releases after a five-second feedback preparation timeout", async () => {
+  let finishPreparation = () => {};
+  const preparation = new Promise((resolve) => {
+    finishPreparation = () =>
+      resolve({
+        ok: true,
+        json: async () => ({
+          warnings: [],
+          prompt: {
+            prompt: "Late layout feedback",
+            text: "Layout issue: 1 selected",
+            target: { type: "layout-warnings", artifact_revision: 1, warnings: [{ id: "w1" }] },
+          },
+        }),
+      });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/layout-warnings/queue")) return preparation;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+  chrome.element("chatInput").value = "Already queued";
+
+  chrome.element("warningsQueueButton").click();
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Already queued"],
+  );
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.equal(chrome.element("annotation").disabled, false);
+  assert.equal(chrome.element("end").disabled, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /within 5 seconds/i);
+  assert.equal(chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"), false);
+
+  finishPreparation();
+  await flushPromises();
+  await flushPromises();
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Already queued"],
+    "feedback that completed after the timeout is not claimed as queued",
+  );
 });
 
 test("a stale queued layout prompt remains available for user re-decision", async () => {
