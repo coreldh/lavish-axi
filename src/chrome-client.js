@@ -1437,7 +1437,15 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   const prompts = submission.prompts.filter((prompt) => !deliveredPrompts.has(prompt));
   const shouldEndSession = submission.endAfter;
   if (!prompts.length) {
-    if (shouldEndSession && !ended) await endSession(submission.terminal);
+    if (shouldEndSession && !ended) {
+      try {
+        await endSession(submission.terminal);
+      } catch (error) {
+        showPersistentSendFailure(TERMINAL_SEND_FAILED_COPY);
+        throw error;
+      }
+    }
+    settleAcknowledgementGuidance(submission, failureGenerationAtStart, preserveFailureState);
     return;
   }
   const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: submission.domSnapshot };
@@ -1494,21 +1502,24 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   }
   persistQueuedPrompts();
   render();
-  if (sendFailureGeneration === failureGenerationAtStart && (!preserveFailureState || !queued.length)) {
-    const hasLaterAcknowledgement = [...pendingAcknowledgements].some(
-      (acknowledgement) => acknowledgement !== submission.acknowledgement,
-    );
-    if (hasLaterAcknowledgement) {
-      if (!sendAcknowledgementTimer && !sendAcknowledgementWarningVisible) armSendAcknowledgementWarning();
-    } else {
-      clearSendAcknowledgementWarning();
-      hideSendHint(true);
-    }
-  }
+  settleAcknowledgementGuidance(submission, failureGenerationAtStart, preserveFailureState);
   if (shouldEndSession) {
     markSessionEnded();
     return;
   }
+}
+
+function settleAcknowledgementGuidance(submission, failureGenerationAtStart, preserveFailureState) {
+  if (sendFailureGeneration !== failureGenerationAtStart || (preserveFailureState && queued.length)) return;
+  const hasLaterAcknowledgement = [...pendingAcknowledgements].some(
+    (acknowledgement) => acknowledgement !== submission.acknowledgement,
+  );
+  if (hasLaterAcknowledgement) {
+    if (!sendAcknowledgementTimer && !sendAcknowledgementWarningVisible) armSendAcknowledgementWarning();
+    return;
+  }
+  clearSendAcknowledgementWarning();
+  hideSendHint(true);
 }
 
 function normalizeLayoutFindings(value) {

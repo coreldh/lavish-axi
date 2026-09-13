@@ -887,6 +887,75 @@ test("an older success preserves stall guidance for a later pending send", async
   assert.equal(chrome.element("sendHint").hidden, true);
 });
 
+test("a redundant zero-prompt send clears obsolete stall guidance", async () => {
+  const posts = [];
+  let releaseFirstPost = () => {};
+  const firstPost = new Promise((resolve) => {
+    releaseFirstPost = () => resolve({ ok: true });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return firstPost;
+    },
+  });
+
+  chrome.element("chatInput").value = "Shared batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("first snapshot");
+  await flushPromises();
+
+  chrome.element("send").click();
+  chrome.sendSnapshot("redundant snapshot");
+  chrome.runTimers(10_000);
+  assert.match(chrome.element("sendHint").textContent, /still trying to send/i);
+
+  releaseFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, true);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), false);
+});
+
+test("a failed terminal-only end shows retry guidance", async () => {
+  const calls = [];
+  let releasePromptPost = () => {};
+  const promptPost = new Promise((resolve) => {
+    releasePromptPost = () => resolve({ ok: true });
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (String(url).endsWith("/prompts")) return promptPost;
+      if (String(url).endsWith("/end")) return { ok: false };
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.element("chatInput").value = "Shared terminal batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("first snapshot");
+  await flushPromises();
+
+  chrome.element("sendAndEnd").click();
+  chrome.sendSnapshot("terminal snapshot");
+  releasePromptPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(calls.filter((url) => String(url).endsWith("/prompts")).length, 1);
+  assert.equal(calls.filter((url) => String(url).endsWith("/end")).length, 1);
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+});
+
 test("a failed in-flight POST preserves and runs a completed later Send & End", async () => {
   const posts = [];
   let rejectFirstPost = () => {};
