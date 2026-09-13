@@ -898,6 +898,38 @@ test("a failed in-flight POST preserves and runs a completed later Send & End", 
   assert.equal(chrome.element("sendAndEnd").disabled, true);
 });
 
+test("a later successful batch clears an earlier failure after delivering everything", async () => {
+  const posts = [];
+  let rejectFirstPost = () => {};
+  const firstPost = new Promise((_, reject) => {
+    rejectFirstPost = () => reject(new Error("network unavailable"));
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      if (posts.length === 1) await firstPost;
+      return { ok: true };
+    },
+  });
+
+  chrome.element("chatInput").value = "First batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("first snapshot");
+  await flushPromises();
+
+  chrome.element("chatInput").value = "Second batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("second snapshot");
+  rejectFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, true);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), false);
+});
+
 test("Send & End falls back without a snapshot and preserves the atomic end intent", async () => {
   const posts = [];
   const chrome = await createChromeHarness({
@@ -2487,6 +2519,41 @@ test("Send & End waits for layout feedback preparation already in flight", async
   assert.equal(promptPost.body.endSession, true);
   assert.equal(promptPost.body.prompts.length, 1);
   assert.equal(promptPost.body.prompts[0].tag, "layout-warnings");
+});
+
+test("a failed terminal layout preparation stays visible with an empty queue", async () => {
+  let failPreparation = () => {};
+  const preparation = new Promise((_, reject) => {
+    failPreparation = () => reject(new Error("preparation unavailable"));
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/layout-warnings/queue")) return preparation;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+
+  chrome.element("warningsQueueButton").click();
+  chrome.element("sendAndEnd").click();
+  failPreparation();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /still queued/i);
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.equal(chrome.element("annotation").disabled, false);
+  assert.equal(chrome.element("end").disabled, false);
 });
 
 test("Send & End releases after a five-second feedback preparation timeout", async () => {

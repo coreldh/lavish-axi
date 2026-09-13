@@ -1477,7 +1477,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   }
   persistQueuedPrompts();
   render();
-  if (!preserveFailureState) {
+  if (!preserveFailureState || !queued.length) {
     clearSendAcknowledgementWarning();
     hideSendHint(true);
     if (queued.length) armSendAcknowledgementWarning();
@@ -2016,7 +2016,8 @@ async function queueSelectedWarningFixes() {
     closeWarningsDrawer({ restoreFocus: true });
     succeeded = true;
   } catch {
-    showQueuedSendFailure("Could not queue the selected layout fixes. Review the current issues and try again.");
+    clearSendAcknowledgementWarning();
+    showSendHint("Could not prepare the selected layout fixes. Review the current issues and try again.", null, false);
     updateWarningSelectionState();
   } finally {
     preparation.finish(succeeded);
