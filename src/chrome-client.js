@@ -292,6 +292,7 @@ let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
 let sendHintPersistent = false;
+let sendFailureGeneration = 0;
 
 function artifactFrameSrcForLoad(load) {
   const separator = artifactSrc.includes("?") ? "&" : "?";
@@ -560,8 +561,14 @@ function clearSendAcknowledgementWarning() {
 }
 
 function showQueuedSendFailure(message = SEND_FAILED_COPY) {
+  showPersistentSendFailure(message, true);
+}
+
+function showPersistentSendFailure(message, requireQueuedFeedback = false) {
   clearSendAcknowledgementWarning();
-  if (queued.length) showSendHint(message, null, false);
+  if (requireQueuedFeedback && !queued.length) return;
+  sendFailureGeneration += 1;
+  showSendHint(message, null, false);
 }
 
 function setMenuOpen(button, menu, open) {
@@ -1333,10 +1340,8 @@ function finishTerminalPreparation(terminal, preparations) {
   const timeout = setTimeout(() => {
     if (terminalSubmission !== terminal || ended) return;
     for (const preparation of preparations) preparation.finish(false);
-    showSendHint(
+    showPersistentSendFailure(
       "Could not finish preparing all feedback within 5 seconds. This review remains open, and existing queued feedback is still editable.",
-      null,
-      false,
     );
     releaseTerminalSubmission(terminal);
   }, TERMINAL_PREPARATION_TIMEOUT_MS);
@@ -1417,6 +1422,7 @@ async function submitQueued(submission) {
 }
 
 async function submitQueuedOnce(submission, preserveFailureState = false) {
+  const failureGenerationAtStart = sendFailureGeneration;
   const prompts = submission.prompts.filter((prompt) => !deliveredPrompts.has(prompt));
   const shouldEndSession = submission.endAfter;
   if (!prompts.length) {
@@ -1477,7 +1483,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
   }
   persistQueuedPrompts();
   render();
-  if (!preserveFailureState || !queued.length) {
+  if (sendFailureGeneration === failureGenerationAtStart && (!preserveFailureState || !queued.length)) {
     clearSendAcknowledgementWarning();
     hideSendHint(true);
     if (queued.length) armSendAcknowledgementWarning();
@@ -2016,8 +2022,7 @@ async function queueSelectedWarningFixes() {
     closeWarningsDrawer({ restoreFocus: true });
     succeeded = true;
   } catch {
-    clearSendAcknowledgementWarning();
-    showSendHint("Could not prepare the selected layout fixes. Review the current issues and try again.", null, false);
+    showPersistentSendFailure("Could not prepare the selected layout fixes. Review the current issues and try again.");
     updateWarningSelectionState();
   } finally {
     preparation.finish(succeeded);

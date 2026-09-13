@@ -929,6 +929,50 @@ test("a later successful batch clears an earlier failure after delivering everyt
   assert.equal(chrome.element("sendHint").classList.contains("persistent"), false);
 });
 
+test("an older successful send preserves a newer terminal preparation failure", async () => {
+  let releaseFirstPost = () => {};
+  const firstPost = new Promise((resolve) => {
+    releaseFirstPost = () => resolve({ ok: true });
+  });
+  let failPreparation = () => {};
+  const preparation = new Promise((_, reject) => {
+    failPreparation = () => reject(new Error("preparation unavailable"));
+  });
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) return firstPost;
+      if (String(url).endsWith("/layout-warnings/queue")) return preparation;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.element("chatInput").value = "Already sending";
+  chrome.element("send").click();
+  chrome.sendSnapshot("first snapshot");
+  await flushPromises();
+
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+  chrome.element("warningsQueueButton").click();
+  chrome.element("sendAndEnd").click();
+  failPreparation();
+  await flushPromises();
+
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+  releaseFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+});
+
 test("Send & End falls back without a snapshot and preserves the atomic end intent", async () => {
   const posts = [];
   const chrome = await createChromeHarness({
@@ -1130,6 +1174,44 @@ test("a transient terminal failure names Send & End as the retry action", async 
   assert.equal(chrome.element("sendAndEnd").disabled, false);
   assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
   assert.doesNotMatch(chrome.element("sendHint").textContent, /click Send to Agent/i);
+});
+
+test("an older successful send preserves newer terminal retry guidance", async () => {
+  let releaseFirstPost = () => {};
+  const firstPost = new Promise((resolve) => {
+    releaseFirstPost = () => resolve({ ok: true });
+  });
+  let promptPostCount = 0;
+  let chrome;
+  chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/prompts")) return { ok: true, json: async () => ({}) };
+      promptPostCount += 1;
+      if (promptPostCount === 1) {
+        chrome.element("chatInput").value = "Terminal batch";
+        chrome.element("sendAndEnd").click();
+        chrome.sendSnapshot("terminal snapshot");
+        return firstPost;
+      }
+      throw new Error("terminal network unavailable");
+    },
+  });
+
+  chrome.element("chatInput").value = "Ordinary batch";
+  chrome.element("send").click();
+  chrome.sendSnapshot("ordinary snapshot");
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(promptPostCount, 2);
+  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+  releaseFirstPost();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
 });
 
 test("a failed timeout fallback keeps the queue and a timely retry sends it once", async () => {
