@@ -555,7 +555,7 @@ function armSendAcknowledgementWarning() {
   if (sendAcknowledgementTimer || pendingAcknowledgements.size === 0) return;
   sendAcknowledgementTimer = setTimeout(() => {
     sendAcknowledgementTimer = undefined;
-    if (pendingAcknowledgements.size > 0) {
+    if (pendingAcknowledgements.size > 0 && !sendFailureOwner) {
       sendAcknowledgementWarningVisible = true;
       showSendHint(SEND_STALLED_COPY, null, false);
     }

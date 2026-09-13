@@ -2789,6 +2789,52 @@ test("an unrelated successful send preserves layout preparation failure guidance
   assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
 });
 
+test("a stalled unrelated send cannot overwrite layout preparation failure guidance", async () => {
+  let failPreparation = () => {};
+  const preparation = new Promise((_, reject) => {
+    failPreparation = () => reject(new Error("preparation unavailable"));
+  });
+  let finishSend = () => {};
+  const send = new Promise((resolve) => {
+    finishSend = () => resolve({ ok: true, json: async () => ({}) });
+  });
+  const chrome = await createChromeHarness({
+    storedQueue: [{ uid: "", prompt: "Queued separately", selector: "h1", tag: "element", text: "Heading" }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/layout-warnings/queue")) return preparation;
+      if (String(url).endsWith("/prompts")) return send;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+
+  chrome.element("warningsQueueButton").click();
+  failPreparation();
+  await flushPromises();
+  await flushPromises();
+
+  chrome.element("send").click();
+  chrome.sendSnapshot("");
+  await flushPromises();
+  chrome.runTimers(10_000);
+
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /still trying to send/i);
+
+  finishSend();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+});
+
 test("Send & End releases after a five-second feedback preparation timeout", async () => {
   let finishPreparation = () => {};
   const preparation = new Promise((resolve) => {
