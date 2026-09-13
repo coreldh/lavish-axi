@@ -2703,7 +2703,10 @@ test("Send & End waits for layout feedback preparation already in flight", async
   chrome.element("warningsQueueButton").click();
   chrome.element("sendAndEnd").click();
 
-  assert.equal(chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"), false);
+  assert.equal(
+    chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"),
+    false,
+  );
   assert.equal(chrome.element("sendAndEnd").disabled, true);
 
   finishPreparation();
@@ -2880,7 +2883,10 @@ test("Send & End releases after a five-second feedback preparation timeout", asy
   assert.equal(chrome.element("end").disabled, false);
   assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
   assert.match(chrome.element("sendHint").textContent, /within 5 seconds/i);
-  assert.equal(chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"), false);
+  assert.equal(
+    chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"),
+    false,
+  );
 
   finishPreparation();
   await flushPromises();
@@ -5499,7 +5505,10 @@ test("Send & End waits for whiteboard feedback preparation already in flight", a
   await flushPromises();
   chrome.element("sendAndEnd").click();
 
-  assert.equal(chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"), false);
+  assert.equal(
+    chrome.postedToFrame.some((message) => message.type === "lavish:requestSnapshot"),
+    false,
+  );
   assert.equal(chrome.element("sendAndEnd").disabled, true);
 
   finishSceneSave();

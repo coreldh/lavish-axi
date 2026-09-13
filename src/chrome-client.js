@@ -406,7 +406,9 @@ function persistTerminalReservation(reserved) {
   try {
     if (reserved) sessionStorage.setItem(terminalStorageKey, "true");
     else sessionStorage.removeItem(terminalStorageKey);
-  } catch {}
+  } catch {
+    // Session storage can be unavailable; the in-memory reservation still protects this page.
+  }
 }
 
 function promptTargetLabel(prompt) {
@@ -1539,7 +1541,8 @@ function submissionResolvesSendFailure(submission) {
   const failedSubmission = sendFailureOwner.operation;
   return (
     failedSubmission === submission ||
-    (Array.isArray(failedSubmission.prompts) && failedSubmission.prompts.every((prompt) => deliveredPrompts.has(prompt)))
+    (Array.isArray(failedSubmission.prompts) &&
+      failedSubmission.prompts.every((prompt) => deliveredPrompts.has(prompt)))
   );
 }
 
@@ -2069,14 +2072,20 @@ async function queueSelectedWarningFixes() {
     if (!response.ok) throw new Error("failed to queue layout warning fixes");
     const data = await response.json();
     if (data.prompt) {
-      if (!enqueuePrompt({
-        uid: "",
-        prompt: data.prompt.prompt,
-        selector: "",
-        tag: "layout-warnings",
-        text: data.prompt.text,
-        target: data.prompt.target,
-      }, preparation)) throw new Error("failed to retain layout warning fixes");
+      if (
+        !enqueuePrompt(
+          {
+            uid: "",
+            prompt: data.prompt.prompt,
+            selector: "",
+            tag: "layout-warnings",
+            text: data.prompt.text,
+            target: data.prompt.target,
+          },
+          preparation,
+        )
+      )
+        throw new Error("failed to retain layout warning fixes");
     }
     selectedWarningIds.clear();
     persistWarningSelection();
@@ -2906,26 +2915,32 @@ async function queueWhiteboardFeedback(index, message, mode) {
       "\n\nEdited scene JSON: " +
       String(files.scene_path || "") +
       (files.preview_path ? "\nPNG preview: " + String(files.preview_path) : "");
-    if (!enqueuePrompt({
-      uid: "",
-      prompt: promptText,
-      selector: "",
-      tag: "whiteboard",
-      text: "Whiteboard: diagram " + (index + 1),
-      target: {
-        type: "excalidraw-scene",
-        diagramIndex: index,
-        diagramId,
-        sourceHash: String(message.sourceHash || ""),
-        scenePath: String(files.scene_path || ""),
-        previewPath: String(files.preview_path || ""),
-        imageFallback: Boolean(message.imageFallback),
-        stats: message.stats && typeof message.stats === "object" ? message.stats : {},
-      },
-      // Re-queueing the same diagram's whiteboard before sending replaces the
-      // earlier unsent prompt instead of stacking duplicates.
-      [internalQueueKeyField]: "whiteboard:" + index,
-    }, preparation)) throw new Error("failed to retain whiteboard feedback");
+    if (
+      !enqueuePrompt(
+        {
+          uid: "",
+          prompt: promptText,
+          selector: "",
+          tag: "whiteboard",
+          text: "Whiteboard: diagram " + (index + 1),
+          target: {
+            type: "excalidraw-scene",
+            diagramIndex: index,
+            diagramId,
+            sourceHash: String(message.sourceHash || ""),
+            scenePath: String(files.scene_path || ""),
+            previewPath: String(files.preview_path || ""),
+            imageFallback: Boolean(message.imageFallback),
+            stats: message.stats && typeof message.stats === "object" ? message.stats : {},
+          },
+          // Re-queueing the same diagram's whiteboard before sending replaces the
+          // earlier unsent prompt instead of stacking duplicates.
+          [internalQueueKeyField]: "whiteboard:" + index,
+        },
+        preparation,
+      )
+    )
+      throw new Error("failed to retain whiteboard feedback");
     // Queued from the whiteboard inside the artifact, like any other in-artifact prompt.
     pulseSheetDock();
     postToWhiteboard(index, mode, { type: "lavish-whiteboard:queueResult", ok: true });
