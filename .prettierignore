@@ -6,5 +6,8 @@ node_modules
 lavish-code-review.html
 package-lock.json
 CHANGELOG.md
+plugin.json
 .agents
 .claude/settings.local.json
+# Canonical two-line @AGENTS.md pointer; prettier would add a blank line.
+CLAUDE.md
