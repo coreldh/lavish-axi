@@ -1002,17 +1002,6 @@ test("the share dialog hands back the site id alongside the update key it tells 
   );
 });
 
-test("copy DOM snapshot requests a fresh snapshot and copies it to the clipboard", async () => {
-  const js = await chromeClientSource();
-
-  assert.match(js, /const snapshotRequests = new Map\(\)/);
-  assert.match(js, /requestSnapshot\("copy"\)/);
-  assert.match(js, /snapshotRequests\.set\(requestId, request\)/);
-  assert.match(js, /completeSnapshotRequest\(msg\.snapshot_request_id, msg\.snapshot \|\| ""\)/);
-  assert.match(js, /if \(request\.action === "copy"\)/);
-  assert.match(js, /copyText\(snapshot \|\| ""\)/);
-});
-
 test("clipboard copy falls back when navigator clipboard rejects", async () => {
   const js = await chromeClientSource();
 
@@ -1100,17 +1089,6 @@ test("composer offers two always-visible top-level send actions", async () => {
   assert.doesNotMatch(html, /id="sendFromMenu"/);
   assert.match(css, /\.button-danger\{[^}]*color:var\(--danger\)/);
   assert.match(css, /\.actions\{[^}]*min-width:0/);
-});
-
-test("send and end submits queued prompts before ending the session", async () => {
-  const js = await chromeClientSource();
-
-  assert.match(js, /let endAfterSubmit = false/);
-  assert.match(js, /sendQueued\(true\)/);
-  assert.match(js, /if \(shouldEndSession\) body\.endSession = true/);
-  assert.match(js, /if \(shouldEndSession\) \{\n {4}endAfterSubmit = false;\n {4}markSessionEnded\(\)/);
-  assert.match(js, /if \(!succeeded\) \{\n {6}endAfterSubmit = false/);
-  assert.doesNotMatch(js, /await endSession\(\)/);
 });
 
 test("chrome only marks session ended after the end request succeeds", async () => {
@@ -1320,25 +1298,6 @@ test("chrome keeps queued prompts persisted until submit succeeds", async () => 
   assert.match(js, /for \(const prompt of prompts\) \{/);
   assert.match(js, /const index = queued\.indexOf\(prompt\)/);
   assert.match(js, /if \(index !== -1\) queued\.splice\(index, 1\)/);
-});
-
-test("chrome ignores concurrent queued prompt submits", async () => {
-  const js = await chromeClientSource();
-
-  assert.match(js, /let submitQueuedPromise = null/);
-  assert.match(js, /if \(submitQueuedPromise\) \{/);
-  assert.match(js, /return submitQueuedPromise/);
-  assert.match(js, /submitQueuedPromise = null/);
-});
-
-test("chrome submits prompts queued during an in-flight submit", async () => {
-  const js = await chromeClientSource();
-
-  assert.match(js, /let submitQueuedAgain = false/);
-  assert.match(js, /submitQueuedAgain = true/);
-  assert.match(js, /const shouldSubmitAgain = submitQueuedAgain/);
-  assert.match(js, /else if \(!ended && shouldSubmitAgain\) \{\n {6}if \(queued\.length\) \{\n {8}submitQueued\(\)/);
-  assert.match(js, /else if \(endAfterSubmit\) \{\n {8}endAfterSubmit = false;\n {8}endSession\(\)/);
 });
 
 test("/health reports the server version so clients can detect upgrades", async () => {

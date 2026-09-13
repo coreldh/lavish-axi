@@ -183,7 +183,6 @@ const queued = loadQueuedPrompts();
 let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
-let pendingSnapshot = "";
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -211,13 +210,13 @@ let layoutGateTimer;
 let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionData.initialLayoutWarnings : [];
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
-/** @type {Map<string, { action: "copy" | "submit", timeout?: ReturnType<typeof setTimeout> }>} */
+/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, timeout?: ReturnType<typeof setTimeout> }>} */
 const snapshotRequests = new Map();
 let nextSnapshotRequestId = 0;
-let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
-let submitQueuedAgain = false;
+const pendingSubmissions = [];
+const deliveredPrompts = new WeakSet();
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
@@ -989,9 +988,9 @@ function postToFrame(message) {
   if (frame.contentWindow) frame.contentWindow.postMessage(message, "*");
 }
 
-function requestSnapshot(action) {
+function requestSnapshot(action, prompts = [], endAfter = false) {
   const requestId = "snapshot-" + ++nextSnapshotRequestId;
-  const request = { action };
+  const request = action === "submit" ? { action, prompts, endAfter } : { action };
   snapshotRequests.set(requestId, request);
   if (action === "submit") {
     request.timeout = setTimeout(() => completeSnapshotRequest(requestId, ""), SNAPSHOT_REQUEST_TIMEOUT_MS);
@@ -1015,21 +1014,11 @@ function completeSnapshotRequest(requestId, snapshot) {
     return;
   }
 
-  // This response or timeout submits everything the user had queued up to this
-  // point, so older concurrent submit requests no longer own a batch. Retiring
-  // them now prevents a late response from sending newer, not-yet-sent work.
-  // A Send started after this synchronous pass receives a new request and stays
-  // live; Copy requests are independent and remain pending.
-  for (const [pendingId, pendingRequest] of snapshotRequests) {
-    if (pendingRequest.action !== "submit") continue;
-    snapshotRequests.delete(pendingId);
-    if (pendingRequest.timeout) clearTimeout(pendingRequest.timeout);
-  }
-  pendingSnapshot = snapshot || "";
-  // submitQueuedOnce throws to signal "nothing was delivered" - its own finally
-  // already reset the end intent and it left the queue intact for a retry, so the
-  // rejection has no remaining consumer here.
-  submitQueued().catch(() => {});
+  submitQueued({
+    prompts: request.prompts || [],
+    domSnapshot: snapshot || "",
+    endAfter: request.endAfter === true,
+  }).catch(() => {});
 }
 
 function createChatAttachmentsController() {
@@ -1265,43 +1254,41 @@ function sendQueued(endAfter) {
   hideSendHint(true);
   armSendAcknowledgementWarning();
 
-  if (endAfter && !chipsBlocked) endAfterSubmit = true;
-  requestSnapshot("submit");
+  requestSnapshot("submit", queued.slice(), Boolean(endAfter && !chipsBlocked));
 }
 
-async function submitQueued() {
+async function submitQueued(submission) {
+  pendingSubmissions.push(submission);
   if (submitQueuedPromise) {
-    submitQueuedAgain = true;
     return submitQueuedPromise;
   }
 
-  let succeeded = false;
-  submitQueuedPromise = submitQueuedOnce();
+  submitQueuedPromise = (async () => {
+    try {
+      while (pendingSubmissions.length && !ended) {
+        const next = pendingSubmissions.shift();
+        if (next) await submitQueuedOnce(next);
+      }
+    } catch (error) {
+      pendingSubmissions.splice(0, pendingSubmissions.length);
+      throw error;
+    }
+  })();
   try {
-    const result = await submitQueuedPromise;
-    succeeded = result !== false;
-    return result;
+    return await submitQueuedPromise;
   } finally {
     submitQueuedPromise = null;
-    const shouldSubmitAgain = submitQueuedAgain;
-    submitQueuedAgain = false;
-    if (!succeeded) {
-      endAfterSubmit = false;
-    } else if (!ended && shouldSubmitAgain) {
-      if (queued.length) {
-        submitQueued().catch(() => {});
-      } else if (endAfterSubmit) {
-        endAfterSubmit = false;
-        endSession();
-      }
-    }
   }
 }
 
-async function submitQueuedOnce() {
-  const prompts = queued.slice();
-  const shouldEndSession = endAfterSubmit;
-  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
+async function submitQueuedOnce(submission) {
+  const prompts = submission.prompts.filter((prompt) => !deliveredPrompts.has(prompt));
+  const shouldEndSession = submission.endAfter;
+  if (!prompts.length) {
+    if (shouldEndSession && !ended) await endSession();
+    return;
+  }
+  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: submission.domSnapshot };
   if (shouldEndSession) body.endSession = true;
   let response;
   try {
@@ -1322,12 +1309,10 @@ async function submitQueuedOnce() {
       // for another attempt that will be refused the same way.
       if (data?.status === "ended") {
         clearSendAcknowledgementWarning();
-        endAfterSubmit = false;
         markSessionEnded();
         return false;
       }
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
-      endAfterSubmit = false;
       showQueuedSendFailure(
         "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
       );
@@ -1349,6 +1334,7 @@ async function submitQueuedOnce() {
     throw new Error("failed to submit queued prompts");
   }
   for (const prompt of prompts) {
+    deliveredPrompts.add(prompt);
     const index = queued.indexOf(prompt);
     if (index !== -1) queued.splice(index, 1);
   }
@@ -1358,7 +1344,6 @@ async function submitQueuedOnce() {
   hideSendHint(true);
   if (queued.length) armSendAcknowledgementWarning();
   if (shouldEndSession) {
-    endAfterSubmit = false;
     markSessionEnded();
     return;
   }

@@ -59,6 +59,7 @@ async function createChromeHarness({
   const beginRequests = [];
   const artifactBeginRequests = [];
   const focusLog = [];
+  const clipboardWrites = [];
   let activeElement = null;
   let nextTimerId = 1;
   let reloadCount = 0;
@@ -287,7 +288,13 @@ async function createChromeHarness({
         reloadCount += 1;
       },
     },
-    navigator: {},
+    navigator: {
+      clipboard: {
+        async writeText(value) {
+          clipboardWrites.push(String(value));
+        },
+      },
+    },
     setTimeout: fakeSetTimeout,
     URL: {
       createObjectURL() {
@@ -397,6 +404,7 @@ async function createChromeHarness({
     frame,
     postedToFrame,
     postedToWhiteboard,
+    clipboardWrites,
     createInlineWhiteboard() {
       const posted = [];
       // A real inline whiteboard frame is created by the SDK inside the
@@ -661,6 +669,76 @@ test("a queued send falls back without a snapshot and ignores a late snapshot", 
     chrome.queued().map((prompt) => prompt.prompt),
     ["Keep this for later"],
     "a late snapshot must not submit newer work the user has not sent",
+  );
+});
+
+test("Copy snapshot stays independent while a Send snapshot is pending", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+  chrome.element("chatInput").value = "Wait for this snapshot";
+
+  chrome.element("send").click();
+  const submitRequest = chrome.postedToFrame.at(-1);
+  chrome.element("copySnapshot").click();
+  const copyRequest = chrome.postedToFrame.at(-1);
+  assert.notEqual(copyRequest.snapshot_request_id, submitRequest.snapshot_request_id);
+
+  chrome.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "uid=7 copied body",
+    snapshot_request_id: copyRequest.snapshot_request_id,
+  });
+  await flushPromises();
+
+  assert.deepEqual(chrome.clipboardWrites, ["uid=7 copied body"]);
+  assert.equal(posts.length, 0, "the Copy reply must not complete the pending Send");
+
+  chrome.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "uid=8 submitted body",
+    snapshot_request_id: submitRequest.snapshot_request_id,
+  });
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].body.domSnapshot, "uid=8 submitted body");
+});
+
+test("a Send only submits prompts present when that action started", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url, init = {}) => {
+      posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true };
+    },
+  });
+  chrome.element("chatInput").value = "First batch";
+
+  chrome.element("send").click();
+  const firstRequest = chrome.postedToFrame.at(-1);
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Later work", selector: "h2", tag: "annotation", text: "Later" },
+  });
+  chrome.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "uid=1 body",
+    snapshot_request_id: firstRequest.snapshot_request_id,
+  });
+  await flushPromises();
+
+  assert.deepEqual(
+    posts[0].body.prompts.map((prompt) => prompt.prompt),
+    ["First batch"],
+  );
+  assert.deepEqual(
+    chrome.queued().map((prompt) => prompt.prompt),
+    ["Later work"],
   );
 });
 
