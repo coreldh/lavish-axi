@@ -5,6 +5,7 @@ const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
 const queueStorageKey = "lavish-axi:queued:" + key;
+const terminalStorageKey = "lavish-axi:terminal:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
 // triage can never leak into another artifact's.
 const warningSelectionStorageKey = "lavish-axi:warning-selection:" + key;
@@ -183,7 +184,6 @@ const queued = loadQueuedPrompts();
 let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
-let pendingSnapshot = "";
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
 const layoutGateMaxHoldMs =
@@ -211,11 +211,23 @@ let layoutGateTimer;
 let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionData.initialLayoutWarnings : [];
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
-const snapshotRequests = [];
-let endAfterSubmit = false;
+/** @typedef {{ done: Promise<boolean>, finish: (succeeded: boolean) => void }} FeedbackPreparation */
+/** @typedef {{ prompts: any[], inFlight: boolean }} TerminalSubmission */
+/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, acknowledgement?: object, timeout?: ReturnType<typeof setTimeout> }>} */
+const snapshotRequests = new Map();
+let nextSnapshotRequestId = 0;
 let workingBubble = null;
 let submitQueuedPromise = null;
-let submitQueuedAgain = false;
+const pendingSubmissions = [];
+const deliveredPrompts = new WeakSet();
+const pendingAcknowledgements = new Set();
+/** @type {Set<FeedbackPreparation>} */
+const feedbackPreparations = new Set();
+/** @type {TerminalSubmission | null} */
+let terminalSubmission =
+  loadJsonState(terminalStorageKey, false) === true && queued.length
+    ? { prompts: queued.slice(), inFlight: false }
+    : null;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
@@ -249,10 +261,17 @@ const HEALTH_PROBE_TIMEOUT_MS = 4000;
 // batch. Bound that whole wait so a missing SDK response or a browser/network stall can never look
 // like a dead button while the user's queue remains safely stored in this tab.
 const SEND_ACKNOWLEDGEMENT_WARNING_MS = 10_000;
+const TERMINAL_PREPARATION_TIMEOUT_MS = 5000;
+// A DOM snapshot adds useful context, but the reviewer's own words are the payload.
+// If the artifact frame navigated away from the injected SDK (or otherwise stopped
+// answering), deliver those words without a snapshot instead of waiting forever.
+const SNAPSHOT_REQUEST_TIMEOUT_MS = 1500;
 const SEND_STALLED_COPY =
   "Still trying to send. Your feedback is saved in this tab. Keep this tab open while Lavish catches up, and check that the server is running.";
 const SEND_FAILED_COPY =
   "Could not send. Your feedback is still queued in this tab. Check that Lavish is running, then click Send to Agent to retry.";
+const TERMINAL_SEND_FAILED_COPY =
+  "Could not send. Your terminal feedback is still queued in this tab. Check that Lavish is running, then click Send & End to retry the same batch.";
 const HEALTH_NO_ANSWER_TITLE = "Lavish did not answer.";
 const HEALTH_NO_ANSWER_COPY =
   "Lavish did not answer the check, so this page cannot tell whether it is running. Try again in a moment.";
@@ -274,6 +293,9 @@ let copyHintTimer;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
 let sendHintPersistent = false;
+/** @type {{ kind: "preparation" | "submission" | "terminal", operation: object, preparationType?: string } | null} */
+let sendFailureOwner = null;
+let sendAcknowledgementWarningVisible = false;
 
 function artifactFrameSrcForLoad(load) {
   const separator = artifactSrc.includes("?") ? "&" : "?";
@@ -380,6 +402,15 @@ function persistQueuedPrompts() {
   }
 }
 
+function persistTerminalReservation(reserved) {
+  try {
+    if (reserved) sessionStorage.setItem(terminalStorageKey, "true");
+    else sessionStorage.removeItem(terminalStorageKey);
+  } catch {
+    // Session storage can be unavailable; the in-memory reservation still protects this page.
+  }
+}
+
 function promptTargetLabel(prompt) {
   if (prompt?.target?.type === "table-cell") {
     const semantic = [prompt.target.rowLabel, prompt.target.columnLabel].filter(Boolean).join(" → ");
@@ -423,6 +454,7 @@ function render() {
 
   for (const button of annotationPills.querySelectorAll(".pill-close")) {
     const closeButton = /** @type {HTMLButtonElement} */ (button);
+    closeButton.disabled = terminalSubmission !== null;
     closeButton.addEventListener("click", (event) => removeQueuedPrompt(Number(closeButton.dataset.index), event));
   }
   updateSendState();
@@ -431,8 +463,17 @@ function render() {
 }
 
 function updateSendState() {
-  sendButton.disabled = ended;
-  sendAndEndButton.disabled = sendButton.disabled;
+  const terminalReserved = terminalSubmission !== null;
+  // A terminal send owns the exact review batch, so freeze interactions inside the
+  // artifact without disabling annotation mode. Disabling annotation mode closes the
+  // SDK card and destroys an unsent draft before delivery has actually succeeded.
+  frame.inert = ended || terminalReserved;
+  sendButton.disabled = ended || terminalReserved;
+  sendAndEndButton.disabled = ended || Boolean(terminalSubmission?.inFlight);
+  annotationSwitch.disabled = ended || terminalReserved;
+  chatInput.disabled = ended || terminalReserved;
+  chatAttachButton.disabled = ended || terminalReserved;
+  endButton.disabled = ended || terminalReserved;
   if (warningsQueueButton) updateWarningSelectionState();
 }
 
@@ -513,24 +554,45 @@ function hideSendHint(force = false) {
   sendHint.textContent = DEFAULT_SEND_HINT;
   sendHint.classList.remove("persistent");
   sendHintPersistent = false;
+  sendAcknowledgementWarningVisible = false;
 }
 
 function armSendAcknowledgementWarning() {
-  if (sendAcknowledgementTimer || !queued.length) return;
+  if (sendAcknowledgementTimer || pendingAcknowledgements.size === 0) return;
   sendAcknowledgementTimer = setTimeout(() => {
     sendAcknowledgementTimer = undefined;
-    if (queued.length) showSendHint(SEND_STALLED_COPY, null, false);
+    if (pendingAcknowledgements.size > 0 && !sendFailureOwner) {
+      sendAcknowledgementWarningVisible = true;
+      showSendHint(SEND_STALLED_COPY, null, false);
+    }
   }, SEND_ACKNOWLEDGEMENT_WARNING_MS);
 }
 
 function clearSendAcknowledgementWarning() {
   clearTimeout(sendAcknowledgementTimer);
   sendAcknowledgementTimer = undefined;
+  sendAcknowledgementWarningVisible = false;
 }
 
-function showQueuedSendFailure(message = SEND_FAILED_COPY) {
+function showQueuedSendFailure(message = SEND_FAILED_COPY, owner = null) {
+  showPersistentSendFailure(message, true, owner);
+}
+
+function showPersistentSendFailure(message, requireQueuedFeedback = false, owner = null) {
   clearSendAcknowledgementWarning();
-  if (queued.length) showSendHint(message, null, false);
+  if (requireQueuedFeedback && !queued.length) return;
+  sendFailureOwner = owner;
+  showSendHint(message, null, false);
+}
+
+function clearPersistentSendFailure() {
+  sendFailureOwner = null;
+  hideSendHint(true);
+}
+
+function clearPreparationFailure(preparationType) {
+  if (sendFailureOwner?.kind !== "preparation" || sendFailureOwner.preparationType !== preparationType) return;
+  clearPersistentSendFailure();
 }
 
 function setMenuOpen(button, menu, open) {
@@ -939,11 +1001,12 @@ function scrollElementIntoView(el) {
 
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
+  if (terminalSubmission) return;
   queued.splice(index, 1);
   persistQueuedPrompts();
   if (!queued.length) {
     clearSendAcknowledgementWarning();
-    hideSendHint(true);
+    clearPersistentSendFailure();
   }
   render();
 }
@@ -952,9 +1015,28 @@ function promptQueueKey(prompt) {
   return prompt && typeof prompt[internalQueueKeyField] === "string" ? prompt[internalQueueKeyField].trim() : "";
 }
 
-function enqueuePrompt(rawPrompt) {
+function beginFeedbackPreparation() {
+  if (ended || terminalSubmission) return null;
+  /** @type {(succeeded: boolean) => void} */
+  let finishPromise = () => {};
+  const done = new Promise((resolve) => {
+    finishPromise = resolve;
+  });
+  const preparation = {
+    done,
+    finish(succeeded) {
+      if (!feedbackPreparations.delete(preparation)) return;
+      finishPromise(succeeded);
+    },
+  };
+  feedbackPreparations.add(preparation);
+  return preparation;
+}
+
+function enqueuePrompt(rawPrompt, /** @type {FeedbackPreparation | null} */ preparation = null) {
+  if ((preparation && !feedbackPreparations.has(preparation)) || (terminalSubmission && !preparation)) return false;
   const prompt = sanitizeQueuedPrompt(rawPrompt);
-  if (!prompt) return;
+  if (!prompt) return false;
 
   const queueKey = promptQueueKey(prompt);
   if (queueKey) {
@@ -970,6 +1052,7 @@ function enqueuePrompt(rawPrompt) {
 
   persistQueuedPrompts();
   render();
+  return true;
 }
 
 function stripInternalPromptFields(prompt) {
@@ -983,9 +1066,42 @@ function postToFrame(message) {
   if (frame.contentWindow) frame.contentWindow.postMessage(message, "*");
 }
 
-function requestSnapshot(action) {
-  snapshotRequests.push(action);
-  postToFrame({ type: "lavish:requestSnapshot" });
+function requestSnapshot(action, prompts = [], endAfter = false, terminal = null) {
+  const requestId = "snapshot-" + ++nextSnapshotRequestId;
+  const request = action === "submit" ? { action, prompts, endAfter, terminal } : { action };
+  snapshotRequests.set(requestId, request);
+  if (action === "submit") {
+    request.acknowledgement = {};
+    pendingAcknowledgements.add(request.acknowledgement);
+    armSendAcknowledgementWarning();
+    request.timeout = setTimeout(() => completeSnapshotRequest(requestId, ""), SNAPSHOT_REQUEST_TIMEOUT_MS);
+  }
+  postToFrame({ type: "lavish:requestSnapshot", snapshot_request_id: requestId });
+}
+
+function takeSnapshotRequest(requestId) {
+  if (typeof requestId !== "string" || !requestId || !snapshotRequests.has(requestId)) return null;
+  const request = snapshotRequests.get(requestId);
+  snapshotRequests.delete(requestId);
+  if (request?.timeout) clearTimeout(request.timeout);
+  return request || null;
+}
+
+function completeSnapshotRequest(requestId, snapshot) {
+  const request = takeSnapshotRequest(requestId);
+  if (!request) return;
+  if (request.action === "copy") {
+    copyText(snapshot || "");
+    return;
+  }
+
+  submitQueued({
+    prompts: request.prompts || [],
+    domSnapshot: snapshot || "",
+    endAfter: request.endAfter === true,
+    terminal: request.terminal || null,
+    acknowledgement: request.acknowledgement || null,
+  }).catch(() => {});
 }
 
 function createChatAttachmentsController() {
@@ -1188,6 +1304,10 @@ const chatAttachmentController = createChatAttachmentsController();
 
 function sendQueued(endAfter) {
   if (ended) return;
+  if (terminalSubmission) {
+    if (endAfter && !terminalSubmission.inFlight) retryTerminalSubmission();
+    return;
+  }
   closeMenus();
 
   // A pending or failed chip holds back only the COMPOSER message (and an
@@ -1214,50 +1334,137 @@ function sendQueued(endAfter) {
       chatAttachmentController.reset();
     }
   }
-  if (!queued.length) {
+  const shouldEnd = Boolean(endAfter && !chipsBlocked);
+  const preparations = shouldEnd ? [...feedbackPreparations] : [];
+  if (!queued.length && preparations.length === 0) {
     if (!chipsBlocked) showSendHint();
     return;
   }
-  hideSendHint(true);
-  armSendAcknowledgementWarning();
-
-  if (endAfter && !chipsBlocked) endAfterSubmit = true;
-  requestSnapshot("submit");
+  if (!sendFailureOwner) hideSendHint(true);
+  if (shouldEnd) {
+    const terminal = {
+      prompts: [],
+      inFlight: true,
+    };
+    terminalSubmission = terminal;
+    updateSendState();
+    finishTerminalPreparation(terminal, preparations);
+    return;
+  }
+  requestSnapshot("submit", queued.slice(), false, null);
 }
 
-async function submitQueued() {
+function finishTerminalPreparation(terminal, preparations) {
+  if (preparations.length === 0) {
+    completeTerminalPreparation(terminal, []);
+    return;
+  }
+  const timeout = setTimeout(() => {
+    if (terminalSubmission !== terminal || ended) return;
+    for (const preparation of preparations) preparation.finish(false);
+    showPersistentSendFailure(
+      "Could not finish preparing all feedback within 5 seconds. This review remains open, and existing queued feedback is still editable.",
+      false,
+      { kind: "preparation", operation: terminal, preparationType: "terminal" },
+    );
+    releaseTerminalSubmission(terminal);
+  }, TERMINAL_PREPARATION_TIMEOUT_MS);
+  Promise.all(preparations.map((preparation) => preparation.done)).then((results) => {
+    clearTimeout(timeout);
+    completeTerminalPreparation(terminal, results);
+  });
+}
+
+function completeTerminalPreparation(terminal, results) {
+  if (terminalSubmission !== terminal || ended) return;
+  if (results.some((succeeded) => !succeeded)) {
+    releaseTerminalSubmission(terminal);
+    return;
+  }
+  terminal.prompts = queued.slice();
+  if (!terminal.prompts.length) {
+    releaseTerminalSubmission(terminal);
+    showSendHint();
+    return;
+  }
+  clearPreparationFailure("terminal");
+  // Only make the reservation durable once every preparation has joined the exact
+  // batch. A reload before this point must restore an ordinary editable queue, not
+  // an incomplete terminal submission.
+  persistTerminalReservation(true);
+  requestSnapshot("submit", terminal.prompts, true, terminal);
+}
+
+function retryTerminalSubmission() {
+  if (!terminalSubmission || terminalSubmission.inFlight || ended) return;
+  terminalSubmission.inFlight = true;
+  updateSendState();
+  requestSnapshot("submit", terminalSubmission.prompts, true, terminalSubmission);
+}
+
+function markTerminalSubmissionFailed(submission) {
+  if (!terminalSubmission || submission.terminal !== terminalSubmission || ended) return;
+  terminalSubmission.inFlight = false;
+  updateSendState();
+}
+
+function releaseTerminalSubmission(terminal) {
+  if (terminalSubmission !== terminal || ended) return;
+  terminalSubmission = null;
+  persistTerminalReservation(false);
+  render();
+}
+
+async function submitQueued(submission) {
+  pendingSubmissions.push(submission);
   if (submitQueuedPromise) {
-    submitQueuedAgain = true;
     return submitQueuedPromise;
   }
 
-  let succeeded = false;
-  submitQueuedPromise = submitQueuedOnce();
-  try {
-    const result = await submitQueuedPromise;
-    succeeded = result !== false;
-    return result;
-  } finally {
-    submitQueuedPromise = null;
-    const shouldSubmitAgain = submitQueuedAgain;
-    submitQueuedAgain = false;
-    if (!succeeded) {
-      endAfterSubmit = false;
-    } else if (!ended && shouldSubmitAgain) {
-      if (queued.length) {
-        submitQueued().catch(() => {});
-      } else if (endAfterSubmit) {
-        endAfterSubmit = false;
-        endSession();
+  submitQueuedPromise = (async () => {
+    /** @type {unknown} */
+    let firstError = null;
+    while (pendingSubmissions.length && !ended) {
+      const next = pendingSubmissions.shift();
+      if (!next) continue;
+      try {
+        const result = await submitQueuedOnce(next, firstError !== null);
+        if (result === false) markTerminalSubmissionFailed(next);
+      } catch (error) {
+        markTerminalSubmissionFailed(next);
+        if (firstError === null) firstError = error;
+      } finally {
+        if (next.acknowledgement) pendingAcknowledgements.delete(next.acknowledgement);
       }
     }
+    if (firstError !== null) throw firstError;
+  })();
+  try {
+    return await submitQueuedPromise;
+  } finally {
+    submitQueuedPromise = null;
   }
 }
 
-async function submitQueuedOnce() {
-  const prompts = queued.slice();
-  const shouldEndSession = endAfterSubmit;
-  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
+async function submitQueuedOnce(submission, preserveFailureState = false) {
+  const prompts = submission.prompts.filter((prompt) => !deliveredPrompts.has(prompt));
+  const shouldEndSession = submission.endAfter;
+  if (!prompts.length) {
+    if (shouldEndSession && !ended) {
+      try {
+        await endSession(submission.terminal);
+      } catch (error) {
+        showPersistentSendFailure(TERMINAL_SEND_FAILED_COPY, false, {
+          kind: "terminal",
+          operation: submission.terminal,
+        });
+        throw error;
+      }
+    }
+    settleAcknowledgementGuidance(submission, preserveFailureState);
+    return;
+  }
+  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: submission.domSnapshot };
   if (shouldEndSession) body.endSession = true;
   let response;
   try {
@@ -1266,11 +1473,33 @@ async function submitQueuedOnce() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
+    // The DOM snapshot is optional context and can be the difference between a
+    // useful terminal batch and Express' request-size limit. Retry exactly once
+    // without it; never mutate or split the user's exact feedback batch.
+    if (response.status === 413 && body.domSnapshot) {
+      body.domSnapshot = "";
+      response = await fetch("/api/" + key + "/prompts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
   } catch (error) {
-    showQueuedSendFailure();
+    showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY, {
+      kind: submission.terminal ? "terminal" : "submission",
+      operation: submission.terminal || submission,
+    });
     throw error;
   }
   if (!response.ok) {
+    if (response.status === 413) {
+      showQueuedSendFailure(
+        "Could not send because this feedback is too large. It is still queued. Remove some feedback or attachments, then try again.",
+        { kind: "submission", operation: submission },
+      );
+      if (submission.terminal) releaseTerminalSubmission(submission.terminal);
+      throw new Error("queued feedback exceeds the request size limit");
+    }
     if (response.status === 409) {
       const data = await response.json().catch(() => null);
       // The session already ended before this batch arrived - most likely this chrome missed the
@@ -1278,16 +1507,16 @@ async function submitQueuedOnce() {
       // for another attempt that will be refused the same way.
       if (data?.status === "ended") {
         clearSendAcknowledgementWarning();
-        endAfterSubmit = false;
         markSessionEnded();
         return false;
       }
       if (Array.isArray(data?.warnings)) setLayoutWarnings(data.warnings);
-      endAfterSubmit = false;
       showQueuedSendFailure(
         "Could not send because the layout issue selection changed. Your feedback is still queued. Review the current issues, then click Send to Agent to retry.",
+        { kind: "submission", operation: submission },
       );
-      return false;
+      if (submission.terminal) releaseTerminalSubmission(submission.terminal);
+      return;
     }
     // C4: the server persisted nothing (atomic reject) - the queue below is left
     // intact because the splice only runs on success. Surface exactly what failed
@@ -1295,29 +1524,62 @@ async function submitQueuedOnce() {
     if (response.status === 400) {
       const detail = await response.json().catch(() => ({}));
       if (Array.isArray(detail.rejected) && detail.rejected.length) {
-        showQueuedSendFailure(describeAttachmentRejection(detail.rejected, detail.caps));
+        showQueuedSendFailure(describeAttachmentRejection(detail.rejected, detail.caps), {
+          kind: "submission",
+          operation: submission,
+        });
+        if (submission.terminal) releaseTerminalSubmission(submission.terminal);
       } else {
-        showQueuedSendFailure();
+        showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY, {
+          kind: submission.terminal ? "terminal" : "submission",
+          operation: submission.terminal || submission,
+        });
       }
     } else {
-      showQueuedSendFailure();
+      showQueuedSendFailure(submission.terminal ? TERMINAL_SEND_FAILED_COPY : SEND_FAILED_COPY, {
+        kind: submission.terminal ? "terminal" : "submission",
+        operation: submission.terminal || submission,
+      });
     }
     throw new Error("failed to submit queued prompts");
   }
   for (const prompt of prompts) {
+    deliveredPrompts.add(prompt);
     const index = queued.indexOf(prompt);
     if (index !== -1) queued.splice(index, 1);
   }
   persistQueuedPrompts();
   render();
-  clearSendAcknowledgementWarning();
-  hideSendHint(true);
-  if (queued.length) armSendAcknowledgementWarning();
+  settleAcknowledgementGuidance(submission, preserveFailureState);
   if (shouldEndSession) {
-    endAfterSubmit = false;
     markSessionEnded();
     return;
   }
+}
+
+function submissionResolvesSendFailure(submission) {
+  if (!sendFailureOwner) return true;
+  if (sendFailureOwner.kind === "preparation") return false;
+  if (sendFailureOwner.kind === "terminal") return sendFailureOwner.operation === submission.terminal;
+  const failedSubmission = sendFailureOwner.operation;
+  return (
+    failedSubmission === submission ||
+    (Array.isArray(failedSubmission.prompts) &&
+      failedSubmission.prompts.every((prompt) => deliveredPrompts.has(prompt)))
+  );
+}
+
+function settleAcknowledgementGuidance(submission, preserveFailureState) {
+  if (!submissionResolvesSendFailure(submission) || (preserveFailureState && queued.length)) return;
+  const hasLaterAcknowledgement = [...pendingAcknowledgements].some(
+    (acknowledgement) => acknowledgement !== submission.acknowledgement,
+  );
+  if (hasLaterAcknowledgement) {
+    if (!sendAcknowledgementTimer && !sendAcknowledgementWarningVisible) armSendAcknowledgementWarning();
+    return;
+  }
+  clearSendAcknowledgementWarning();
+  clearPersistentSendFailure();
 }
 
 function normalizeLayoutFindings(value) {
@@ -1758,7 +2020,7 @@ function updateWarningSelectionState() {
   warningsSelectAll.checked = selectable.length > 0 && selectedCount === selectable.length;
   warningsSelectAll.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
   warningsSelected.textContent = selectedCount === 0 ? "None selected" : selectedCount + " selected";
-  warningsQueueButton.disabled = selectedCount === 0 || ended;
+  warningsQueueButton.disabled = selectedCount === 0 || ended || terminalSubmission !== null;
 }
 
 function toggleSelectAllWarnings() {
@@ -1815,10 +2077,15 @@ async function dismissWarning(id) {
 // One queued batch = one ordinary queued prompt. The CLI cannot tell it apart from any other
 // feedback, which is exactly the point: no parallel agent protocol.
 async function queueSelectedWarningFixes() {
-  if (ended) return;
+  const preparation = beginFeedbackPreparation();
+  if (!preparation) return;
   const ids = [...selectedWarningIds];
-  if (ids.length === 0) return;
+  if (ids.length === 0) {
+    preparation.finish(true);
+    return;
+  }
   warningsQueueButton.disabled = true;
+  let succeeded = false;
   try {
     const response = await fetch("/api/" + key + "/layout-warnings/queue", {
       method: "POST",
@@ -1828,21 +2095,36 @@ async function queueSelectedWarningFixes() {
     if (!response.ok) throw new Error("failed to queue layout warning fixes");
     const data = await response.json();
     if (data.prompt) {
-      enqueuePrompt({
-        uid: "",
-        prompt: data.prompt.prompt,
-        selector: "",
-        tag: "layout-warnings",
-        text: data.prompt.text,
-        target: data.prompt.target,
-      });
+      if (
+        !enqueuePrompt(
+          {
+            uid: "",
+            prompt: data.prompt.prompt,
+            selector: "",
+            tag: "layout-warnings",
+            text: data.prompt.text,
+            target: data.prompt.target,
+          },
+          preparation,
+        )
+      )
+        throw new Error("failed to retain layout warning fixes");
     }
     selectedWarningIds.clear();
     persistWarningSelection();
     if (Array.isArray(data.warnings)) setLayoutWarnings(data.warnings);
     closeWarningsDrawer({ restoreFocus: true });
+    clearPreparationFailure("layout-warnings");
+    succeeded = true;
   } catch {
+    showPersistentSendFailure(
+      "Could not prepare the selected layout fixes. Review the current issues and try again.",
+      false,
+      { kind: "preparation", operation: preparation, preparationType: "layout-warnings" },
+    );
     updateWarningSelectionState();
+  } finally {
+    preparation.finish(succeeded);
   }
 }
 
@@ -1857,8 +2139,8 @@ async function refreshLayoutWarnings() {
   }
 }
 
-async function endSession() {
-  if (ended) return;
+async function endSession(terminal = null) {
+  if (ended || (terminalSubmission && terminal !== terminalSubmission)) return;
   const response = await fetch("/api/" + key + "/end", { method: "POST" });
   if (!response.ok) throw new Error("failed to end session");
   markSessionEnded();
@@ -1867,6 +2149,10 @@ async function endSession() {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  pendingAcknowledgements.clear();
+  clearSendAcknowledgementWarning();
+  terminalSubmission = null;
+  persistTerminalReservation(false);
   cancelArtifactLoadRecovery();
   closeMenus();
   closeShareDialog();
@@ -2619,7 +2905,17 @@ function whiteboardSummaryText(summaryLines) {
 }
 
 async function queueWhiteboardFeedback(index, message, mode) {
+  const preparation = beginFeedbackPreparation();
+  if (!preparation) {
+    postToWhiteboard(index, mode, {
+      type: "lavish-whiteboard:queueResult",
+      ok: false,
+      error: "Feedback delivery is already ending this review.",
+    });
+    return;
+  }
   const diagramId = whiteboardRecord(index).diagramId;
+  let succeeded = false;
   try {
     // Persist the exact reviewed state before queueing, so the paths in the
     // prompt point at what the user actually saw.
@@ -2643,36 +2939,46 @@ async function queueWhiteboardFeedback(index, message, mode) {
       "\n\nEdited scene JSON: " +
       String(files.scene_path || "") +
       (files.preview_path ? "\nPNG preview: " + String(files.preview_path) : "");
-    enqueuePrompt({
-      uid: "",
-      prompt: promptText,
-      selector: "",
-      tag: "whiteboard",
-      text: "Whiteboard: diagram " + (index + 1),
-      target: {
-        type: "excalidraw-scene",
-        diagramIndex: index,
-        diagramId,
-        sourceHash: String(message.sourceHash || ""),
-        scenePath: String(files.scene_path || ""),
-        previewPath: String(files.preview_path || ""),
-        imageFallback: Boolean(message.imageFallback),
-        stats: message.stats && typeof message.stats === "object" ? message.stats : {},
-      },
-      // Re-queueing the same diagram's whiteboard before sending replaces the
-      // earlier unsent prompt instead of stacking duplicates.
-      [internalQueueKeyField]: "whiteboard:" + index,
-    });
+    if (
+      !enqueuePrompt(
+        {
+          uid: "",
+          prompt: promptText,
+          selector: "",
+          tag: "whiteboard",
+          text: "Whiteboard: diagram " + (index + 1),
+          target: {
+            type: "excalidraw-scene",
+            diagramIndex: index,
+            diagramId,
+            sourceHash: String(message.sourceHash || ""),
+            scenePath: String(files.scene_path || ""),
+            previewPath: String(files.preview_path || ""),
+            imageFallback: Boolean(message.imageFallback),
+            stats: message.stats && typeof message.stats === "object" ? message.stats : {},
+          },
+          // Re-queueing the same diagram's whiteboard before sending replaces the
+          // earlier unsent prompt instead of stacking duplicates.
+          [internalQueueKeyField]: "whiteboard:" + index,
+        },
+        preparation,
+      )
+    )
+      throw new Error("failed to retain whiteboard feedback");
     // Queued from the whiteboard inside the artifact, like any other in-artifact prompt.
     pulseSheetDock();
     postToWhiteboard(index, mode, { type: "lavish-whiteboard:queueResult", ok: true });
     if (mode === "overlay") closeWhiteboard();
+    clearPreparationFailure("whiteboard");
+    succeeded = true;
   } catch (error) {
     postToWhiteboard(index, mode, {
       type: "lavish-whiteboard:queueResult",
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    preparation.finish(succeeded);
   }
 }
 
@@ -2987,16 +3293,7 @@ window.addEventListener("message", (event) => {
     pulseSheetDock();
   }
   if (msg.type === "lavish:snapshot") {
-    const snapshotAction = snapshotRequests.shift() || "submit";
-    if (snapshotAction === "copy") {
-      copyText(msg.snapshot || "");
-    } else {
-      pendingSnapshot = msg.snapshot || "";
-      // submitQueuedOnce throws to signal "nothing was delivered" - its own
-      // finally already reset the end intent and it left the queue intact for a
-      // retry, so the rejection has no remaining consumer here.
-      submitQueued().catch(() => {});
-    }
+    completeSnapshotRequest(msg.snapshot_request_id, msg.snapshot || "");
   }
   if (msg.type === "lavish:scroll") {
     lastScroll = { x: Number(msg.x) || 0, y: Number(msg.y) || 0 };
@@ -3150,7 +3447,7 @@ async function uploadAttachment(message, reportResult = postToFrame, signal) {
 loadFrame();
 
 function toggleAnnotationMode() {
-  if (ended) return;
+  if (ended || terminalSubmission) return;
   annotation = !annotation;
   annotationSwitch.setAttribute("aria-pressed", String(annotation));
   postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation });
