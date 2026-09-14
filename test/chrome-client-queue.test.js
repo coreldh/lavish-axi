@@ -142,6 +142,13 @@ async function createChromeHarness({
         if (handler) handler(event);
       },
       querySelectorAll(selector) {
+        if (id === "annotationPills" && selector === ".pill-close") {
+          return [...this.innerHTML.matchAll(/class="pill-close"[^>]*data-index="(\d+)"/g)].map((match) => {
+            const close = element(`annotation-pill-close-${match[1]}`);
+            close.dataset.index = match[1];
+            return close;
+          });
+        }
         const matches = [];
         const walk = (node) => {
           for (const child of node.children || []) {
@@ -630,7 +637,11 @@ test("a queued send falls back without a snapshot and ignores a late snapshot", 
   assert.equal(snapshotRequest.type, "lavish:requestSnapshot");
   assert.equal(typeof snapshotRequest.snapshot_request_id, "string");
 
-  chrome.runTimers(1500);
+  chrome.runTimers(4999);
+  await flushPromises();
+  assert.equal(posts.length, 0, "the snapshot wait does not fall back before five seconds");
+
+  chrome.runTimers(5000);
   await flushPromises();
   await flushPromises();
 
@@ -1100,7 +1111,7 @@ test("Send & End falls back without a snapshot and preserves the atomic end inte
   chrome.element("chatInput").value = "Final answer";
 
   chrome.element("sendAndEnd").click();
-  chrome.runTimers(1500);
+  chrome.runTimers(5000);
   await flushPromises();
   await flushPromises();
 
@@ -1412,7 +1423,7 @@ test("a failed timeout fallback keeps the queue and a timely retry sends it once
   });
 
   chrome.element("send").click();
-  chrome.runTimers(1500);
+  chrome.runTimers(5000);
   await flushPromises();
   await flushPromises();
 
@@ -1428,7 +1439,7 @@ test("a failed timeout fallback keeps the queue and a timely retry sends it once
   chrome.sendSnapshot("uid=1 retry");
   await flushPromises();
   await flushPromises();
-  chrome.runTimers(1500);
+  chrome.runTimers(5000);
   await flushPromises();
 
   assert.equal(promptPostAttempts, 2, "the timely snapshot cancels its fallback timer");
@@ -2861,6 +2872,73 @@ test("an unrelated successful send preserves layout preparation failure guidance
   assert.equal(chrome.element("sendHint").hidden, false);
   assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
   assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+});
+
+test("removing the final unrelated prompt preserves layout preparation failure guidance", async () => {
+  const chrome = await createChromeHarness({
+    storedQueue: [{ uid: "", prompt: "Queued separately", selector: "h1", tag: "element", text: "Heading" }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/layout-warnings/queue")) return { ok: false, status: 500 };
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+
+  await chrome.element("warningsQueueButton").onclick();
+  await flushPromises();
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+
+  const [removeButton] = chrome.element("annotationPills").querySelectorAll(".pill-close");
+  assert.ok(removeButton, "the queued prompt exposes its removal control");
+  removeButton.click({ stopPropagation() {} });
+
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+});
+
+test("an older failed send cannot overwrite a newer layout preparation failure", async () => {
+  let rejectSend = () => {};
+  const send = new Promise((_, reject) => {
+    rejectSend = () => reject(new Error("network unavailable"));
+  });
+  const chrome = await createChromeHarness({
+    storedQueue: [{ uid: "", prompt: "Already sending", selector: "h1", tag: "element", text: "Heading" }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) return send;
+      if (String(url).endsWith("/layout-warnings/queue")) return { ok: false, status: 500 };
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.element("send").click();
+  chrome.sendSnapshot("older snapshot");
+  await flushPromises();
+
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+  await chrome.element("warningsQueueButton").onclick();
+  await flushPromises();
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+
+  rejectSend();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Send to Agent to retry/i);
 });
 
 test("a successful retry of the failed preparation clears its stale error", async () => {

@@ -265,7 +265,7 @@ const TERMINAL_PREPARATION_TIMEOUT_MS = 5000;
 // A DOM snapshot adds useful context, but the reviewer's own words are the payload.
 // If the artifact frame navigated away from the injected SDK (or otherwise stopped
 // answering), deliver those words without a snapshot instead of waiting forever.
-const SNAPSHOT_REQUEST_TIMEOUT_MS = 1500;
+const SNAPSHOT_REQUEST_TIMEOUT_MS = 5000;
 const SEND_STALLED_COPY =
   "Still trying to send. Your feedback is saved in this tab. Keep this tab open while Lavish catches up, and check that the server is running.";
 const SEND_FAILED_COPY =
@@ -581,6 +581,7 @@ function showQueuedSendFailure(message = SEND_FAILED_COPY, owner = null) {
 function showPersistentSendFailure(message, requireQueuedFeedback = false, owner = null) {
   clearSendAcknowledgementWarning();
   if (requireQueuedFeedback && !queued.length) return;
+  if (sendFailureOwner?.kind === "preparation" && owner?.kind !== "preparation") return;
   sendFailureOwner = owner;
   showSendHint(message, null, false);
 }
@@ -1006,7 +1007,7 @@ function removeQueuedPrompt(index, event) {
   persistQueuedPrompts();
   if (!queued.length) {
     clearSendAcknowledgementWarning();
-    clearPersistentSendFailure();
+    if (sendFailureOwner?.kind !== "preparation") clearPersistentSendFailure();
   }
   render();
 }
