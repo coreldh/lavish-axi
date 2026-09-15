@@ -1472,6 +1472,50 @@ test("an older successful send preserves newer terminal retry guidance", async (
   assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
 });
 
+test("an older late Send failure preserves newer terminal retry guidance", async () => {
+  const posts = [];
+  const chrome = await createChromeHarness({
+    storedQueue: [{ uid: "", prompt: "Shared batch", selector: "h1", tag: "element", text: "Heading" }],
+    fetchImpl: async (url, init = {}) => {
+      if (!String(url).endsWith("/prompts")) return { ok: true, json: async () => ({}) };
+      posts.push(JSON.parse(init.body));
+      throw new Error("network unavailable");
+    },
+  });
+
+  chrome.element("send").click();
+  const ordinaryRequest = chrome.postedToFrame.at(-1);
+  chrome.element("sendAndEnd").click();
+  const terminalRequest = chrome.postedToFrame.at(-1);
+
+  chrome.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "terminal snapshot",
+    snapshot_request_id: terminalRequest.snapshot_request_id,
+  });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].endSession, true);
+  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+
+  chrome.sendFrameMessage({
+    type: "lavish:snapshot",
+    snapshot: "older ordinary snapshot",
+    snapshot_request_id: ordinaryRequest.snapshot_request_id,
+  });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].endSession, undefined);
+  assert.equal(chrome.element("send").disabled, true);
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.match(chrome.element("sendHint").textContent, /click Send & End to retry the same batch/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /click Send to Agent to retry/i);
+});
+
 test("a failed timeout fallback keeps the queue and a timely retry sends it once", async () => {
   let promptPostAttempts = 0;
   const chrome = await createChromeHarness({

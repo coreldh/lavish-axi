@@ -212,10 +212,11 @@ let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionD
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
 /** @typedef {{ done: Promise<boolean>, finish: (succeeded: boolean) => void }} FeedbackPreparation */
-/** @typedef {{ prompts: any[], inFlight: boolean }} TerminalSubmission */
-/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, acknowledgement?: object, timeout?: ReturnType<typeof setTimeout> }>} */
+/** @typedef {{ prompts: any[], inFlight: boolean, order: number }} TerminalSubmission */
+/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, acknowledgement?: object, order?: number, timeout?: ReturnType<typeof setTimeout> }>} */
 const snapshotRequests = new Map();
 let nextSnapshotRequestId = 0;
+let nextSendOperationOrder = 0;
 let workingBubble = null;
 let submitQueuedPromise = null;
 const pendingSubmissions = [];
@@ -225,7 +226,9 @@ const pendingAcknowledgements = new Set();
 const feedbackPreparations = new Set();
 /** @type {TerminalSubmission | null} */
 let terminalSubmission =
-  loadJsonState(terminalStorageKey, false) === true ? { prompts: queued.slice(), inFlight: false } : null;
+  loadJsonState(terminalStorageKey, false) === true
+    ? { prompts: queued.slice(), inFlight: false, order: ++nextSendOperationOrder }
+    : null;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
@@ -580,6 +583,9 @@ function showPersistentSendFailure(message, requireQueuedFeedback = false, owner
   clearSendAcknowledgementWarning();
   if (requireQueuedFeedback && !queued.length) return;
   if (sendFailureOwner?.kind === "preparation") return;
+  const currentOrder = Number(sendFailureOwner?.operation?.order) || 0;
+  const nextOrder = Number(owner?.operation?.order) || 0;
+  if (owner?.kind !== "preparation" && currentOrder > nextOrder) return;
   sendFailureOwner = owner;
   showSendHint(message, null, false);
 }
@@ -1067,7 +1073,10 @@ function postToFrame(message) {
 
 function requestSnapshot(action, prompts = [], endAfter = false, terminal = null) {
   const requestId = "snapshot-" + ++nextSnapshotRequestId;
-  const request = action === "submit" ? { action, prompts, endAfter, terminal } : { action };
+  const request =
+    action === "submit"
+      ? { action, prompts, endAfter, terminal, order: terminal?.order || ++nextSendOperationOrder }
+      : { action };
   snapshotRequests.set(requestId, request);
   if (action === "submit") {
     request.acknowledgement = {};
@@ -1100,6 +1109,7 @@ function completeSnapshotRequest(requestId, snapshot) {
     endAfter: request.endAfter === true,
     terminal: request.terminal || null,
     acknowledgement: request.acknowledgement || null,
+    order: request.order || 0,
   }).catch(() => {});
 }
 
@@ -1344,6 +1354,7 @@ function sendQueued(endAfter) {
     const terminal = {
       prompts: [],
       inFlight: true,
+      order: ++nextSendOperationOrder,
     };
     terminalSubmission = terminal;
     updateSendState();
