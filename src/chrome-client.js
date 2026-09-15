@@ -225,9 +225,7 @@ const pendingAcknowledgements = new Set();
 const feedbackPreparations = new Set();
 /** @type {TerminalSubmission | null} */
 let terminalSubmission =
-  loadJsonState(terminalStorageKey, false) === true && queued.length
-    ? { prompts: queued.slice(), inFlight: false }
-    : null;
+  loadJsonState(terminalStorageKey, false) === true ? { prompts: queued.slice(), inFlight: false } : null;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };

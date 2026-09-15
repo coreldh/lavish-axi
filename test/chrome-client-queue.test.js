@@ -1284,6 +1284,64 @@ test("reload during terminal preparation cannot restore an incomplete terminal b
   finishPreparation();
 });
 
+test("reload restores a completed terminal reservation after its prompt was delivered elsewhere", async () => {
+  const storage = new Map();
+  let finishOrdinarySend = () => {};
+  const ordinarySend = new Promise((resolve) => {
+    finishOrdinarySend = () => resolve({ ok: true });
+  });
+  let originalEndAttempts = 0;
+  const chrome = await createChromeHarness({
+    storage,
+    storedQueue: [{ uid: "", prompt: "Deliver then end", selector: "h1", tag: "element", text: "Heading" }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts")) return ordinarySend;
+      if (String(url).endsWith("/end")) {
+        originalEndAttempts += 1;
+        return new Promise(() => {});
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  chrome.element("send").click();
+  chrome.sendSnapshot("ordinary snapshot");
+  await flushPromises();
+
+  chrome.element("sendAndEnd").click();
+  chrome.sendSnapshot("terminal snapshot");
+  await flushPromises();
+
+  finishOrdinarySend();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.queued().length, 0);
+  assert.equal(storage.get("lavish-axi:terminal:abc"), "true");
+  assert.equal(originalEndAttempts, 1);
+
+  const reloadedRequests = [];
+  const reloaded = await createChromeHarness({
+    storage,
+    fetchImpl: async (url, init = {}) => {
+      reloadedRequests.push({ url: String(url), body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  assert.equal(reloaded.queued().length, 0);
+  assert.equal(reloaded.element("send").disabled, true);
+  assert.equal(reloaded.element("sendAndEnd").disabled, false);
+
+  reloaded.element("sendAndEnd").click();
+  reloaded.sendSnapshot("retry snapshot");
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(reloadedRequests, [{ url: "/api/abc/end", body: null }]);
+  assert.equal(storage.has("lavish-axi:terminal:abc"), false);
+  assert.equal(reloaded.element("sendAndEnd").disabled, true);
+});
+
 test("a recoverable terminal layout conflict restores ordinary review controls", async () => {
   const prompt = {
     uid: "",
