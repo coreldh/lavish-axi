@@ -581,7 +581,7 @@ function showQueuedSendFailure(message = SEND_FAILED_COPY, owner = null) {
 function showPersistentSendFailure(message, requireQueuedFeedback = false, owner = null) {
   clearSendAcknowledgementWarning();
   if (requireQueuedFeedback && !queued.length) return;
-  if (sendFailureOwner?.kind === "preparation" && owner?.kind !== "preparation") return;
+  if (sendFailureOwner?.kind === "preparation") return;
   sendFailureOwner = owner;
   showSendHint(message, null, false);
 }
@@ -1338,7 +1338,7 @@ function sendQueued(endAfter) {
   const shouldEnd = Boolean(endAfter && !chipsBlocked);
   const preparations = shouldEnd ? [...feedbackPreparations] : [];
   if (!queued.length && preparations.length === 0) {
-    if (!chipsBlocked) showSendHint();
+    if (!chipsBlocked && !sendFailureOwner) showSendHint();
     return;
   }
   if (!sendFailureOwner) hideSendHint(true);
@@ -1383,12 +1383,12 @@ function completeTerminalPreparation(terminal, results) {
     return;
   }
   terminal.prompts = queued.slice();
+  clearPreparationFailure("terminal");
   if (!terminal.prompts.length) {
     releaseTerminalSubmission(terminal);
-    showSendHint();
+    if (!sendFailureOwner) showSendHint();
     return;
   }
-  clearPreparationFailure("terminal");
   // Only make the reservation durable once every preparation has joined the exact
   // batch. A reload before this point must restore an ordinary editable queue, not
   // an incomplete terminal submission.

@@ -198,6 +198,8 @@ async function createChromeHarness({
       click(event = {}) {
         this.clicked = true;
         if (typeof this.onclick === "function") return this.onclick(event);
+        const handler = listeners.get("click");
+        if (handler) return handler(event);
         return undefined;
       },
       remove() {
@@ -2836,6 +2838,65 @@ test("a failed terminal layout preparation stays visible with an empty queue", a
   assert.equal(chrome.element("sendAndEnd").disabled, false);
   assert.equal(chrome.element("annotation").disabled, false);
   assert.equal(chrome.element("end").disabled, false);
+});
+
+test("an empty Send preserves layout preparation failure guidance", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/layout-warnings/queue")) return { ok: false, status: 500 };
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+
+  await chrome.element("warningsQueueButton").onclick();
+  await flushPromises();
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+
+  chrome.element("send").click();
+  chrome.runTimers(2600);
+
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /write a message or annotate/i);
+});
+
+test("a terminal preparation timeout preserves another preparation type's failure", async () => {
+  let attempts = 0;
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (!String(url).endsWith("/layout-warnings/queue")) return { ok: true, json: async () => ({}) };
+      attempts += 1;
+      if (attempts === 1) return { ok: false, status: 500 };
+      return new Promise(() => {});
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload()] }),
+  });
+  const [row] = chrome.warningRows();
+  row.children[0].checked = true;
+  row.children[0].dispatch("change");
+
+  await chrome.element("warningsQueueButton").onclick();
+  await flushPromises();
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+
+  chrome.element("warningsQueueButton").click();
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+
+  assert.equal(chrome.element("sendHint").hidden, false);
+  assert.equal(chrome.element("sendHint").classList.contains("persistent"), true);
+  assert.match(chrome.element("sendHint").textContent, /could not prepare the selected layout fixes/i);
+  assert.doesNotMatch(chrome.element("sendHint").textContent, /finish preparing all feedback/i);
 });
 
 test("an unrelated successful send preserves layout preparation failure guidance", async () => {
