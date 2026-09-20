@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -33,6 +34,7 @@ test(
     const cli = path.join(repoRoot, "dist", "cli.mjs");
     const browser = (...args) => run("chrome-devtools-axi", args, chromeEnv);
     const readState = async () => JSON.parse(await readFile(path.join(stateDir, "state.json"), "utf8"));
+    let hostileServer = null;
     try {
       await writeFile(entry, '<!doctype html><body style="font:16px system-ui"><p>Exact entry target</p></body>');
       const opened = run(process.execPath, [cli, entry, "--no-open"], env);
@@ -74,20 +76,48 @@ test(
 
       const artifactUrl = new URL(`/artifact/${key}/${encodeURIComponent(path.basename(entry))}`, url).href;
       const hostile = `<script>window.received=[];addEventListener('message',e=>{received.push(e.data);e.source.postMessage({type:'lavish:bind',...e.data},'*')})</script><iframe src="${artifactUrl}"></iframe>`;
-      browser("open", "data:text/html," + encodeURIComponent(hostile));
+      const hostilePort = await freePort();
+      hostileServer = spawn(process.execPath, ["-e", HOSTILE_SERVER_SCRIPT], {
+        env: {
+          ...process.env,
+          LAVISH_HOSTILE_PORT: String(hostilePort),
+          LAVISH_HOSTILE_HTML: Buffer.from(hostile).toString("base64"),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await Promise.race([
+        once(hostileServer.stdout, "data").then(([chunk]) => assert.match(String(chunk), /READY/)),
+        once(hostileServer, "error").then(([error]) => Promise.reject(error)),
+        once(hostileServer, "exit").then(([code]) => Promise.reject(new Error(`hostile server exited ${code}`))),
+      ]);
+      browser("open", `http://127.0.0.1:${hostilePort}/`);
       const result = browser(
         "eval",
-        "async () => { await new Promise(r => setTimeout(r, 500)); return { received: window.received.length }; }",
+        "async () => { await new Promise(r => setTimeout(r, 500)); return window.received.length; }",
       );
-      assert.match(result, /"received":\s*0/);
+      assert.match(result, /result:\s*"0"/);
       assert.match(browser("console"), /frame-ancestors|refused to frame/i);
     } finally {
+      if (hostileServer?.exitCode === null) {
+        hostileServer.kill();
+        await once(hostileServer, "exit");
+      }
       cleanupRun(process.execPath, [cli, "stop", "--port", String(port)], env);
       cleanupRun("chrome-devtools-axi", ["stop"], chromeEnv);
       await rm(temp, { recursive: true, force: true });
     }
   },
 );
+
+const HOSTILE_SERVER_SCRIPT = String.raw`
+const http = require("node:http");
+const html = Buffer.from(process.env.LAVISH_HOSTILE_HTML, "base64");
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(html);
+});
+server.listen(Number(process.env.LAVISH_HOSTILE_PORT), "127.0.0.1", () => process.stdout.write("READY\\n"));
+`;
 
 function run(command, args, env, timeout = 45_000) {
   const result = spawnSync(command, args, {
