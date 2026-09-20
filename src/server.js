@@ -1001,7 +1001,16 @@ export async function serve({
 
   async function validateReloadDestination(session, destination) {
     const entryRoute = path.basename(session.file);
-    const entry = { ok: true, artifactUrl: artifactDocumentUrl(session.key, entryRoute) };
+    const root = path.dirname(session.file);
+    const canonicalRoot = await canonicalArtifactRoot(root);
+    const entryPage = normalizePageIdentity(entryRoute);
+    const entry = {
+      ok: true,
+      artifactUrl: artifactDocumentUrl(session.key, entryRoute),
+      page: entryPage,
+      pageProof: signPageProof(pageProofKey, session.key, canonicalRoot, entryPage),
+      servedRoute: entryRoute,
+    };
     if (destination === undefined || destination === null) {
       return entry;
     }
@@ -1035,8 +1044,6 @@ export async function serve({
       return invalid();
     }
 
-    const root = path.dirname(session.file);
-    const canonicalRoot = await canonicalArtifactRoot(root);
     const claim = validatePageClaim(session, canonicalRoot, page, proof, { allowMissing: false });
     if (!claim.ok || claim.page === null) return invalid();
     const resolution = await resolveArtifactPage(root, route, { entryFile: entryRoute });
@@ -1060,7 +1067,13 @@ export async function serve({
       for (const name of parsed.searchParams.keys()) {
         if (name === "__lavish_reload") return invalid();
       }
-      return { ok: true, artifactUrl: expectedPath + parsed.search + parsed.hash };
+      return {
+        ok: true,
+        artifactUrl: expectedPath + parsed.search + parsed.hash,
+        page: claim.page,
+        pageProof: claim.proof,
+        servedRoute: resolution.servedRoute || route,
+      };
     } catch {
       return invalid();
     }
@@ -1946,6 +1959,9 @@ export async function serve({
         artifact_revision: result.artifact_revision,
         artifact_load_token: result.artifact_load_token,
         artifact_url: destination.artifactUrl,
+        page: destination.page,
+        page_proof: destination.pageProof,
+        served_route: destination.servedRoute,
       });
     } catch (error) {
       next(error);

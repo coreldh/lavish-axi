@@ -7511,6 +7511,58 @@ test("protocol 1 availability probes stay on the captured authored destination",
   assert.equal(failure.body.page_proof, "proof-details");
 });
 
+test("protocol 1 fatal probes retain the accepted destination before SDK binding", async () => {
+  const requests = [];
+  const storage = new Map([
+    [
+      "lavish-axi:destination:abc",
+      JSON.stringify({
+        available: true,
+        destination: "/artifact/abc/sub/page.html",
+        route: "sub/page.html",
+        page: "sub/page.html",
+        page_proof: "proof-sub-page",
+      }),
+    ],
+  ]);
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/entry.html",
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    storage,
+    beginLoadResponses: [
+      {
+        ok: true,
+        json: async () => ({
+          artifact_revision: 1,
+          artifact_load_token: "pending-load",
+          artifact_url: "/artifact/abc/sub/page.html",
+          page: "sub/page.html",
+          page_proof: "proof-sub-page",
+          served_route: "sub/page.html",
+        }),
+      },
+    ],
+    fetchImpl: async (url, init) => {
+      requests.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : null });
+      if (String(url).includes("probe=1")) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+
+  chrome.runTimers(8000);
+  await flushPromises();
+  await flushPromises();
+
+  const failure = requests.find((request) => request.url === "/api/abc/artifact-failures");
+  assert.equal(failure.body.page, "sub/page.html");
+  assert.equal(failure.body.page_proof, "proof-sub-page");
+  assert.equal(failure.body.document_sequence, 1);
+  assert.equal(failure.body.artifact_load_token, "pending-load");
+  assert.equal(failure.body.artifact_revision, 1);
+});
+
 test("an artifact that reports diagnostics is never probed as unavailable", async () => {
   const posts = [];
   const chrome = await createChromeHarness({

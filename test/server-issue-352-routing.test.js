@@ -228,6 +228,9 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       const accepted = await acceptedResponse.json();
       assert.equal(accepted.artifact_url, `/artifact/${session.key}/sub/page.html?view=full&view=print#section-2`);
       assert.equal(accepted.artifact_revision, load.artifact_revision + 1);
+      assert.equal(accepted.page, "sub/page.html");
+      assert.equal(accepted.page_proof, context.page_proof);
+      assert.equal(accepted.served_route, "sub/page.html");
 
       const tampered = await begin("tampered-proof", 3, { ...destination, page_proof: "x".repeat(43) });
       assert.equal(tampered.status, 400);
@@ -260,6 +263,77 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       });
       assert.equal(retargeted.status, 400);
       assert.deepEqual(await retargeted.json(), { status: "invalid-destination" });
+    } finally {
+      await server.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 352 fatal document failures retain the accepted page before SDK binding", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-pending-failure-"));
+  const artifact = path.join(root, "entry.html");
+  try {
+    await writeFile(artifact, "<!doctype html><body>ENTRY</body>");
+    await mkdir(path.join(root, "sub"));
+    const sibling = path.join(root, "sub", "page.html");
+    await writeFile(sibling, "<!doctype html><body>SIBLING</body>");
+    const server = await serve({ port: 0, stateFile: path.join(root, "state.json"), version: "failure-test" });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const { session, handoff } = await openAndLoad(base, artifact);
+      const context = injectedPageContext(
+        base,
+        await fetch(`${base}/artifact/${session.key}/sub/page.html`).then((response) => response.text()),
+      );
+      const acceptedResponse = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          request_id: "pending-failure",
+          request_sequence: 2,
+          chrome_load_token: handoff.chrome_load_token,
+          destination: {
+            ...context,
+            url: `/artifact/${session.key}/sub/page.html`,
+            query: "",
+            fragment: "",
+          },
+        }),
+      });
+      assert.equal(acceptedResponse.status, 200);
+      const accepted = await acceptedResponse.json();
+      assert.equal(accepted.page, "sub/page.html");
+      assert.equal(accepted.page_proof, context.page_proof);
+
+      await rm(sibling);
+      const documentUrl = new URL(accepted.artifact_url, base);
+      documentUrl.searchParams.set("artifact_revision", String(accepted.artifact_revision));
+      documentUrl.searchParams.set("artifact_load_token", accepted.artifact_load_token);
+      const document = await fetch(documentUrl);
+      assert.equal(document.status, 404);
+
+      const recorded = await fetch(`${base}/api/${session.key}/artifact-failures`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({
+          failures: [{ kind: "artifact-unavailable", detail: "the artifact document responded with HTTP 404" }],
+          artifact_load_token: accepted.artifact_load_token,
+          artifact_revision: accepted.artifact_revision,
+          page: accepted.page,
+          page_proof: accepted.page_proof,
+          document_sequence: 1,
+        }),
+      });
+      assert.equal(recorded.status, 200);
+
+      const feedback = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then(
+        (response) => response.json(),
+      );
+      assert.equal(feedback.status, "feedback");
+      assert.equal(feedback.artifact_failures[0].page, "sub/page.html");
+      assert.equal(feedback.artifact_failures[0].page_proof, undefined);
     } finally {
       await server.close();
     }

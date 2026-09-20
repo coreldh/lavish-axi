@@ -360,6 +360,8 @@ let sendFailureOwner = null;
 let sendAcknowledgementWarningVisible = false;
 
 let artifactLoadDestination = "";
+/** @type {{ page: string, proof: string, route: string, destination: string, documentSequence: number, token: string, revision: number } | null} */
+let pendingArtifactFailureBinding = null;
 let topLevelTeardown = false;
 
 function decodeNavigationPart(value) {
@@ -2799,11 +2801,19 @@ async function reportArtifactFailures(failures, context = {}) {
 function armArtifactAvailabilityProbe(loadToken = artifactLoadToken) {
   clearTimeout(artifactSilenceTimer);
   const binding = currentArtifactBinding;
+  const pendingBinding =
+    !binding &&
+    pendingArtifactFailureBinding?.token === loadToken &&
+    pendingArtifactFailureBinding?.revision === artifactLoadRevision
+      ? pendingArtifactFailureBinding
+      : null;
   const context = {
     loadToken,
     revision: artifactLoadRevision,
-    binding,
-    destination: binding?.destination || artifactLoadDestination || artifactSrc,
+    binding: binding || pendingBinding,
+    definitiveBinding: binding,
+    pendingBinding,
+    destination: binding?.destination || pendingBinding?.destination || artifactLoadDestination || artifactSrc,
   };
   artifactSilenceTimer = setTimeout(() => {
     if (loadToken !== artifactLoadToken) return;
@@ -2830,11 +2840,12 @@ function artifactProbeSrc(destination, revision, loadToken) {
 }
 
 async function probeArtifactAvailability(context) {
-  const { loadToken, revision, binding, destination } = context;
+  const { loadToken, revision, definitiveBinding, pendingBinding, destination } = context;
   if (
     loadToken !== artifactLoadToken ||
     revision !== artifactLoadRevision ||
-    (binding ? currentArtifactBinding !== binding : currentArtifactBinding)
+    (definitiveBinding ? currentArtifactBinding !== definitiveBinding : currentArtifactBinding) ||
+    (pendingBinding && pendingArtifactFailureBinding !== pendingBinding)
   )
     return;
   try {
@@ -2842,7 +2853,8 @@ async function probeArtifactAvailability(context) {
     if (
       loadToken !== artifactLoadToken ||
       revision !== artifactLoadRevision ||
-      (binding ? currentArtifactBinding !== binding : currentArtifactBinding)
+      (definitiveBinding ? currentArtifactBinding !== definitiveBinding : currentArtifactBinding) ||
+      (pendingBinding && pendingArtifactFailureBinding !== pendingBinding)
     )
       return;
     if (response.status === 409) return;
@@ -3434,6 +3446,7 @@ async function endSession(terminal = null) {
 function markSessionEnded() {
   if (ended) return;
   ended = true;
+  pendingArtifactFailureBinding = null;
   pendingAcknowledgements.clear();
   clearSendAcknowledgementWarning();
   terminalSubmission = null;
@@ -3750,6 +3763,7 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   cancelArtifactLoadRecovery();
   if (!recoveryRetry) artifactLoadRecoveryAttempt = 0;
   clearTimeout(artifactSilenceTimer);
+  pendingArtifactFailureBinding = null;
   const destinationCandidate = currentDestinationCandidate();
   const requestedDestination = destinationPayload(destinationCandidate);
   // The iframe is sandboxed, so reload by resetting the iframe URL from chrome.
@@ -3878,6 +3892,9 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
         artifact_revision: candidateRevision,
         artifact_load_token: candidateToken,
         artifact_url: typeof candidate?.artifact_url === "string" ? candidate.artifact_url : "",
+        page: typeof candidate?.page === "string" ? candidate.page : "",
+        page_proof: typeof candidate?.page_proof === "string" ? candidate.page_proof : "",
+        served_route: typeof candidate?.served_route === "string" ? candidate.served_route : "",
       };
       break;
     } catch {
@@ -3909,6 +3926,17 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
     ) ||
     artifactSrc;
   artifactLoadDestination = stripReservedReloadParameters(selectedDestination);
+  if (modernArtifactProtocol && load?.page && load?.page_proof && load?.served_route) {
+    pendingArtifactFailureBinding = {
+      page: load.page,
+      proof: load.page_proof,
+      route: load.served_route,
+      destination: artifactLoadDestination,
+      documentSequence: 1,
+      token,
+      revision,
+    };
+  }
   // The next document reports its own registry once it loads; until then the
   // previous revision's legend would point at blocks that may no longer exist.
   // This reset stays adjacent to the navigation that actually replaces the
@@ -5023,6 +5051,7 @@ function challengeArtifactDocument(expectedDocumentId = "") {
       window: source,
     };
     retireArtifactBinding();
+    pendingArtifactFailureBinding = null;
     currentArtifactBinding = binding;
     activatePageReviewState(binding.page);
     const destination = bindingDestination(binding);
@@ -5411,6 +5440,7 @@ if (modernArtifactProtocol) {
   // not a beforeunload prompt: it only records state and never sets
   // `returnValue` or calls preventDefault().
   window.addEventListener("beforeunload", () => {
+    pendingArtifactFailureBinding = null;
     const record = destinationRecord(currentArtifactBinding);
     if (!record) return;
     topLevelTeardown = true;
