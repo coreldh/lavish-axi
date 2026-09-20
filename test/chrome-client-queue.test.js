@@ -2977,23 +2977,14 @@ test("protocol 1 warning rows disclose their page and reveal only on the current
   chrome.eventSource().listeners.get("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload({ page: "page-a.html" })] }),
   });
-  let row = chrome.warningRows()[0];
-  let body = row.children[1];
-  let meta = body.children[2];
-  let actions = body.children.at(-1);
-  assert.equal(
-    meta.children.some((chip) => chip.textContent === "Page page-a.html"),
-    true,
-  );
-  assert.equal(actions.children.length, 1, "a warning from another page has no Reveal action");
-  assert.equal(actions.children[0].textContent, "Dismiss");
+  assert.equal(chrome.warningRows().length, 0, "another page's warnings stay hidden");
 
   chrome.eventSource().listeners.get("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload({ page: "page-b.html" })] }),
   });
-  row = chrome.warningRows()[0];
-  body = row.children[1];
-  actions = body.children.at(-1);
+  const row = chrome.warningRows()[0];
+  const body = row.children[1];
+  const actions = body.children.at(-1);
   assert.equal(actions.children[0].textContent, "Reveal");
   actions.children[0].click();
   await flushPromises();
@@ -3002,7 +2993,7 @@ test("protocol 1 warning rows disclose their page and reveal only on the current
   assert.equal(reveal.page, "page-b.html");
 });
 
-test("protocol 1 warning batches retain per-item pages without a common page claim", async () => {
+test("protocol 1 rejects a heterogeneous warning preparation response", async () => {
   const binding = {
     page: "page-b.html",
     proof: "proof-b",
@@ -3049,16 +3040,7 @@ test("protocol 1 warning batches retain per-item pages without a common page cla
   await chrome.element("warningsQueueButton").onclick();
   await flushPromises();
 
-  const [prompt] = chrome.queued();
-  assert.equal(prompt.page, null);
-  assert.equal(prompt.page_proof, "");
-  assert.deepEqual(
-    prompt.target.warnings.map(({ id, page }) => ({ id, page })),
-    [
-      { id: "wa", page: "page-a.html" },
-      { id: "wb", page: "page-b.html" },
-    ],
-  );
+  assert.equal(chrome.queued().length, 0);
 });
 
 test("a failed diagnostic pass reports its incompleteness rather than an empty result", async () => {
@@ -6691,6 +6673,68 @@ test("protocol 1 retains distinct document URLs despite reversed receipt respons
   assert.equal(recovery.receipt, receipts[1]);
 });
 
+test("protocol 1 retains a delayed receipt after navigation and uses it for stale Back recovery", async () => {
+  const a = {
+    page: "a.html",
+    proof: "proof-a",
+    route: "a.html",
+    documentId: "document-a",
+    destination: "/artifact/abc/a.html",
+  };
+  /** @type {(value: any) => void} */
+  let release = () => {};
+  const delayed = new Promise((resolve) => {
+    release = resolve;
+  });
+  const chrome = await createChromeHarness({
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+    bindingValidationResponses: [
+      { ok: true, json: async () => ({ receipt: "a".repeat(43) }) },
+      delayed,
+      { ok: true, json: async () => ({ receipt: "b".repeat(43) }) },
+      { ok: false, json: async () => ({ status: "stale" }) },
+    ],
+  });
+  await flushPromises();
+  await flushPromises();
+  const activation = chrome.modernPostedToFrame.find((message) => message.type === "lavish:activate");
+  const destination = "/artifact/abc/a.html?author=retained#later";
+  chrome.sendModernMessage({ ...activation, type: "lavish:documentDestination", destination });
+  await flushPromises();
+  chrome.updateModernBinding({
+    page: "b.html",
+    proof: "proof-b",
+    route: "b.html",
+    documentId: "document-b",
+    destination: "/artifact/abc/b.html",
+  });
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: "document-b" });
+  await flushPromises();
+  await flushPromises();
+  release({ ok: true, json: async () => ({ receipt: "c".repeat(43) }) });
+  await flushPromises();
+  await flushPromises();
+  const history = JSON.parse(chrome.storage.get("lavish-axi:destination:abc:history"));
+  assert.equal(history.find((record) => record.url === destination)?.receipt, "c".repeat(43));
+  assert.equal(JSON.parse(chrome.storage.get("lavish-axi:destination:abc")).destination, "/artifact/abc/b.html");
+  chrome.updateModernBinding({
+    ...a,
+    destination,
+    token: activation.artifact_load_token,
+    revision: activation.artifact_revision,
+  });
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: a.documentId });
+  await flushPromises();
+  await flushPromises();
+  await flushPromises();
+  const recovery = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body).historical_page;
+  assert.equal(recovery.url, destination);
+  assert.equal(recovery.document_id, a.documentId);
+  assert.equal(recovery.receipt, "c".repeat(43));
+});
+
 test("protocol 1 fails closed for a stale BFCache page without an exact destination receipt", async () => {
   const staleBinding = {
     page: "page-a.html",
@@ -7282,6 +7326,232 @@ test("protocol 1 restores review state and scroll only for the accepted canonica
       { page: "page-b.html", text: "page B draft" },
     ],
   );
+});
+
+test("protocol 1 displays and sends only the authenticated page and restores other queues and composer drafts", async () => {
+  const a = protocolWhiteboardBinding("a.html", "a");
+  const b = protocolWhiteboardBinding("b.html", "b");
+  const posts = [];
+  /** @type {(value: any) => void} */
+  let releaseUpload = () => {};
+  const chrome = await createChromeHarness({
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/attachments"))
+        return new Promise((resolve) => {
+          releaseUpload = resolve;
+        });
+      if (String(url).endsWith("/prompts")) posts.push(JSON.parse(init.body));
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  const queue = (text) =>
+    chrome.sendModernMessage({
+      ...chrome.modernPostedToFrame.filter((message) => message.type === "lavish:activate").at(-1),
+      type: "lavish:queuePrompt",
+      prompt: { prompt: text, tag: "element", selector: "h1", text: "Heading" },
+    });
+  const navigate = async (binding) => {
+    chrome.updateModernBinding(binding);
+    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
+    await flushPromises();
+    await flushPromises();
+  };
+  queue("Only A");
+  await flushPromises();
+  chrome.element("chatInput").value = "Draft A";
+  chrome.element("chatInput").dispatch("paste", clipboardEvent(pastedImage("a-only.png")));
+  await flushPromises();
+  await navigate(b);
+  releaseUpload({ ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.element("chatAttachments").innerHTML, "", "A upload cannot repaint B chips");
+  assert.equal(chrome.element("chatInput").value, "");
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /Only A/);
+  queue("Only B");
+  await flushPromises();
+  chrome.element("chatInput").value = "Draft B";
+  await navigate(a);
+  assert.equal(chrome.element("chatInput").value, "Draft A");
+  assert.match(chrome.element("chatAttachments").innerHTML, /a-only\.png/);
+  assert.match(chrome.element("queuedLog").innerHTML, /Only A/);
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /Only B/);
+  chrome.element("send").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.deepEqual(
+    posts[0].prompts.map((prompt) => [prompt.prompt, prompt.page]),
+    [
+      ["Only A", "a.html"],
+      ["Draft A", "a.html"],
+    ],
+  );
+  assert.equal(posts[0].prompts[1].attachments[0].name, "a-only.png");
+  await navigate(b);
+  assert.equal(chrome.element("chatInput").value, "Draft B");
+  assert.match(chrome.element("queuedLog").innerHTML, /Only B/);
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /Only A/);
+  chrome.element("send").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.deepEqual(
+    posts[1].prompts.map((prompt) => [prompt.prompt, prompt.page]),
+    [
+      ["Only B", "b.html"],
+      ["Draft B", "b.html"],
+    ],
+  );
+  assert.equal(posts[1].prompts[1].attachments, undefined);
+});
+
+test("protocol 1 terminal reservations survive reload without collecting another page", async () => {
+  const a = protocolWhiteboardBinding("a.html", "a");
+  const storedQueue = [
+    { prompt_id: "pending-a", prompt: "A", tag: "message", page: "a.html", page_proof: "proof-a" },
+    { prompt_id: "pending-b", prompt: "B", tag: "message", page: "b.html", page_proof: "proof-b" },
+  ];
+  const storage = new Map();
+  const posts = [];
+  const chrome = await createChromeHarness({
+    storage,
+    storedQueue,
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        posts.push(JSON.parse(init.body));
+        throw new Error("offline");
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.deepEqual(
+    posts[0].prompts.map((prompt) => prompt.page),
+    ["a.html"],
+  );
+  assert.deepEqual(JSON.parse(storage.get("lavish-axi:terminal:abc")), { page: "a.html", ids: ["pending-a"] });
+  const retryPosts = [];
+  const b = protocolWhiteboardBinding("b.html", "b");
+  const restored = await createChromeHarness({
+    storage,
+    artifactSrc: b.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: b,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) retryPosts.push(JSON.parse(init.body));
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(restored.frame.inert, false, "a reservation on A must not trap navigation on B");
+  assert.equal(restored.element("sendAndEnd").disabled, true);
+  restored.updateModernBinding(a);
+  restored.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: a.documentId });
+  await flushPromises();
+  await flushPromises();
+  restored.element("sendAndEnd").click();
+  restored.runTimers(5000);
+  await flushPromises();
+  assert.deepEqual(
+    retryPosts[0].prompts.map((prompt) => prompt.page),
+    ["a.html"],
+  );
+  assert.deepEqual(
+    restored.queued().map((prompt) => prompt.page),
+    ["b.html"],
+  );
+
+  const migrated = await createChromeHarness({
+    storage: new Map([["lavish-axi:terminal:abc", "true"]]),
+    storedQueue,
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+  });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(
+    migrated.element("send").disabled,
+    false,
+    "unscoped legacy reservations restore as editable page queues",
+  );
+  assert.equal(migrated.queued().length, 2);
+});
+
+test("protocol 1 warning selection and delayed preparation stay with the captured page", async () => {
+  const a = protocolWhiteboardBinding("a.html", "a");
+  const b = protocolWhiteboardBinding("b.html", "b");
+  const warnings = [warningPayload({ id: "wa", page: "a.html" }), warningPayload({ id: "wb", page: "b.html" })];
+  const requests = [];
+  /** @type {(value: any) => void} */
+  let release = () => {};
+  const chrome = await createChromeHarness({
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/layout-warnings/queue")) {
+        requests.push(JSON.parse(init.body));
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  const navigate = async (binding) => {
+    chrome.updateModernBinding(binding);
+    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
+    await flushPromises();
+    await flushPromises();
+  };
+  chrome.eventSource().listeners.get("layout-warnings")({ data: JSON.stringify({ warnings }) });
+  assert.equal(chrome.warningRows().length, 1);
+  chrome.element("warningsSelectAll").checked = true;
+  chrome.element("warningsSelectAll").onchange();
+  const preparation = chrome.element("warningsQueueButton").onclick();
+  await flushPromises();
+  assert.deepEqual(requests[0].ids, ["wa"]);
+  assert.equal(requests[0].page, "a.html");
+  await navigate(b);
+  assert.equal(chrome.warningRows().length, 1);
+  assert.equal(chrome.element("warningsSelectAll").checked, false);
+  chrome.element("warningsSelectAll").checked = true;
+  chrome.element("warningsSelectAll").onchange();
+  release({
+    ok: true,
+    json: async () => ({
+      warnings,
+      prompt: {
+        prompt: "Fix A",
+        text: "A warning",
+        target: { type: "layout-warnings", warnings: [{ id: "wa", page: "a.html" }] },
+      },
+    }),
+  });
+  await preparation;
+  await flushPromises();
+  assert.equal(chrome.queued()[0].page, "a.html");
+  assert.equal(chrome.queued()[0].page_proof, a.proof);
+  assert.doesNotMatch(chrome.element("queuedLog").innerHTML, /Fix A/);
+  assert.equal(chrome.element("warningsSelectAll").checked, true, "B selection survives A response");
+  await navigate(a);
+  assert.match(chrome.element("queuedLog").innerHTML, /Fix A/);
+  assert.equal(chrome.element("warningsSelectAll").checked, false);
 });
 
 test("protocol 1 prompt replacement keys are isolated per accepted page", async () => {
@@ -9456,7 +9726,8 @@ test("protocol 1 preserves explicit unavailable and attributed queued contexts",
   chrome.runTimers(5000);
   await flushPromises();
 
-  const restored = publicPostedBody(postedBody).prompts;
+  assert.equal(postedBody, undefined, "an unavailable document cannot send another page's queue");
+  const restored = chrome.queued();
   assert.equal(restored[0].prompt, "Keep my unattributed note");
   assert.equal(restored[0].page, null);
   assert.equal(restored[0].page_proof, "");

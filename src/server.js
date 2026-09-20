@@ -1160,6 +1160,10 @@ export async function serve({
         prompt.page_proof = claim.proof;
       }
     }
+    if (modern && prompts.length > 0) {
+      const page = prompts[0]?.page;
+      if (typeof page !== "string" || prompts.some((prompt) => prompt.page !== page)) invalid.push({ kind: "batch" });
+    }
     const snapshot = String(payload?.domSnapshot || payload?.dom_snapshot || "");
     const snapshotClaim = validatePageClaim(
       session,
@@ -1173,6 +1177,8 @@ export async function serve({
     if (snapshot && (!snapshotClaim.ok || (modern && !Object.hasOwn(payload || {}, "snapshot_page")))) {
       invalid.push({ kind: "snapshot" });
     }
+    if (modern && snapshot && prompts.length && snapshotClaim.page !== prompts[0].page)
+      invalid.push({ kind: "snapshot-page" });
     if (invalid.length) {
       return {
         ok: false,
@@ -1708,9 +1714,26 @@ export async function serve({
   // /api/:key/prompts with the rest of the ordinary feedback queue.
   app.post("/api/:key/layout-warnings/queue", async (req, res, next) => {
     try {
-      const result = await store.prepareLayoutWarningFixes(req.params.key, req.body?.ids);
+      const modern = Number(req.body?.page_protocol) === 1;
+      const session = modern ? await store.findByKey(req.params.key) : null;
+      if (modern && session) {
+        const validation = await validatePromptContext(session, [req.body], req.body);
+        if (!validation.ok) {
+          res.status(400).json({ status: "invalid-page-context" });
+          return;
+        }
+      }
+      const result = await store.prepareLayoutWarningFixes(
+        req.params.key,
+        req.body?.ids,
+        modern ? { page: req.body?.page } : {},
+      );
       if (!result) {
         res.status(404).json({ error: "session not found" });
+        return;
+      }
+      if (result.invalid_page_context) {
+        res.status(400).json({ status: "invalid-page-context" });
         return;
       }
       res.json({

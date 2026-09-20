@@ -703,6 +703,89 @@ test("issue 352 authenticates a live page binding before chrome activation", asy
   }
 });
 
+test("issue 352 rejects cross-page sends and warning selections while accepting one authenticated page", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-page-queue-"));
+  const entry = path.join(root, "a.html");
+  let server;
+  try {
+    await writeFile(entry, "<!doctype html><p>A</p>");
+    await writeFile(path.join(root, "b.html"), "<!doctype html><p>B</p>");
+    server = await serve({ port: 0, stateFile: path.join(root, "state.json"), version: "page-queue-test" });
+    const base = `http://127.0.0.1:${server.port}`;
+    const { session, load } = await openAndLoad(base, entry);
+    const contexts = [];
+    const headers = { "content-type": "application/json", origin: base };
+    const post = (route, body) =>
+      fetch(`${base}/api/${session.key}/${route}`, { method: "POST", headers, body: JSON.stringify(body) });
+    for (const [index, page] of ["a.html", "b.html"].entries()) {
+      const context = injectedPageContext(
+        base,
+        await fetch(`${base}/artifact/${session.key}/${page}`).then((r) => r.text()),
+      );
+      contexts.push(context);
+      const diagnostic = await post("layout-diagnostics", {
+        ...context,
+        page_protocol: 1,
+        artifact_revision: load.artifact_revision,
+        artifact_load_token: load.artifact_load_token,
+        artifact_pass_sequence: 1,
+        document_sequence: index + 1,
+        complete: true,
+        viewport_width: 1440,
+        findings: [{ selector: "p", kind: "clipped-text", axis: "vertical", overflowPx: 30, severity: "error" }],
+      });
+      assert.equal(diagnostic.status, 200);
+    }
+    const warnings = (await fetch(`${base}/api/${session.key}/layout-warnings`).then((r) => r.json())).warnings;
+    assert.equal(warnings.length, 2);
+    const ids = warnings.map((warning) => warning.id);
+    assert.equal((await post("layout-warnings/queue", { page_protocol: 1, ...contexts[0], ids })).status, 400);
+    assert.equal(
+      (await post("layout-warnings/queue", { ids })).status,
+      400,
+      "legacy shape cannot create a mixed-page batch",
+    );
+    const aIds = warnings.filter((warning) => warning.page === "a.html").map((warning) => warning.id);
+    const prepared = await post("layout-warnings/queue", { page_protocol: 1, ...contexts[0], ids: aIds });
+    assert.equal(prepared.status, 200);
+    const aPrompt = (await prepared.json()).prompt;
+    const prompts = contexts.map((context) => ({ ...context, prompt: "page note", tag: "message" }));
+    assert.equal((await post("prompts", { page_protocol: 1, prompts })).status, 400);
+    assert.equal(
+      (
+        await post("prompts", {
+          page_protocol: 1,
+          prompts: [prompts[0]],
+          domSnapshot: "B snapshot",
+          snapshot_page: contexts[1].page,
+          snapshot_page_proof: contexts[1].page_proof,
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (await post("prompts", { page_protocol: 1, prompts: [{ ...aPrompt, tag: "layout-warnings", ...contexts[1] }] }))
+        .status,
+      400,
+      "warning IDs cannot be restamped as another page",
+    );
+    const accepted = await post("prompts", {
+      page_protocol: 1,
+      prompts: [{ ...aPrompt, tag: "layout-warnings", ...contexts[0] }],
+    });
+    assert.equal(accepted.status, 200);
+    const feedback = await fetch(`${base}/api/poll?file=${encodeURIComponent(entry)}&timeoutMs=0`).then((r) =>
+      r.json(),
+    );
+    assert.equal(feedback.prompts.length, 1);
+    assert.equal(feedback.prompts[0].page, "a.html");
+    assert.equal(feedback.prompts[0].target.warnings[0].page, "a.html");
+  } finally {
+    await server?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("issue 352 validates page claims atomically and keeps proofs out of poll output", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-352-context-"));
   const artifact = path.join(root, "entry.html");
@@ -808,14 +891,11 @@ test("issue 352 validates page claims atomically and keeps proofs out of poll ou
           snapshot_page_proof: "",
         }),
       });
-      assert.equal(legacyQueued.status, 200);
+      assert.equal(legacyQueued.status, 400, "modern unavailable-page feedback cannot be sent as a page batch");
       const legacyFeedback = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then(
         (response) => response.json(),
       );
-      assert.equal(legacyFeedback.status, "feedback");
-      assert.equal(legacyFeedback.prompts[0].prompt, "preserve pre-feature writing");
-      assert.equal(legacyFeedback.prompts[0].page, null);
-      assert.equal(legacyFeedback.prompts[0].page_proof, undefined);
+      assert.equal(legacyFeedback.status, "waiting");
 
       const accepted = await fetch(`${base}/api/${session.key}/prompts`, {
         method: "POST",

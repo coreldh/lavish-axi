@@ -249,8 +249,8 @@ let layoutGateTimer;
 let layoutWarnings = Array.isArray(sessionData.initialLayoutWarnings) ? sessionData.initialLayoutWarnings : [];
 const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, []));
 let warningsDrawerOpen = false;
-/** @typedef {{ done: Promise<boolean>, finish: (succeeded: boolean) => void }} FeedbackPreparation */
-/** @typedef {{ prompts: any[], inFlight: boolean, order: number }} TerminalSubmission */
+/** @typedef {{ page: string | null, done: Promise<boolean>, finish: (succeeded: boolean) => void }} FeedbackPreparation */
+/** @typedef {{ page?: string | null, prompts: any[], inFlight: boolean, order: number }} TerminalSubmission */
 /** @typedef {{ version: number, page: string | null, proof: string, route: string, destination: string, documentId: string, documentSequence: number, token: string, revision: number }} SnapshotBinding */
 /** @type {Map<string, { action: "copy" | "submit", prompts?: any[], chatAtRequest?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, acknowledgement?: object, order?: number, timeout?: ReturnType<typeof setTimeout>, binding?: SnapshotBinding | null }>} */
 const snapshotRequests = new Map();
@@ -272,10 +272,7 @@ const pendingAcknowledgements = new Set();
 /** @type {Set<FeedbackPreparation>} */
 const feedbackPreparations = new Set();
 /** @type {TerminalSubmission | null} */
-let terminalSubmission =
-  loadJsonState(terminalStorageKey, false) === true
-    ? { prompts: queued.slice(), inFlight: false, order: ++nextSendOperationOrder }
-    : null;
+let terminalSubmission = restoreTerminalReservation();
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendAcknowledgementTimer;
 let lastScroll = { x: 0, y: 0 };
@@ -399,6 +396,7 @@ function rememberHistoricalDestination(documentId, destination, receipt) {
 
 async function refreshHistoricalDestination(binding) {
   const destination = destinationPayload(destinationRecord(binding));
+  const documentId = binding.documentId;
   if (!destination) return;
   try {
     const response = await fetch("/api/" + key + "/artifact-bindings/validate", {
@@ -415,16 +413,12 @@ async function refreshHistoricalDestination(binding) {
       }),
     });
     const result = await response.json();
-    if (
-      !response.ok ||
-      currentArtifactBinding !== binding ||
-      binding.token !== artifactLoadToken ||
-      binding.revision !== artifactLoadRevision
-    )
-      return;
+    if (!response.ok) return;
     // Responses for different URLs may arrive in any order. They populate exact keys,
     // and never restore an older destination into the current binding.
-    rememberHistoricalDestination(binding.documentId, destination, result.receipt);
+    // Signing was authorized by the server before the response was sent. Retirement
+    // while that response is in flight does not invalidate historical evidence.
+    rememberHistoricalDestination(documentId, destination, result.receipt);
   } catch {
     /* Recovery without evidence fails closed. */
   }
@@ -899,11 +893,39 @@ function persistQueuedPrompts() {
 
 function persistTerminalReservation(reserved) {
   try {
-    if (reserved) sessionStorage.setItem(terminalStorageKey, "true");
+    if (reserved)
+      sessionStorage.setItem(
+        terminalStorageKey,
+        JSON.stringify(
+          modernArtifactProtocol
+            ? { page: terminalSubmission?.page, ids: terminalSubmission?.prompts.map((prompt) => prompt.prompt_id) }
+            : true,
+        ),
+      );
     else sessionStorage.removeItem(terminalStorageKey);
   } catch {
     // Session storage can be unavailable; the in-memory reservation still protects this page.
   }
+}
+
+function restoreTerminalReservation() {
+  const saved = loadJsonState(terminalStorageKey, false);
+  if (!modernArtifactProtocol)
+    return saved === true ? { prompts: queued.slice(), inFlight: false, order: ++nextSendOperationOrder } : null;
+  // Old boolean reservations did not identify a page or exact batch. Preserve the
+  // writing as an editable queue, never infer an aggregate terminal submission.
+  if (!saved || typeof saved.page !== "string" || !Array.isArray(saved.ids)) return null;
+  const prompts = queued.filter((prompt) => saved.ids.includes(prompt.prompt_id));
+  if (prompts.some((prompt) => prompt.page !== saved.page)) return null;
+  return { page: saved.page, prompts, inFlight: false, order: ++nextSendOperationOrder };
+}
+
+function belongsToReviewPage(item, page = currentArtifactBinding?.page) {
+  return !modernArtifactProtocol || (typeof page === "string" && item?.page === page);
+}
+
+function queuedForPage(page = currentArtifactBinding?.page) {
+  return queued.filter((prompt) => belongsToReviewPage(prompt, page));
 }
 
 const REMOVE_ICON_SVG =
@@ -1046,7 +1068,9 @@ function isPromptSending(prompt) {
 }
 
 function render() {
-  queuedLog.innerHTML = queued.map((prompt, index) => queuedBubbleHtml(prompt, index)).join("");
+  queuedLog.innerHTML = queued
+    .map((prompt, index) => (belongsToReviewPage(prompt) ? queuedBubbleHtml(prompt, index) : ""))
+    .join("");
 
   for (const button of queuedLog.querySelectorAll(".queued-remove")) {
     const removeButton = /** @type {HTMLButtonElement} */ (button);
@@ -1064,12 +1088,21 @@ function updateSendState() {
   // A terminal send owns the exact review batch, so freeze interactions inside the
   // artifact without disabling annotation mode. Disabling annotation mode closes the
   // SDK card and destroys an unsent draft before delivery has actually succeeded.
-  frame.inert = ended || terminalReserved;
-  sendButton.disabled = ended || terminalReserved;
-  sendAndEndButton.disabled = ended || Boolean(terminalSubmission?.inFlight);
+  // A restored reservation must not trap the reviewer on another page: leave
+  // authored navigation usable so they can return to its page and retry.
+  frame.inert =
+    ended ||
+    (terminalReserved && (!modernArtifactProtocol || terminalSubmission.page === currentArtifactBinding?.page));
+  const unavailable = modernArtifactProtocol && !currentArtifactBinding;
+  sendButton.disabled = ended || terminalReserved || unavailable;
+  sendAndEndButton.disabled =
+    ended ||
+    Boolean(terminalSubmission?.inFlight) ||
+    unavailable ||
+    Boolean(modernArtifactProtocol && terminalSubmission && terminalSubmission.page !== currentArtifactBinding?.page);
   annotationSwitch.disabled = ended || terminalReserved;
-  chatInput.disabled = ended || terminalReserved;
-  chatAttachButton.disabled = ended || terminalReserved;
+  chatInput.disabled = ended || terminalReserved || unavailable;
+  chatAttachButton.disabled = ended || terminalReserved || unavailable;
   endButton.disabled = ended || terminalReserved;
   if (warningsQueueButton) updateWarningSelectionState();
 }
@@ -1739,8 +1772,9 @@ function applySheetState() {
 // then a reply they have not seen, then whether the agent is there to receive a send.
 function sheetSummary() {
   if (ended) return { text: "Session ended", accent: false, unread: false };
-  if (queued.length > 0) {
-    return { text: queued.length === 1 ? "1 queued" : queued.length + " queued", accent: true, unread: false };
+  const queuedCount = queuedForPage().length;
+  if (queuedCount > 0) {
+    return { text: queuedCount === 1 ? "1 queued" : queuedCount + " queued", accent: true, unread: false };
   }
   if (unreadAgentReply) return { text: unreadAgentReply, accent: false, unread: true };
   if (agentPresence === "working") return { text: "Agent is working…", accent: false, unread: false };
@@ -1889,14 +1923,6 @@ function promptQueueKey(prompt) {
 function stampPromptBinding(prompt, binding = currentArtifactBinding) {
   if (!modernArtifactProtocol || !prompt || typeof prompt !== "object") return prompt;
   delete prompt[legacyQueuedPageField];
-  // A layout-warning batch is intentionally heterogeneous: each authoritative
-  // warning record carries its own page.  Stamping the batch with whichever
-  // page happens to be visible would mislabel warnings selected across pages.
-  if (prompt.tag === "layout-warnings" && prompt.target?.type === "layout-warnings") {
-    prompt.page = null;
-    prompt.page_proof = "";
-    return prompt;
-  }
   // The artifact is untrusted and may include look-alike page fields.  Replace
   // them with the chrome's accepted binding, or an explicit null when the
   // composer has no eligible current document.
@@ -1913,6 +1939,7 @@ function beginFeedbackPreparation() {
     finishPromise = resolve;
   });
   const preparation = {
+    page: currentArtifactBinding?.page ?? null,
     done,
     finish(succeeded) {
       if (!feedbackPreparations.delete(preparation)) return;
@@ -1994,6 +2021,11 @@ function retireArtifactBinding() {
   const binding = currentArtifactBinding;
   if (binding) retireWhiteboardChannelsForBinding?.(binding);
   currentArtifactBinding = null;
+  if (modernArtifactProtocol) {
+    activateComposerPage(null);
+    render();
+    renderWarnings();
+  }
   if (binding?.port) {
     try {
       binding.port.close();
@@ -2036,19 +2068,23 @@ function postToBindingFrame(binding, message) {
 
 function requestSnapshot(action, prompts = [], endAfter = false, terminal = null) {
   const requestId = "snapshot-" + ++nextSnapshotRequestId;
-  const capturedBinding = currentArtifactBinding
-    ? {
-        version: currentArtifactBinding.version,
-        page: currentArtifactBinding.page,
-        proof: currentArtifactBinding.proof,
-        route: currentArtifactBinding.route,
-        destination: currentArtifactBinding.destination,
-        documentId: currentArtifactBinding.documentId,
-        documentSequence: currentArtifactBinding.documentSequence,
-        token: currentArtifactBinding.token,
-        revision: currentArtifactBinding.revision,
-      }
-    : null;
+  const capturedBinding =
+    currentArtifactBinding &&
+    (!modernArtifactProtocol ||
+      action !== "submit" ||
+      prompts.every((prompt) => prompt.page === currentArtifactBinding.page))
+      ? {
+          version: currentArtifactBinding.version,
+          page: currentArtifactBinding.page,
+          proof: currentArtifactBinding.proof,
+          route: currentArtifactBinding.route,
+          destination: currentArtifactBinding.destination,
+          documentId: currentArtifactBinding.documentId,
+          documentSequence: currentArtifactBinding.documentSequence,
+          token: currentArtifactBinding.token,
+          revision: currentArtifactBinding.revision,
+        }
+      : null;
   const request =
     action === "submit"
       ? {
@@ -2068,7 +2104,8 @@ function requestSnapshot(action, prompts = [], endAfter = false, terminal = null
     armSendAcknowledgementWarning();
     request.timeout = setTimeout(() => completeSnapshotRequest(requestId, ""), SNAPSHOT_REQUEST_TIMEOUT_MS);
   }
-  postToFrame({ type: "lavish:requestSnapshot", snapshot_request_id: requestId });
+  if (modernArtifactProtocol && action === "submit" && !capturedBinding) completeSnapshotRequest(requestId, "");
+  else postToFrame({ type: "lavish:requestSnapshot", snapshot_request_id: requestId });
 }
 
 function takeSnapshotRequest(requestId) {
@@ -2120,7 +2157,7 @@ function completeSnapshotRequest(requestId, snapshot, responseBinding = null) {
   }).catch(() => {});
 }
 
-function createChatAttachmentsController() {
+function createChatAttachmentsController(page = null) {
   const items = [];
   let nextId = 0;
   let capRejected = false;
@@ -2131,6 +2168,7 @@ function createChatAttachmentsController() {
   }
 
   function renderAttachments() {
+    if (modernArtifactProtocol && page !== composerPage) return;
     chatAttachments.innerHTML = items
       .map((item) => {
         const status = item.status === "uploading" ? "Uploading…" : item.status === "error" ? item.error : "";
@@ -2177,6 +2215,7 @@ function createChatAttachmentsController() {
   // went stale the moment the pending upload it described failed, leaving the
   // user waiting on an upload that was already over.
   function syncNotice() {
+    if (modernArtifactProtocol && page !== composerPage) return;
     if (currentImageCount() < attachmentMaxCount) capRejected = false;
     const pending = items.some((item) => item.status === "uploading");
     const errored = items.some((item) => item.status === "error");
@@ -2297,6 +2336,7 @@ function createChatAttachmentsController() {
   }
 
   return {
+    render: renderAttachments,
     addFiles,
     rejectUnsupported,
     remove,
@@ -2316,10 +2356,37 @@ function createChatAttachmentsController() {
   };
 }
 
-const chatAttachmentController = createChatAttachmentsController();
+let composerPage = null;
+const composerStorageKey = queueStorageKey + ":drafts";
+const storedComposerDrafts = loadJsonState(composerStorageKey, []);
+const composerDrafts = new Map(
+  Array.isArray(storedComposerDrafts)
+    ? storedComposerDrafts.filter(
+        (item) => Array.isArray(item) && typeof item[0] === "string" && typeof item[1] === "string",
+      )
+    : [],
+);
+const composerAttachments = new Map();
+let chatAttachmentController = createChatAttachmentsController();
+
+function persistComposerDraft() {
+  if (!modernArtifactProtocol || typeof composerPage !== "string") return;
+  composerDrafts.set(composerPage, chatInput.value);
+  saveJsonState(composerStorageKey, Array.from(composerDrafts));
+}
+
+function activateComposerPage(page) {
+  if (!modernArtifactProtocol || composerPage === page) return;
+  persistComposerDraft();
+  if (typeof composerPage === "string") composerAttachments.set(composerPage, chatAttachmentController);
+  composerPage = page;
+  chatInput.value = typeof page === "string" ? composerDrafts.get(page) || "" : "";
+  chatAttachmentController = composerAttachments.get(page) || createChatAttachmentsController(page);
+  chatAttachmentController.render();
+}
 
 function sendQueued(endAfter) {
-  if (ended) return;
+  if (ended || (modernArtifactProtocol && !currentArtifactBinding)) return;
   if (terminalSubmission) {
     if (endAfter && !terminalSubmission.inFlight) retryTerminalSubmission();
     return;
@@ -2349,18 +2416,23 @@ function sendQueued(endAfter) {
       // becomes a sent bubble only when the server's transcript carries it (see submitQueuedOnce).
       render();
       chatInput.value = "";
+      persistComposerDraft();
       chatAttachmentController.reset();
     }
   }
   const shouldEnd = Boolean(endAfter && !chipsBlocked);
-  const preparations = shouldEnd ? [...feedbackPreparations] : [];
-  if (!queued.length && preparations.length === 0) {
+  const preparations = shouldEnd
+    ? [...feedbackPreparations].filter((preparation) => belongsToReviewPage(preparation))
+    : [];
+  const pageQueued = queuedForPage();
+  if (!pageQueued.length && preparations.length === 0) {
     if (!chipsBlocked && !sendFailureOwner) showSendHint();
     return;
   }
   if (!sendFailureOwner) hideSendHint(true);
   if (shouldEnd) {
     const terminal = {
+      page: currentArtifactBinding?.page ?? null,
       prompts: [],
       inFlight: true,
       order: ++nextSendOperationOrder,
@@ -2370,7 +2442,7 @@ function sendQueued(endAfter) {
     finishTerminalPreparation(terminal, preparations);
     return;
   }
-  requestSnapshot("submit", queued.slice(), false, null);
+  requestSnapshot("submit", pageQueued, false, null);
   render();
 }
 
@@ -2401,7 +2473,7 @@ function completeTerminalPreparation(terminal, results) {
     releaseTerminalSubmission(terminal);
     return;
   }
-  terminal.prompts = queued.slice();
+  terminal.prompts = queuedForPage(terminal.page);
   clearPreparationFailure("terminal");
   if (!terminal.prompts.length) {
     releaseTerminalSubmission(terminal);
@@ -2418,6 +2490,7 @@ function completeTerminalPreparation(terminal, results) {
 
 function retryTerminalSubmission() {
   if (!terminalSubmission || terminalSubmission.inFlight || ended) return;
+  if (modernArtifactProtocol && terminalSubmission.page !== currentArtifactBinding?.page) return;
   terminalSubmission.inFlight = true;
   updateSendState();
   requestSnapshot("submit", terminalSubmission.prompts, true, terminalSubmission);
@@ -2949,7 +3022,7 @@ async function probeArtifactAvailability(context) {
 }
 
 function activeWarnings() {
-  return layoutWarnings.filter((warning) => warning && warning.active);
+  return layoutWarnings.filter((warning) => warning && warning.active && belongsToReviewPage(warning));
 }
 
 function pendingLayoutWarningIds() {
@@ -3454,9 +3527,13 @@ async function dismissWarning(id) {
 // One queued batch = one ordinary queued prompt. The CLI cannot tell it apart from any other
 // feedback, which is exactly the point: no parallel agent protocol.
 async function queueSelectedWarningFixes() {
+  const binding = currentArtifactBinding;
+  if (modernArtifactProtocol && !binding) return;
   const preparation = beginFeedbackPreparation();
   if (!preparation) return;
-  const ids = [...selectedWarningIds];
+  const ids = activeWarnings()
+    .filter((warning) => warning.selectable && selectedWarningIds.has(warning.id))
+    .map((warning) => warning.id);
   if (ids.length === 0) {
     preparation.finish(true);
     return;
@@ -3467,11 +3544,20 @@ async function queueSelectedWarningFixes() {
     const response = await fetch("/api/" + key + "/layout-warnings/queue", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify({
+        ids,
+        ...(modernArtifactProtocol ? { page_protocol: 1, page: binding.page, page_proof: binding.proof } : {}),
+      }),
     });
     if (!response.ok) throw new Error("failed to queue layout warning fixes");
     const data = await response.json();
     if (data.prompt) {
+      if (
+        modernArtifactProtocol &&
+        (!Array.isArray(data.prompt.target?.warnings) ||
+          data.prompt.target.warnings.some((warning) => !belongsToReviewPage(warning, binding.page)))
+      )
+        throw new Error("layout warning page mismatch");
       if (
         !enqueuePrompt(
           {
@@ -3483,14 +3569,15 @@ async function queueSelectedWarningFixes() {
             target: data.prompt.target,
           },
           preparation,
+          binding,
         )
       )
         throw new Error("failed to retain layout warning fixes");
     }
-    selectedWarningIds.clear();
+    for (const id of ids) selectedWarningIds.delete(id);
     persistWarningSelection();
     if (Array.isArray(data.warnings)) setLayoutWarnings(data.warnings);
-    closeWarningsDrawer({ restoreFocus: true });
+    if (!modernArtifactProtocol || binding === currentArtifactBinding) closeWarningsDrawer({ restoreFocus: true });
     clearPreparationFailure("layout-warnings");
     succeeded = true;
   } catch {
@@ -5136,6 +5223,18 @@ function challengeArtifactDocument(expectedDocumentId = "") {
       return;
     }
     const validated = typeof validation.json === "function" ? await validation.json().catch(() => ({})) : {};
+    // A retired challenge cannot activate a document, but a successfully signed
+    // response still belongs to its exact historical document/destination.
+    rememberHistoricalDestination(
+      message.document_id,
+      destinationPayload({
+        page: message.page,
+        proof: message.page_proof,
+        route: String(message.served_route || ""),
+        destination: normalizeArtifactDestination(message.destination, String(message.served_route || "")),
+      }),
+      validated.receipt,
+    );
     if (answered || expired) return;
     if (
       artifactChallengeAttempt !== attempt ||
@@ -5176,6 +5275,9 @@ function challengeArtifactDocument(expectedDocumentId = "") {
     currentArtifactBinding = binding;
     stampLegacyQueuedPrompts(binding);
     activatePageReviewState(binding.page);
+    activateComposerPage(binding.page);
+    render();
+    renderWarnings();
     const destination = bindingDestination(binding);
     binding.destination = destination;
     rememberHistoricalDestination(
@@ -5457,7 +5559,10 @@ chatInput.addEventListener("keydown", (event) => {
     sendQueued(false);
   }
 });
-chatInput.addEventListener("input", () => hideSendHint());
+chatInput.addEventListener("input", () => {
+  persistComposerDraft();
+  hideSendHint();
+});
 copyPathButton.onclick = copyFilePath;
 reloadArtifactButton.onclick = reloadArtifact;
 copySnapshotButton.onclick = copyDomSnapshot;

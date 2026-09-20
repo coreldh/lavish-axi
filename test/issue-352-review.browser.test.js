@@ -83,7 +83,29 @@ test(
         ["Push view", "pushed"],
         ["Replace view", "replaced"],
       ]) {
+        if (fragment === "replaced")
+          evalChrome(`() => {
+          window.__delayedHistoryDocument = currentArtifactBinding.documentId;
+          const original = window.fetch;
+          window.fetch = async function(url, init) {
+            const response = await original.apply(this, arguments);
+            if (!window.__delayedHistorySigned && String(url).includes('/artifact-bindings/validate') && JSON.parse(init.body).destination?.url.endsWith('#replaced')) {
+              window.__delayedHistorySigned = response.ok;
+              await new Promise(resolve => { window.__releaseHistoryReceipt = resolve; });
+            }
+            return response;
+          };
+          return true;
+        }`);
         click(label);
+        if (fragment === "replaced") {
+          await eventually(
+            async () => evalChrome("() => window.__delayedHistorySigned"),
+            (text) => /true/.test(text),
+            "receipt was not signed before navigation",
+          );
+          continue;
+        }
         await eventually(
           async () =>
             evalChrome(
@@ -99,6 +121,16 @@ test(
         (text) => text.includes("b.html"),
         "second page did not bind",
       );
+      evalChrome("() => { window.__releaseHistoryReceipt(); return true; }");
+      await eventually(
+        async () =>
+          evalChrome(
+            "() => Array.from(historicalDestinations.values()).some(r => r.document_id === window.__delayedHistoryDocument && r.url.endsWith('#replaced'))",
+          ),
+        (text) => /true/.test(text),
+        "delayed A receipt was lost after B authenticated",
+      );
+      assert.match(evalChrome("() => currentArtifactBinding.page"), /b.html/);
       evalChrome("() => { reloadArtifact(); return true; }");
       await eventually(
         async () => evalChrome("() => currentArtifactBinding?.page"),

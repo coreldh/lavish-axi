@@ -222,7 +222,11 @@ export class SessionStore {
       : { ok: true };
     if (!contextValidation?.ok) return contextValidation?.result || { invalid_page_context: true };
     if (!restoring) {
-      const warningContextValidation = validateLayoutWarningClaims(session.layout_warnings, normalizedPrompts);
+      const warningContextValidation = validateLayoutWarningClaims(
+        session.layout_warnings,
+        normalizedPrompts,
+        Number(payload?.page_protocol) === 1,
+      );
       if (!warningContextValidation.ok) return warningContextValidation.result;
     }
     // Resolve every attachment BEFORE mutating anything. If any prompt's images
@@ -581,7 +585,7 @@ export class SessionStore {
   }
 
   // Prepare the user's explicit triage action. The ordinary prompt queue commits it when sent.
-  async prepareLayoutWarningFixes(key, ids) {
+  async prepareLayoutWarningFixes(key, ids, options = {}) {
     return this.runExclusive(async () => {
       const state = await this.readState();
       const session = state.sessions[key];
@@ -591,6 +595,18 @@ export class SessionStore {
       const revision = normalizeRevision(session.artifact_revision);
       const at = new Date().toISOString();
       const result = queueWarningRecords(session.layout_warnings, ids, { revision, at });
+      const pages = new Set(result.queued.map((warning) => normalizeWarningPage(warning.page)));
+      if (
+        pages.size > 1 ||
+        (Object.hasOwn(options, "page") && result.queued.some((warning) => warning.page !== options.page))
+      )
+        return {
+          session,
+          invalid_page_context: true,
+          queued: [],
+          prompt: null,
+          warnings: serializeLayoutWarnings(session.layout_warnings),
+        };
       if (!result.queued.length) {
         return { session, queued: [], prompt: null, warnings: serializeLayoutWarnings(session.layout_warnings) };
       }
@@ -955,7 +971,8 @@ function migrateLegacyPrompts(session, entryPage, warnings) {
         item.page = warning && Object.hasOwn(warning, "page") ? normalizeWarningPage(warning.page) : null;
         changed = true;
       }
-      // A warning batch is intentionally heterogeneous. It has no common prompt-level page.
+      // Historical batches may predate page isolation. Preserve their recorded
+      // attribution; do not invent a common page while migrating old transcripts.
       continue;
     }
     if (Object.hasOwn(prompt, "page") && prompt.page !== "") continue;
@@ -1309,7 +1326,7 @@ function parseSequenceValue(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-function validateLayoutWarningClaims(warnings, prompts) {
+function validateLayoutWarningClaims(warnings, prompts, modern = false) {
   const records = normalizeStoredWarnings(warnings);
   const invalid = [];
   for (const [promptIndex, prompt] of (Array.isArray(prompts) ? prompts : []).entries()) {
@@ -1318,8 +1335,12 @@ function validateLayoutWarningClaims(warnings, prompts) {
       ? prompt.target.warnings
       : []
     ).entries()) {
-      if (!Object.hasOwn(item || {}, "page") || item.page === null || item.page === "") continue;
       const record = records.find((candidate) => candidate.id === String(item.id || ""));
+      if (modern && (!record || typeof prompt.page !== "string" || normalizeWarningPage(record.page) !== prompt.page)) {
+        invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
+        continue;
+      }
+      if (!Object.hasOwn(item || {}, "page") || item.page === null || item.page === "") continue;
       const claimed = normalizeWarningPage(item.page);
       if (!record || claimed === null || claimed !== normalizeWarningPage(record.page)) {
         invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
