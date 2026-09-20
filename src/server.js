@@ -67,7 +67,6 @@ import {
   loadPageProofKey,
   normalizeReviewPageIdentity,
   pageProofKeyIdentity,
-  pageProofKeyPath,
   readResolvedArtifactPage,
   resolveArtifactEntry,
   resolveArtifactPage,
@@ -382,10 +381,8 @@ export async function serve({
   let bindRecoveryTimer = null;
   const app = express();
   const stateDirectory = path.dirname(path.resolve(stateFile));
-  const pageProofKeyFile = pageProofKeyPath(stateDirectory);
   const pageProofKey = await loadPageProofKey(stateDirectory);
   const protectedPageProofKeyIdentity = pageProofKeyIdentity(pageProofKey);
-  const canonicalPageProofKeyFile = await realpath(pageProofKeyFile);
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
   const watchers = new Map();
@@ -983,7 +980,17 @@ export async function serve({
   }
 
   async function readArtifactPageContent(resolution) {
-    return readResolvedArtifactPage(resolution, artifactPageOpen ? { openFile: artifactPageOpen } : {});
+    return readResolvedArtifactPage(resolution, {
+      forbiddenFileIdentities: [protectedPageProofKeyIdentity],
+      ...(artifactPageOpen ? { openFile: artifactPageOpen } : {}),
+    });
+  }
+
+  async function readArtifactSource(file) {
+    const resolution = await resolveArtifactEntry(file, {
+      ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
+    });
+    return readArtifactPageContent(resolution);
   }
 
   async function freshWhiteboardSource(resolution, res) {
@@ -1284,7 +1291,7 @@ export async function serve({
       }
       logEvent?.(`session opened key=${key} file=${file}`);
       await syncOutstandingRepairs(key);
-      await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
+      await watchSession(session, watchers, events, logEvent, reloadDebounceMs, readArtifactSource);
       res.json({
         key,
         file,
@@ -1792,12 +1799,12 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      const source = await readFile(session.file, "utf8");
+      const source = await readArtifactSource(session.file);
       const root = path.dirname(session.file);
       const { html, warnings } = await buildSelfContainedHtml(source, {
         baseDir: root,
         confineDir: root,
-        forbiddenLocalFiles: [canonicalPageProofKeyFile],
+        forbiddenFileIdentities: [protectedPageProofKeyIdentity],
         resolveAbsolute: resolveDesignAssetPath,
       });
       const { unresolved, notices } = splitExportWarnings(warnings);
@@ -1838,12 +1845,12 @@ export async function serve({
       // the alphabet and length rules, free to drift from the one the CLI uses.
       const generatePassword = body.generate_password === true;
       const password = generatePassword ? generateSharePassword() : optionalBodyString(body.password);
-      const source = await readFile(session.file, "utf8");
+      const source = await readArtifactSource(session.file);
       const root = path.dirname(session.file);
       const { html, warnings } = await buildSelfContainedHtml(source, {
         baseDir: root,
         confineDir: root,
-        forbiddenLocalFiles: [canonicalPageProofKeyFile],
+        forbiddenFileIdentities: [protectedPageProofKeyIdentity],
         resolveAbsolute: resolveDesignAssetPath,
       });
       let site;
@@ -1921,8 +1928,8 @@ export async function serve({
         return;
       }
       const session = chromeLoad.session;
-      await watchSession(session, watchers, events, logEvent, reloadDebounceMs);
-      const artifactHtml = await readFile(session.file, "utf8").catch(() => "");
+      await watchSession(session, watchers, events, logEvent, reloadDebounceMs, readArtifactSource);
+      const artifactHtml = await readArtifactSource(session.file).catch(() => "");
       const { faviconTag, title } = extractArtifactHead(artifactHtml);
       // Nothing legitimately frames the review chrome - it is the top-level
       // page, and shares/exports ship standalone HTML rather than embedding it.
@@ -3517,11 +3524,18 @@ export async function resolveArtifactAsset(root, assetPath) {
 /**
  * @param {(key: string) => number} reloadDebounceMs
  */
-async function watchSession(session, watchers, events, logEvent, reloadDebounceMs = () => RELOAD_DEBOUNCE_MS) {
+async function watchSession(
+  session,
+  watchers,
+  events,
+  logEvent,
+  reloadDebounceMs = () => RELOAD_DEBOUNCE_MS,
+  readSource = undefined,
+) {
   if (watchers.has(session.key)) {
     return;
   }
-  const target = await resolveWatchTarget(session);
+  const target = await resolveWatchTarget(session, { readSource });
   if (watchers.has(session.key)) {
     return;
   }
@@ -3545,13 +3559,13 @@ async function watchSession(session, watchers, events, logEvent, reloadDebounceM
 // itself; an artifact opts back into directory-wide live reload via either a
 // `data-lavish-live-reload-root` attribute on its root element or
 // `<meta name="lavish-live-reload" content="root">`.
-export async function resolveWatchTarget(session) {
+export async function resolveWatchTarget(session, { readSource = (file) => readFile(file, "utf8") } = {}) {
   const baseOptions = {
     ignoreInitial: true,
     awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
   };
   try {
-    const html = await readFile(session.file, "utf8");
+    const html = await readSource(session.file);
     if (hasLiveReloadRootOptIn(html)) {
       return {
         path: path.dirname(session.file),

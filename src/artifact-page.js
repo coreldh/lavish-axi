@@ -444,18 +444,30 @@ export async function resolveArtifactEntry(file, { statFile = stat } = {}) {
 
 /**
  * @param {{ file: string | null, reason: string }} resolution
- * @param {{ openFile?: typeof open }} [options]
+ * @param {{ openFile?: typeof open, forbiddenFileIdentities?: Array<{dev: bigint, ino: bigint}> }} [options]
  */
-export async function readResolvedArtifactPage(resolution, { openFile = open } = {}) {
+export async function readResolvedArtifactPage(resolution, { openFile = open, forbiddenFileIdentities = [] } = {}) {
   const expected = artifactPageIdentities.get(resolution);
   if (!expected || resolution?.reason !== "ok" || !resolution.file) {
-    throw Object.assign(new Error("artifact page resolution is not readable"), { code: "ARTIFACT_PAGE_CHANGED" });
+    throw Object.assign(new Error("artifact page resolution is not readable"), {
+      code: "ARTIFACT_PAGE_CHANGED",
+      status: 403,
+    });
   }
   const handle = await openFile(resolution.file, "r");
   try {
     const opened = await handle.stat({ bigint: true });
     if (!opened.isFile() || opened.dev !== expected.dev || opened.ino !== expected.ino) {
-      throw Object.assign(new Error("artifact page changed after resolution"), { code: "ARTIFACT_PAGE_CHANGED" });
+      throw Object.assign(new Error("artifact page changed after resolution"), {
+        code: "ARTIFACT_PAGE_CHANGED",
+        status: 403,
+      });
+    }
+    if (forbiddenFileIdentities.some((identity) => sameFileIdentity(opened, identity))) {
+      throw Object.assign(new Error("refusing to read protected local file"), {
+        code: "ARTIFACT_PAGE_CHANGED",
+        status: 403,
+      });
     }
     return await handle.readFile("utf8");
   } finally {

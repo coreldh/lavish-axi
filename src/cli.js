@@ -9,7 +9,7 @@ import {
   realpathSync,
   writeFileSync,
 } from "node:fs";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, writeFile } from "node:fs/promises";
 import { get as httpGet } from "node:http";
 import { isIP } from "node:net";
 import os from "node:os";
@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { AxiError, installSessionStartHooks, RESERVED_COMMANDS, runAxiCli } from "axi-sdk-js";
 
 import { pageProofKeyPath } from "./artifact-page.js";
+import { fileIdentityForPath, readVerifiedLocalFile } from "./verified-local-file.js";
 import { createDesignOutput, DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "./design-reference.js";
 import {
   buildSelfContainedHtml,
@@ -396,10 +397,18 @@ async function openCommand(args) {
 // through its own fatal path, and the self-paint check always fails open.
 async function selfPaintWarningForFile(absolute) {
   try {
-    return analyzeSelfPaint(await readFile(absolute, "utf8")).painted ? undefined : SELF_PAINT_WARNING;
+    return analyzeSelfPaint((await readArtifactSource(absolute)).source).painted ? undefined : SELF_PAINT_WARNING;
   } catch {
     return undefined;
   }
+}
+
+async function readArtifactSource(file) {
+  const forbiddenFileIdentities = [await fileIdentityForPath(pageProofKeyPath(path.dirname(stateFile())))].filter(
+    Boolean,
+  );
+  const bytes = await readVerifiedLocalFile(file, { confineDir: path.dirname(file), forbiddenFileIdentities });
+  return { source: bytes.toString("utf8"), forbiddenFileIdentities };
 }
 
 export function shouldOpenBrowser(args, env) {
@@ -678,11 +687,11 @@ async function exportCommand(args) {
   const absolute = await canonicalFile(file);
   const root = path.dirname(absolute);
   const output = path.resolve(flagValue(args, "--out") || path.join(root, exportFileName(absolute)));
-  const source = await readFile(absolute, "utf8");
+  const { source, forbiddenFileIdentities } = await readArtifactSource(absolute);
   const { html, warnings } = await buildSelfContainedHtml(source, {
     baseDir: root,
     confineDir: root,
-    forbiddenLocalFiles: [pageProofKeyPath(path.dirname(stateFile()))],
+    forbiddenFileIdentities,
     resolveAbsolute: resolveDesignAssetPath,
   });
   await writeFile(output, html);
@@ -745,11 +754,11 @@ export async function shareCommand(args) {
   await assertHtmlFile(request.file);
   const absolute = await canonicalFile(request.file);
   const root = path.dirname(absolute);
-  const source = await readFile(absolute, "utf8");
+  const { source, forbiddenFileIdentities } = await readArtifactSource(absolute);
   const { html, warnings } = await buildSelfContainedHtml(source, {
     baseDir: root,
     confineDir: root,
-    forbiddenLocalFiles: [pageProofKeyPath(path.dirname(stateFile()))],
+    forbiddenFileIdentities,
     resolveAbsolute: resolveDesignAssetPath,
   });
   const selfPaintWarning = analyzeSelfPaint(source).painted ? undefined : SELF_PAINT_WARNING;

@@ -121,6 +121,7 @@ const UNRESOLVED_LOCAL_ASSET_WARNING_KINDS = new Set([
  * @param {(refPath: string) => (string|null)} [options.resolveAbsolute] Map a root-absolute ref (e.g. /design/x.css) to a local path.
  * @param {string} [options.confineDir] Reject local refs that resolve (lexically or via symlink) outside this directory.
  * @param {string[]} [options.forbiddenLocalFiles] Canonical local files that must never be bundled.
+ * @param {Array<{dev: bigint, ino: bigint}>} [options.forbiddenFileIdentities] Already captured protected identities, independent of replaceable pathnames.
  * @param {number} [options.maxAssetBytes] Per-asset inline cap; larger local files are left as references with a warning.
  * @param {number} [options.maxBundleBytes] Per-bundle inline cap across all inlined local assets.
  * @param {number} [options.maxDepth] Local stylesheet-import recursion guard.
@@ -128,13 +129,16 @@ const UNRESOLVED_LOCAL_ASSET_WARNING_KINDS = new Set([
  */
 export async function buildSelfContainedHtml(html, options = {}) {
   const confineDir = options.confineDir ? path.resolve(options.confineDir) : null;
-  const forbiddenFileIdentities = (
-    await Promise.all(
-      (Array.isArray(options.forbiddenLocalFiles) ? options.forbiddenLocalFiles : []).map((file) =>
-        fileIdentityForPath(path.resolve(String(file))),
-      ),
-    )
-  ).filter(Boolean);
+  const forbiddenFileIdentities = [
+    ...(options.forbiddenFileIdentities || []),
+    ...(
+      await Promise.all(
+        (Array.isArray(options.forbiddenLocalFiles) ? options.forbiddenLocalFiles : []).map((file) =>
+          fileIdentityForPath(path.resolve(String(file))),
+        ),
+      )
+    ).filter(Boolean),
+  ];
   const readLocalFile =
     options.readLocalFile ||
     ((absPath, readOptions = {}) =>
