@@ -355,7 +355,7 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   second.port1.close();
 });
 
-test("the protocol-1 SDK sends scoped uploads and authored destinations over its accepted port", async () => {
+test("the protocol-1 SDK sends scoped uploads and authored destinations over its accepted port", async (t) => {
   const sdk = bootSdk({
     sdkOptions: {
       pageProtocol: 1,
@@ -367,6 +367,10 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   const channel = new MessageChannel();
   /** @type {any} */ (channel.port1).unref?.();
   /** @type {any} */ (channel.port2).unref?.();
+  t.after(() => {
+    channel.port1.close();
+    channel.port2.close();
+  });
   const responsePromise = nextPortMessage(channel.port1);
   sdk.dispatchWindowEvent("message", {
     data: { type: "lavish:challenge", challenge: "scoped-upload" },
@@ -437,8 +441,12 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
     id: "stored-image",
   });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(card.querySelector("[data-attachments]").innerHTML, /Ready/);
-  channel.port1.close();
+  const queuedPromise = nextPortMessage(channel.port1);
+  card.querySelector("textarea").value = "Review scoped upload";
+  card.querySelector(".lavish-send").onclick();
+  const queued = await queuedPromise;
+  assert.equal(queued.type, "lavish:queuePrompt");
+  assert.deepEqual(queued.prompt.attachments, [{ id: "stored-image", name: "evidence.png" }]);
 });
 
 test("a requested layout diagnostic publishes even when the result is unchanged", async () => {
