@@ -15,20 +15,37 @@ $operation = $args[0]
 $target = $args[1]
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User
-$acl = Get-Acl -LiteralPath $target
-if ($operation -eq 'restrict') {
-  $acl.SetOwner($sid)
-  $acl.SetAccessRuleProtection($true, $false)
-  foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $sid,
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+  $sid,
+  [System.Security.AccessControl.FileSystemRights]::FullControl,
+  [System.Security.AccessControl.AccessControlType]::Allow
+)
+if ($operation -eq 'create') {
+  $security = [System.Security.AccessControl.FileSecurity]::new()
+  $security.SetOwner($sid)
+  $security.SetAccessRuleProtection($true, $false)
+  [void]$security.AddAccessRule($rule)
+  $stream = [System.IO.FileStream]::new(
+    $target,
+    [System.IO.FileMode]::CreateNew,
     [System.Security.AccessControl.FileSystemRights]::FullControl,
-    [System.Security.AccessControl.AccessControlType]::Allow
+    [System.IO.FileShare]::None,
+    4096,
+    [System.IO.FileOptions]::WriteThrough,
+    $security
   )
-  [void]$acl.AddAccessRule($rule)
-  Set-Acl -LiteralPath $target -AclObject $acl
+  try {
+    $bytes = [byte[]]::new(${PAGE_PROOF_KEY_BYTES})
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
   exit 0
 }
+$acl = Get-Acl -LiteralPath $target
 $ownerSid = try {
   ([System.Security.Principal.NTAccount]::new($acl.Owner)).Translate(
     [System.Security.Principal.SecurityIdentifier]
@@ -205,11 +222,22 @@ export async function loadPageProofKey(
   if (existing) return existing;
 
   const temporary = path.join(directory, `.page-proof.key.${process.pid}.${crypto.randomUUID()}.tmp`);
-  const candidate = crypto.randomBytes(PAGE_PROOF_KEY_BYTES);
   try {
-    await writeFile(temporary, candidate, { flag: "wx", mode: 0o600 });
-    if (platform === "win32") await windowsAcl(temporary, "restrict");
-    else await chmod(temporary, 0o600);
+    if (platform === "win32") {
+      try {
+        await windowsAcl(temporary, "create");
+        await windowsAcl(temporary, "verify");
+      } catch (error) {
+        throw pageProofKeyError(file, error?.message || String(error));
+      }
+      const created = await readFile(temporary);
+      if (created.length !== PAGE_PROOF_KEY_BYTES) {
+        throw pageProofKeyError(file, `the new key must contain exactly ${PAGE_PROOF_KEY_BYTES} bytes`);
+      }
+    } else {
+      await writeFile(temporary, crypto.randomBytes(PAGE_PROOF_KEY_BYTES), { flag: "wx", mode: 0o600 });
+      await chmod(temporary, 0o600);
+    }
     try {
       await link(temporary, file);
     } catch (error) {

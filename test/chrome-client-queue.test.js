@@ -321,7 +321,9 @@ async function createChromeHarness({
           page: modernBinding.page ?? null,
           page_proof: String(modernBinding.proof || "proof"),
           served_route: String(modernBinding.route || ""),
-          destination: String(modernBinding.destination || frameLocation.href || ""),
+          destination: modernBinding.omitDestination
+            ? ""
+            : String(modernBinding.destination || frameLocation.href || ""),
           artifact_load_token: String(modernBinding.token || artifactLoadTokenForHarness || ""),
           artifact_revision:
             modernBinding.revision === undefined ? Number(artifactRevision) : Number(modernBinding.revision),
@@ -6565,6 +6567,48 @@ test("protocol 1 reloads the accepted authored destination for manual and live r
   assert.match(live, /#section-2$/);
   assert.match(live, /__lavish_reload=/);
   assert.notEqual(live, manual, "manual and live reloads each get a fresh discriminator");
+});
+
+test("protocol 1 encodes reserved characters in a served-route fallback", async () => {
+  const route = "sub folder/report#draft%.html";
+  const expectedPath = "/artifact/abc/sub%20folder/report%23draft%25.html";
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/start.html",
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: {
+      page: route,
+      proof: "proof-reserved-page",
+      route,
+      omitDestination: true,
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+
+  chrome.element("reloadArtifact").click();
+  await flushPromises();
+  await flushPromises();
+
+  const request = chrome.artifactBeginRequests.at(-1);
+  const destination = JSON.parse(request.init.body).destination;
+  assert.deepEqual(destination, {
+    url: expectedPath,
+    route,
+    page: route,
+    page_proof: "proof-reserved-page",
+    query: "",
+    fragment: "",
+    fallback_to_entry: false,
+  });
+  assert.equal(chrome.replacedDestinations.at(-1).startsWith(expectedPath + "?"), true);
+  assert.match(chrome.replacedDestinations.at(-1), /__lavish_reload=/);
+
+  chrome.eventSource().listeners.get("reload")();
+  await flushPromises();
+  await flushPromises();
+  const liveDestination = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body).destination;
+  assert.equal(liveDestination.url, expectedPath);
+  assert.equal(chrome.replacedDestinations.at(-1).startsWith(expectedPath + "?"), true);
 });
 
 test("protocol 1 does not activate page state before the server accepts the binding", async () => {

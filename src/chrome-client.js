@@ -420,8 +420,7 @@ function destinationForServedRoute(servedRoute) {
   if (!route || route.includes("\0") || route.includes("\\") || route.startsWith("/")) return "";
   // `served_route` is the server-accepted lexical route. It is deliberately not
   // decoded or normalized here: relative links may depend on its exact alias.
-  // Browsers encode spaces and other URL characters when assigning the URL.
-  return artifactPathPrefix() + route;
+  return artifactPathPrefix() + route.split("/").map(encodeURIComponent).join("/");
 }
 
 function fallbackLocationDestination(candidate) {

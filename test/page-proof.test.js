@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -62,17 +62,44 @@ test("an existing corrupt page proof key fails without silent rotation", async (
 test("Windows page proof keys are restricted and verified through ACLs", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-windows-"));
   const calls = [];
-  const windowsAcl = async (file, operation) => calls.push({ file, operation });
+  const windowsAcl = async (file, operation) => {
+    calls.push({ file, operation });
+    if (operation === "create") {
+      assert.equal(await stat(file).catch(() => null), null);
+      await writeFile(file, Buffer.alloc(32, 11), { flag: "wx" });
+    }
+  };
   try {
     const key = await loadPageProofKey(root, { platform: "win32", windowsAcl });
     assert.equal(key.length, 32);
-    assert.equal(calls[0].operation, "restrict");
+    assert.equal(calls[0].operation, "create");
     assert.match(path.basename(calls[0].file), /^\.page-proof\.key\..+\.tmp$/);
+    assert.deepEqual(calls[1], { file: calls[0].file, operation: "verify" });
     assert.deepEqual(calls.at(-1), { file: path.join(root, "page-proof.key"), operation: "verify" });
 
     calls.length = 0;
     assert.deepEqual(await loadPageProofKey(root, { platform: "win32", windowsAcl }), key);
     assert.deepEqual(calls, [{ file: path.join(root, "page-proof.key"), operation: "verify" }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows removes an incomplete atomic key creation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-windows-failed-create-"));
+  try {
+    await assert.rejects(
+      loadPageProofKey(root, {
+        platform: "win32",
+        windowsAcl: async (file, operation) => {
+          if (operation !== "create") return;
+          await writeFile(file, Buffer.alloc(1), { flag: "wx" });
+          throw new Error("atomic creation failed");
+        },
+      }),
+      /page-proof\.key.*atomic creation failed.*invalidates existing queued page proofs/i,
+    );
+    assert.deepEqual(await readdir(root), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
