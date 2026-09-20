@@ -328,7 +328,6 @@ async function createChromeHarness({
           artifact_load_token: String(modernBinding.token || artifactLoadTokenForHarness || ""),
           artifact_revision:
             modernBinding.revision === undefined ? Number(artifactRevision) : Number(modernBinding.revision),
-          historical_destination_receipt: String(modernBinding.historicalDestinationReceipt || ""),
           document_id: documentId,
           challenge: String(message.challenge || ""),
         };
@@ -379,21 +378,9 @@ async function createChromeHarness({
       };
     }
     if (String(url).includes("/artifact-bindings/validate")) {
-      const body = init?.body ? JSON.parse(init.body) : null;
-      bindingValidationRequests.push({ url, body });
-      const supplied = bindingValidationResponses.length > 0 ? await bindingValidationResponses.shift() : null;
-      if (supplied && !supplied.ok) return supplied;
-      const suppliedBody = supplied?.json ? await supplied.json() : {};
-      return {
-        ...(supplied || {}),
-        ok: true,
-        status: supplied?.status || 200,
-        json: async () => ({
-          historical_destination_receipt: `receipt-${body?.document_id || "document"}-${bindingValidationRequests.length}`,
-          destination: body?.destination?.url || "",
-          ...suppliedBody,
-        }),
-      };
+      bindingValidationRequests.push({ url, body: init?.body ? JSON.parse(init.body) : null });
+      if (bindingValidationResponses.length > 0) return bindingValidationResponses.shift();
+      return { ok: true, status: 204, json: async () => ({}) };
     }
     return fetchImpl(url, init);
   };
@@ -6636,7 +6623,75 @@ test("protocol 1 recognizes older chrome reload discriminators retained in histo
   assert.equal(request.destination.url, "/artifact/abc/page-a.html?view=review#target");
 });
 
-test("protocol 1 recovers a stale BFCache page only through its proven page identity", async () => {
+test("protocol 1 retains distinct document URLs despite reversed receipt responses and recovers only the exact history key", async () => {
+  const receipts = ["a".repeat(43), "b".repeat(43), "c".repeat(43)];
+  const binding = {
+    page: "a.html",
+    proof: "proof-a",
+    route: "alias.html",
+    documentId: "document-a",
+    destination: "/artifact/abc/alias.html?view=one#first",
+  };
+  /** @type {(value: any) => void} */
+  let releaseFirst = () => {};
+  /** @type {(value: any) => void} */
+  let releaseSecond = () => {};
+  const first = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const second = new Promise((resolve) => {
+    releaseSecond = resolve;
+  });
+  const validationResponses = [
+    { ok: true, json: async () => ({ receipt: receipts[0] }) },
+    first,
+    second,
+    { ok: false, json: async () => ({ status: "stale" }) },
+  ];
+  const chrome = await createChromeHarness({
+    artifactSrc: binding.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: binding,
+    bindingValidationResponses: validationResponses,
+  });
+  await flushPromises();
+  await flushPromises();
+  const activation = chrome.modernPostedToFrame.find((message) => message.type === "lavish:activate");
+  assert.ok(activation);
+  const destinationTwo = "/artifact/abc/alias.html?view=two#second";
+  const destinationThree = "/artifact/abc/alias.html?view=three#third";
+  chrome.sendModernMessage({ ...activation, type: "lavish:documentDestination", destination: destinationTwo });
+  await flushPromises();
+  chrome.sendModernMessage({ ...activation, type: "lavish:documentDestination", destination: destinationThree });
+  await flushPromises();
+  releaseSecond({ ok: true, json: async () => ({ receipt: receipts[2] }) });
+  await flushPromises();
+  releaseFirst({ ok: true, json: async () => ({ receipt: receipts[1] }) });
+  await flushPromises();
+  const retained = JSON.parse(chrome.storage.get("lavish-axi:destination:abc:history"));
+  assert.equal(retained.length, 3);
+  assert.equal(retained.find((record) => record.url === destinationTwo).receipt, receipts[1]);
+  assert.equal(JSON.parse(chrome.storage.get("lavish-axi:destination:abc")).destination, destinationThree);
+  chrome.element("reloadArtifact").click();
+  await flushPromises();
+  await flushPromises();
+  chrome.updateModernBinding({
+    ...binding,
+    destination: destinationTwo,
+    token: activation.artifact_load_token,
+    revision: activation.artifact_revision,
+  });
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
+  await flushPromises();
+  await flushPromises();
+  await flushPromises();
+  const recovery = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body).historical_page;
+  assert.equal(recovery.url, destinationTwo);
+  assert.equal(recovery.document_id, binding.documentId);
+  assert.equal(recovery.receipt, receipts[1]);
+});
+
+test("protocol 1 fails closed for a stale BFCache page without an exact destination receipt", async () => {
   const staleBinding = {
     page: "page-a.html",
     proof: "proof-a",
@@ -6645,7 +6700,6 @@ test("protocol 1 recovers a stale BFCache page only through its proven page iden
     documentId: "stale-page-a",
     token: "stale-load",
     revision: 1,
-    historicalDestinationReceipt: "signed-history-receipt",
   };
   const chrome = await createChromeHarness({
     artifactSrc: "/artifact/abc/page-a.html",
@@ -6668,51 +6722,6 @@ test("protocol 1 recovers a stale BFCache page only through its proven page iden
         json: async () => ({
           artifact_revision: 3,
           artifact_load_token: "recovered-load",
-          artifact_url: "/artifact/abc/trusted-alias.html?tab=2#form",
-          page: "page-a.html",
-          page_proof: "proof-a",
-          served_route: "trusted-alias.html",
-        }),
-      },
-    ],
-    bindingValidationResponses: [{ ok: false, status: 409, json: async () => ({ status: "stale" }) }],
-  });
-  await flushPromises();
-  await flushPromises();
-  await flushPromises();
-
-  const recovery = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body);
-  assert.deepEqual(recovery.historical_destination, {
-    receipt: "signed-history-receipt",
-    document_id: "stale-page-a",
-  });
-  assert.equal(Object.hasOwn(recovery, "destination"), false);
-  assert.doesNotMatch(JSON.stringify(recovery), /untrusted-alias|forged=1|stale-load/);
-  assert.match(chrome.replacedDestinations.at(-1), /^\/artifact\/abc\/trusted-alias\.html\?/);
-  assert.match(chrome.replacedDestinations.at(-1), /tab=2/);
-  assert.match(chrome.replacedDestinations.at(-1), /#form$/);
-  assert.match(chrome.replacedDestinations.at(-1), /__lavish_reload=/);
-});
-
-test("protocol 1 fails closed when a stale BFCache page has no destination receipt", async () => {
-  const chrome = await createChromeHarness({
-    artifactSrc: "/artifact/abc/page-a.html",
-    sessionData: { ...defaultSessionData, pageProtocol: 1 },
-    modernBinding: {
-      page: "page-a.html",
-      proof: "proof-a",
-      route: "page-a.html",
-      destination: "/artifact/abc/page-a.html?tab=2#form",
-      documentId: "stale-without-receipt",
-      token: "stale-load",
-      revision: 1,
-    },
-    beginLoadResponses: [
-      {
-        ok: true,
-        json: async () => ({
-          artifact_revision: 2,
-          artifact_load_token: "current-load",
           artifact_url: "/artifact/abc/page-a.html",
           page: "page-a.html",
           page_proof: "proof-a",
@@ -6726,87 +6735,12 @@ test("protocol 1 fails closed when a stale BFCache page has no destination recei
   await flushPromises();
   await flushPromises();
 
-  assert.equal(chrome.artifactBeginRequests.length, 1);
-  assert.equal(chrome.replacedDestinations.length, 1);
-});
-
-test("protocol 1 keeps the newest signed destination when history receipt responses race", async () => {
-  let resolveFirst;
-  let resolveSecond;
-  const first = new Promise((resolve) => {
-    resolveFirst = resolve;
-  });
-  const second = new Promise((resolve) => {
-    resolveSecond = resolve;
-  });
-  const binding = {
-    page: "page-a.html",
-    proof: "proof-a",
-    route: "page-a.html",
-    destination: "/artifact/abc/page-a.html",
-    documentId: "history-race-document",
-    token: "harness-load-1",
-    revision: 1,
-  };
-  const chrome = await createChromeHarness({
-    artifactSrc: binding.destination,
-    sessionData: {
-      ...defaultSessionData,
-      pageProtocol: 1,
-      initialArtifactLoadToken: binding.token,
-      initialArtifactRevision: binding.revision,
-    },
-    modernBinding: binding,
-    bindingValidationResponses: [{ ok: true, json: async () => ({}) }, first, second],
-  });
-  await flushPromises();
-  await flushPromises();
-  const tuple = {
-    page_protocol: 1,
-    page: binding.page,
-    page_proof: binding.proof,
-    served_route: binding.route,
-    document_id: binding.documentId,
-    document_sequence: 1,
-    artifact_load_token: binding.token,
-    artifact_revision: binding.revision,
-  };
-  chrome.sendModernMessage({
-    ...tuple,
-    type: "lavish:documentDestination",
-    destination: "/artifact/abc/page-a.html?tab=1#first",
-  });
-  chrome.sendModernMessage({
-    ...tuple,
-    type: "lavish:documentDestination",
-    destination: "/artifact/abc/page-a.html?tab=2#second",
-  });
-  await flushPromises();
-  resolveSecond?.({
-    ok: true,
-    json: async () => ({
-      historical_destination_receipt: "receipt-second",
-      destination: "/artifact/abc/page-a.html?tab=2#second",
-    }),
-  });
-  await flushPromises();
-  resolveFirst?.({
-    ok: true,
-    json: async () => ({
-      historical_destination_receipt: "receipt-first",
-      destination: "/artifact/abc/page-a.html?tab=1#first",
-    }),
-  });
-  await flushPromises();
-  await flushPromises();
-
-  const retained = JSON.parse(chrome.storage.get("lavish-axi:destination:abc"));
-  assert.equal(retained.destination, "/artifact/abc/page-a.html?tab=2#second");
-  assert.equal(
-    chrome.modernPostedToFrame.filter((message) => message.type === "lavish:historicalDestinationReceipt").at(-1)
-      .historical_destination_receipt,
-    "receipt-second",
-  );
+  const recovery = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body);
+  assert.equal(recovery.historical_page, undefined);
+  assert.equal(Object.hasOwn(recovery, "destination"), false);
+  assert.doesNotMatch(JSON.stringify(recovery), /untrusted-alias|forged=1|stale-load/);
+  assert.match(chrome.replacedDestinations.at(-1), /^\/artifact\/abc\/page-a\.html\?/);
+  assert.match(chrome.replacedDestinations.at(-1), /__lavish_reload=/);
 });
 
 test("protocol 1 rejects queued prior-generation feedback when the next load begins", async () => {
@@ -6948,14 +6882,14 @@ test("protocol 1 does not activate page state before the server accepts the bind
         page: "page-a.html",
         page_proof: "forged-proof-a",
         served_route: "page-a.html",
-        document_id: "forged-document",
         artifact_load_token: "harness-load-1",
         artifact_revision: 1,
+        document_id: "forged-document",
         destination: {
-          url: "/artifact/abc/page-a.html",
-          route: "page-a.html",
           page: "page-a.html",
           page_proof: "forged-proof-a",
+          route: "page-a.html",
+          url: "/artifact/abc/page-a.html",
           query: "",
           fragment: "",
         },
@@ -9441,6 +9375,7 @@ test("a queued note settles from a compact ack after its transcript entry is evi
 });
 
 test("protocol 1 stamps pre-feature queued writing after authenticating the saved entry", async () => {
+  /** @type {any} */
   let postedBody;
   const entryBinding = {
     page: "entry.html",
@@ -9449,7 +9384,7 @@ test("protocol 1 stamps pre-feature queued writing after authenticating the save
     destination: "/artifact/abc/entry.html",
     documentId: "entry-document",
     token: "harness-load-1",
-    revision: 0,
+    revision: 1,
   };
   const chrome = await createChromeHarness({
     artifactSrc: entryBinding.destination,
@@ -9470,7 +9405,6 @@ test("protocol 1 stamps pre-feature queued writing after authenticating the save
     },
   });
 
-  assert.equal(chrome.queued()[0]._lavishLegacyQueuedPage, true);
   await flushPromises();
   await flushPromises();
   assert.equal(chrome.queued()[0]._lavishLegacyQueuedPage, undefined);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,6 +10,183 @@ import { fileURLToPath } from "node:url";
 
 const runBrowserE2e = process.env.LAVISH_AXI_BROWSER_E2E === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test(
+  "352 stale history retains the accepted alias, author query and fragment",
+  { skip: !runBrowserE2e, timeout: 180_000 },
+  async () => {
+    const temp = await mkdtemp(path.join(tmpdir(), "lavish-352-history-"));
+    const entry = path.join(temp, "entry.html");
+    const port = await freePort();
+    const env = {
+      LAVISH_AXI_PORT: String(port),
+      LAVISH_AXI_STATE_DIR: path.join(temp, "state"),
+      LAVISH_AXI_NO_OPEN: "1",
+      LAVISH_AXI_TELEMETRY: "0",
+      LAVISH_AXI_HOST: "127.0.0.1",
+      LAVISH_AXI_LINK_HOST: "127.0.0.1",
+    };
+    const chromeEnv = {
+      CHROME_DEVTOOLS_AXI_SESSION: `lavish-history-${process.pid}`,
+      CHROME_DEVTOOLS_AXI_USER_DATA_DIR: path.join(temp, "chrome"),
+    };
+    const cli = path.join(repoRoot, "dist", "cli.mjs");
+    const browser = (...args) => run("chrome-devtools-axi", args, chromeEnv);
+    try {
+      await writeFile(
+        entry,
+        '<!doctype html><body><a href="alias.html?view=review&view=full#target">Open history target</a></body>',
+      );
+      await writeFile(
+        path.join(temp, "a.html"),
+        `<!doctype html><body><p id="target">Historical alias target</p><button onclick="history.pushState(null,'','#pushed')">Push view</button><button onclick="history.replaceState(null,'','#replaced')">Replace view</button><a href="b.html">Next document</a>
+        <script>addEventListener('message', e => {
+          if (e.data === 'test-history-hide') {
+            dispatchEvent(new PageTransitionEvent('pagehide', {persisted:true}));
+            parent.postMessage('test-history-hidden', '*');
+          }
+          if (e.data === 'test-history-show') dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}));
+        });</script></body>`,
+      );
+      await writeFile(path.join(temp, "b.html"), "<!doctype html><body><p>Second document</p></body>");
+      await symlink("a.html", path.join(temp, "alias.html"));
+      const opened = run(process.execPath, [cli, entry, "--no-open"], env);
+      const url = opened.match(/url:\s*"([^"]+)"/)?.[1];
+      assert.ok(url, opened);
+      browser("open", url);
+      const evalChrome = (source) => browser("eval", source);
+      await eventually(
+        async () => evalChrome("() => Boolean(currentArtifactBinding)"),
+        (text) => /true/.test(text),
+        "entry did not bind",
+      );
+      evalChrome(
+        '() => { annotation = false; postToFrame({type:"lavish:setAnnotationMode",enabled:false}); return true; }',
+      );
+      const click = (label) => {
+        const line = browser("snapshot")
+          .split("\n")
+          .find((line) => line.includes(label));
+        assert.ok(line, label);
+        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+      };
+      click("Open history target");
+      await eventually(
+        async () =>
+          evalChrome(
+            '() => Array.from(historicalDestinations.values()).some(r => r.url.endsWith("alias.html?view=review&view=full#target"))',
+          ),
+        (text) => /true/.test(text),
+        "alias receipt was not retained",
+      );
+      for (const [label, fragment] of [
+        ["Push view", "pushed"],
+        ["Replace view", "replaced"],
+      ]) {
+        click(label);
+        await eventually(
+          async () =>
+            evalChrome(
+              `() => Array.from(historicalDestinations.values()).some(r => r.url.endsWith("alias.html?view=review&view=full#${fragment}"))`,
+            ),
+          (text) => /true/.test(text),
+          `successful ${label} did not get a destination receipt`,
+        );
+      }
+      click("Next document");
+      await eventually(
+        async () => evalChrome("() => currentArtifactBinding?.page"),
+        (text) => text.includes("b.html"),
+        "second page did not bind",
+      );
+      evalChrome("() => { reloadArtifact(); return true; }");
+      await eventually(
+        async () => evalChrome("() => currentArtifactBinding?.page"),
+        (text) => text.includes("b.html"),
+        "second page reload did not bind",
+      );
+      evalChrome(`() => {
+        window.__historyRecoveryRequests = [];
+        window.__historyValidation = [];
+        const original = window.fetch;
+        window.fetch = function(url, init) {
+          if (String(url).includes('/artifact-loads/begin') && init?.body) {
+            const body = JSON.parse(init.body);
+            if (body.historical_page) window.__historyRecoveryRequests.push(body.historical_page);
+          }
+          const result = original.apply(this, arguments);
+          if (String(url).includes('/artifact-bindings/validate')) result.then(r => r.clone().text().then(text => window.__historyValidation.push({input:JSON.parse(init.body),status:r.status,text})));
+          return result;
+        };
+        return true;
+      }`);
+      browser("back");
+      await eventually(
+        async () => evalChrome("() => currentArtifactBinding?.destination"),
+        (text) => text.includes("alias.html?view=review&view=full#replaced"),
+        "Back lost the exact historical destination",
+      );
+      assert.match(browser("snapshot"), /Historical alias target/);
+      // Chromium may refetch instead of using BFCache for subframe Back. Exercise
+      // the persisted lifecycle explicitly too, keeping the actual SDK document.
+      evalChrome(`() => {
+        window.__historyHidden = false;
+        window.addEventListener('message', e => { if (e.source === frame.contentWindow && e.data === 'test-history-hidden') window.__historyHidden = true; });
+        frame.contentWindow.postMessage('test-history-hide', '*');
+        return true;
+      }`);
+      await eventually(
+        async () => evalChrome("() => window.__historyHidden"),
+        (text) => /result:\s*"true"/.test(text),
+        "SDK document did not receive pagehide",
+      );
+      assert.match(
+        evalChrome(`async () => {
+        const response = await fetch('/api/' + key + '/artifact-loads/begin', {
+          method: 'POST', headers: {'content-type':'application/json'},
+          body: JSON.stringify({request_id:'browser-stale-history', request_sequence: ++artifactLoadRequestSequence,
+            chrome_load_token:chromeLoadToken})
+        });
+        if (!response.ok) throw new Error('generation advance failed');
+        const load = await response.json();
+        artifactLoadRevision = load.artifact_revision;
+        artifactLoadToken = load.artifact_load_token;
+        retireArtifactBinding();
+        frame.contentWindow.postMessage('test-history-show', '*');
+        return true;
+      }`),
+        /result:\s*"true"/,
+      );
+      try {
+        await eventually(
+          async () =>
+            evalChrome(
+              "() => window.__historyRecoveryRequests.length > 0 && currentArtifactBinding?.destination.endsWith('alias.html?view=review&view=full#replaced')",
+            ),
+          (text) => /result:\s*"true"/.test(text),
+          "stale historical document did not recover through its receipt",
+        );
+      } catch (error) {
+        assert.fail(
+          String(error) +
+            evalChrome(
+              "() => JSON.stringify({binding:currentArtifactBinding && {id:currentArtifactBinding.documentId,token:currentArtifactBinding.token,url:currentArtifactBinding.destination},token:artifactLoadToken,ready:latestReadyDocumentId,attempt:artifactChallengeAttempt?.documentId,requests:window.__historyRecoveryRequests,validation:window.__historyValidation})",
+            ),
+        );
+      }
+      assert.match(
+        evalChrome(
+          "() => currentArtifactBinding.token === artifactLoadToken && currentArtifactBinding.revision === artifactLoadRevision",
+        ),
+        /true/,
+      );
+    } finally {
+      cleanupRun(process.execPath, [cli, "stop", "--port", String(port)], env);
+      cleanupRun("chrome-devtools-axi", ["stop"], chromeEnv);
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "352 exact POSIX entry remains reviewable and foreign framing is blocked",

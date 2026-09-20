@@ -494,16 +494,13 @@ export function createArtifactSdk(
     let readyAttempt = 0;
     const READY_RETRY_LIMIT = 24;
     const READY_RETRY_DELAY_MS = 250;
-    const MAX_HISTORICAL_DESTINATION_RECEIPTS = 32;
-    const historicalDestinationReceipts = new Map();
-    const acceptedBinding = /** @type {any} */ ({
+    const acceptedBinding = {
       page: embeddedPage,
       pageProof: embeddedPageProof,
       servedRoute: embeddedServedRoute,
       documentId,
       documentSequence: 0,
-      historicalDestinationReceipt: "",
-    });
+    };
     const transportBridge = {
       currentPort: null,
       handlers: new Set(),
@@ -564,22 +561,6 @@ export function createArtifactSdk(
       String(window.location?.pathname || "") +
       String(window.location?.search || "") +
       String(window.location?.hash || "");
-    const rememberHistoricalDestinationReceipt = (destination, receipt) => {
-      const key = String(destination || "");
-      const value = String(receipt || "");
-      if (!key || !value) return;
-      historicalDestinationReceipts.delete(key);
-      historicalDestinationReceipts.set(key, value);
-      while (historicalDestinationReceipts.size > MAX_HISTORICAL_DESTINATION_RECEIPTS) {
-        const oldest = historicalDestinationReceipts.keys().next().value;
-        if (typeof oldest !== "string") break;
-        historicalDestinationReceipts.delete(oldest);
-      }
-    };
-    const historicalReceiptForCurrentDestination = () =>
-      historicalDestinationReceipts.get(currentDocumentDestination()) || "";
-    acceptedBinding.rememberHistoricalDestinationReceipt = rememberHistoricalDestinationReceipt;
-    acceptedBinding.historicalReceiptForCurrentDestination = historicalReceiptForCurrentDestination;
     const stopReadyRetry = () => {
       if (readyRetryTimer) window.clearTimeout(readyRetryTimer);
       readyRetryTimer = undefined;
@@ -600,7 +581,6 @@ export function createArtifactSdk(
         destination: currentDocumentDestination(),
         artifact_load_token: String(artifactLoadToken || ""),
         artifact_revision: artifactRevision,
-        historical_destination_receipt: historicalReceiptForCurrentDestination(),
         document_id: documentId,
         challenge,
       };
@@ -633,17 +613,6 @@ export function createArtifactSdk(
         stopReadyRetry();
         port.removeEventListener("message", activateListener);
         acceptedBinding.documentSequence = Number(activation.document_sequence);
-        acceptedBinding.historicalDestinationReceipt = String(
-          activation.historical_destination_receipt || "",
-        );
-        rememberHistoricalDestinationReceipt(
-          currentDocumentDestination(),
-          acceptedBinding.historicalDestinationReceipt,
-        );
-        rememberHistoricalDestinationReceipt(
-          activation.destination,
-          acceptedBinding.historicalDestinationReceipt,
-        );
         transportBridge.bind(port);
         if (!fullSdkInstalled) {
           fullSdkInstalled = true;
@@ -697,7 +666,6 @@ export function createArtifactSdk(
           destination: currentDocumentDestination(),
           artifact_load_token: String(artifactLoadToken || ""),
           artifact_revision: artifactRevision,
-          historical_destination_receipt: historicalReceiptForCurrentDestination(),
           document_id: documentId,
           document_sequence: acceptedBinding.documentSequence,
         });
@@ -735,10 +703,6 @@ export function createArtifactSdk(
               String(window.location?.hash || ""),
             document_id: binding?.documentId || "",
             document_sequence: binding?.documentSequence || 0,
-            historical_destination_receipt:
-              typeof binding?.historicalReceiptForCurrentDestination === "function"
-                ? binding.historicalReceiptForCurrentDestination()
-                : binding?.historicalDestinationReceipt || "",
           }
         : {}),
     };
@@ -2791,20 +2755,6 @@ export function createArtifactSdk(
         Number(msg.artifact_revision) !== Number(artifactRevision))
     )
       return;
-    if (msg.type === "lavish:historicalDestinationReceipt" && binding) {
-      const receipt = String(msg.historical_destination_receipt || "");
-      if (receipt) {
-        binding.historicalDestinationReceipt = receipt;
-        binding.rememberHistoricalDestinationReceipt?.(msg.destination, receipt);
-        binding.rememberHistoricalDestinationReceipt?.(
-          String(window.location?.pathname || "") +
-            String(window.location?.search || "") +
-            String(window.location?.hash || ""),
-          receipt,
-        );
-      }
-      return;
-    }
     if (msg.type === "lavish:setAnnotationMode") setAnnotationMode(msg.enabled);
     if (msg.type === "lavish:attachmentResult") {
       if (
@@ -2835,6 +2785,14 @@ export function createArtifactSdk(
     const announceDestination = () => postArtifactMessage("lavish:documentDestination");
     window.addEventListener("hashchange", announceDestination);
     window.addEventListener("popstate", announceDestination);
+    for (const method of window.history ? ["pushState", "replaceState"] : []) {
+      const original = window.history[method];
+      window.history[method] = function (...args) {
+        const result = Reflect.apply(original, this, args);
+        announceDestination();
+        return result;
+      };
+    }
   } else {
     window.addEventListener("message", handleInboundMessage);
   }

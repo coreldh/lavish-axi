@@ -71,9 +71,9 @@ import {
   readResolvedArtifactPage,
   resolveArtifactEntry,
   resolveArtifactPage,
-  signHistoricalDestinationReceipt,
   signPageProof,
-  verifyHistoricalDestinationReceipt,
+  signHistoricalDestination,
+  verifyHistoricalDestination,
   verifyPageProof,
 } from "./artifact-page.js";
 import {
@@ -1013,6 +1013,10 @@ export async function serve({
     }
   }
 
+  // The accepted canonical file/inode follows the generation through its document GET.
+  // Resolving the lexical alias again is a safety check, never permission to switch targets.
+  const loadDestinations = new Map();
+
   async function validateReloadDestination(session, destination) {
     const entryRoute = path.basename(session.file);
     const root = path.dirname(session.file);
@@ -1025,6 +1029,7 @@ export async function serve({
      *   page?: string,
      *   pageProof?: string,
      *   servedRoute?: string,
+     *   resolution?: Awaited<ReturnType<typeof resolveArtifactPage>>,
      * }}
      */
     const entry = {
@@ -1073,7 +1078,10 @@ export async function serve({
 
     const claim = validatePageClaim(session, canonicalRoot, page, proof, { allowMissing: false });
     if (!claim.ok || claim.page === null) return invalid();
-    const resolution = await resolveArtifactPage(root, route, { entryFile: entryRoute });
+    const resolution = await resolveArtifactPage(root, route, {
+      entryFile: entryRoute,
+      ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
+    });
     if (resolution.reason !== "ok" || resolution.page !== claim.page) return invalid();
 
     try {
@@ -1095,62 +1103,35 @@ export async function serve({
         if (name === "__lavish_reload") return invalid();
       }
       return {
-        ok: true,
+        ok: /** @type {const} */ (true),
         artifactUrl: expectedPath + parsed.search + parsed.hash,
         page: claim.page,
         pageProof: claim.proof,
         servedRoute: resolution.servedRoute || route,
+        resolution,
       };
     } catch {
       return invalid();
     }
   }
 
-  async function validateHistoricalDestination(session, historicalDestination) {
+  async function validateHistoricalPage(session, historicalPage) {
     const invalid = () => /** @type {{ ok: false }} */ ({ ok: false });
+    if (!historicalPage || typeof historicalPage !== "object" || Array.isArray(historicalPage)) return invalid();
+    const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
     if (
-      !historicalDestination ||
-      typeof historicalDestination !== "object" ||
-      Array.isArray(historicalDestination)
+      !verifyHistoricalDestination(
+        pageProofKey,
+        session.key,
+        canonicalRoot,
+        session.file,
+        historicalPage,
+        historicalPage.document_id,
+        historicalPage.receipt,
+      )
     )
       return invalid();
-    const receipt = historicalDestination.receipt;
-    const documentId = historicalDestination.document_id;
-    const entryRoute = path.basename(session.file);
-    const root = path.dirname(session.file);
-    const canonicalRoot = await canonicalArtifactRoot(root);
-    const proven = verifyHistoricalDestinationReceipt(
-      pageProofKey,
-      session.key,
-      canonicalRoot,
-      receipt,
-      documentId,
-      session.file,
-    );
-    if (!proven) return invalid();
-    let parsed;
-    try {
-      parsed = new URL(proven.url, "http://lavish.invalid");
-    } catch {
-      return invalid();
-    }
-    const proof = signPageProof(pageProofKey, session.key, canonicalRoot, proven.page, session.file);
-    const validated = await validateReloadDestination(session, {
-      route: proven.route,
-      page: proven.page,
-      page_proof: proof,
-      url: proven.url,
-      query: parsed.search.slice(1),
-      fragment: parsed.hash.slice(1),
-    });
-    if (
-      !validated.ok ||
-      validated.page !== proven.page ||
-      validated.servedRoute !== proven.route ||
-      validated.artifactUrl !== proven.url
-    )
-      return invalid();
-    return validated;
+    return validateReloadDestination(session, historicalPage);
   }
 
   async function validatePromptContext(session, prompts, payload) {
@@ -2012,11 +1993,11 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      const hasHistoricalDestination = req.body?.historical_destination !== undefined;
-      const destination = hasHistoricalDestination
+      const hasHistoricalPage = req.body?.historical_page !== undefined;
+      const destination = hasHistoricalPage
         ? req.body?.destination === undefined
-          ? await validateHistoricalDestination(session, req.body.historical_destination)
-          : { ok: false }
+          ? await validateHistoricalPage(session, req.body.historical_page)
+          : { ok: /** @type {const} */ (false) }
         : await validateReloadDestination(session, req.body?.destination);
       if (!destination.ok) {
         res.status(400).json({ status: "invalid-destination" });
@@ -2034,6 +2015,15 @@ export async function serve({
       if (result.stale) {
         res.status(409).json({ status: result.stale });
         return;
+      }
+      if (destination.resolution) {
+        loadDestinations.set(req.params.key, {
+          token: result.artifact_load_token,
+          route: destination.servedRoute,
+          resolution: destination.resolution,
+        });
+      } else if (loadDestinations.get(req.params.key)?.token !== result.artifact_load_token) {
+        loadDestinations.delete(req.params.key);
       }
       res.json({
         artifact_revision: result.artifact_revision,
@@ -2074,56 +2064,55 @@ export async function serve({
         allowMissing: false,
       });
       const route = req.body?.served_route;
-      const documentId = req.body?.document_id;
-      if (
-        !claim.ok ||
-        claim.page === null ||
-        typeof route !== "string" ||
-        !route ||
-        typeof documentId !== "string" ||
-        !documentId
-      ) {
+      if (!claim.ok || claim.page === null || typeof route !== "string" || !route) {
         res.status(403).json({ status: "invalid-page-binding" });
         return;
       }
       const entryRoute = path.basename(session.file);
-      const resolved = await resolveArtifactPage(root, route, { entryFile: entryRoute });
+      const resolved = await resolveArtifactPage(root, route, {
+        entryFile: entryRoute,
+        ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
+      });
       if (resolved.reason !== "ok" || resolved.page !== claim.page || resolved.servedRoute !== route) {
         res.status(403).json({ status: "invalid-page-binding" });
         return;
       }
-      const destination = await validateReloadDestination(session, req.body?.destination);
-      if (
-        !destination.ok ||
-        destination.page !== claim.page ||
-        destination.pageProof !== claim.proof ||
-        destination.servedRoute !== route
-      ) {
-        res.status(403).json({ status: "invalid-page-binding" });
-        return;
-      }
-      let historicalDestinationReceipt;
-      try {
-        historicalDestinationReceipt = signHistoricalDestinationReceipt(
+      if (req.body?.destination !== undefined) {
+        if (!req.body.destination) {
+          res.status(403).json({ status: "invalid-destination" });
+          return;
+        }
+        const destination = await validateReloadDestination(session, req.body.destination);
+        if (!destination.ok || destination.page !== claim.page || destination.servedRoute !== route) {
+          res.status(403).json({ status: "invalid-destination" });
+          return;
+        }
+        // Filesystem validation awaits: recheck the generation after it, before minting.
+        const current = await store.verifyArtifactLoad(
+          req.params.key,
+          req.body.artifact_load_token,
+          req.body.artifact_revision,
+        );
+        if (!current?.valid) {
+          res.status(409).json({ status: "stale" });
+          return;
+        }
+        const receipt = signHistoricalDestination(
           pageProofKey,
           session.key,
           canonicalRoot,
-          {
-            page: claim.page,
-            route,
-            url: destination.artifactUrl,
-            documentId,
-          },
           session.file,
+          { page: destination.page, route: destination.servedRoute, url: destination.artifactUrl },
+          req.body.document_id,
         );
-      } catch {
-        res.status(403).json({ status: "invalid-page-binding" });
+        if (!receipt) {
+          res.status(403).json({ status: "invalid-destination" });
+          return;
+        }
+        res.json({ receipt });
         return;
       }
-      res.json({
-        historical_destination_receipt: historicalDestinationReceipt,
-        destination: destination.artifactUrl,
-      });
+      res.status(204).end();
     } catch (error) {
       next(error);
     }
@@ -2215,9 +2204,18 @@ export async function serve({
       const pageProof = signPageProof(pageProofKey, key, canonicalRoot, pageResolution.page, session.file);
       const beforeRead = await store.currentArtifactLoad(key);
       const hadActiveGeneration = Boolean(beforeRead?.valid);
+      const recovered = loadDestinations.get(key);
+      const pinned =
+        recovered?.token === beforeRead?.artifact_load_token && recovered.route === assetPath
+          ? recovered.resolution
+          : null;
+      if (pinned && (pinned.file !== pageResolution.file || pinned.page !== pageResolution.page)) {
+        res.status(403).send("Historical destination changed");
+        return;
+      }
       let html;
       try {
-        html = await readArtifactPageContent(pageResolution);
+        html = await readArtifactPageContent(pinned || pageResolution);
       } catch (error) {
         if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
           res.status(404).send("Not found");

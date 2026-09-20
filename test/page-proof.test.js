@@ -9,13 +9,54 @@ import { promisify } from "node:util";
 import {
   loadPageProofKey,
   normalizePageIdentity,
-  signHistoricalDestinationReceipt,
   signPageProof,
-  verifyHistoricalDestinationReceipt,
   verifyPageProof,
+  signHistoricalDestination,
+  verifyHistoricalDestination,
 } from "../src/artifact-page.js";
 
 const execFileAsync = promisify(execFile);
+
+test("historical receipts are bounded and domain separated, binding root, entry, session, route, URL and document", () => {
+  const key = Buffer.alloc(32, 8);
+  const destination = { page: "a.html", route: "alias.html", url: "/artifact/session/alias.html?author=1#part" };
+  const args = [key, "session", "/root", "/root/entry.html", destination, "document-a"];
+  const receipt = signHistoricalDestination(...args);
+  assert.equal(verifyHistoricalDestination(...args, receipt), true);
+  /** @type {[number, any][]} */
+  const mutations = [
+    [0, Buffer.alloc(32, 9)],
+    [1, "other"],
+    [2, "/other"],
+    [3, "/root/other.html"],
+    [4, { ...destination, page: "b.html" }],
+    [4, { ...destination, route: "a.html" }],
+    [4, { ...destination, url: destination.url + "-changed" }],
+    [5, "document-b"],
+  ];
+  for (const [index, replacement] of mutations) {
+    const changed = [...args];
+    changed[index] = replacement;
+    assert.equal(verifyHistoricalDestination(...changed, receipt), false);
+  }
+  assert.equal(verifyHistoricalDestination(...args, signPageProof(key, "session", "/root", "a.html")), false);
+  assert.equal(verifyHistoricalDestination(...args, receipt + "="), false);
+  assert.equal(
+    signHistoricalDestination(
+      key,
+      "session",
+      "/root",
+      "/root/entry.html",
+      { ...destination, url: "a".repeat(65537) },
+      "document-a",
+    ),
+    null,
+  );
+  assert.equal(
+    signHistoricalDestination(key, "session", "/root", "/root/entry.html", destination, "a".repeat(257)),
+    null,
+  );
+});
 
 test(
   "literal POSIX entry proof binds exact saved identity without authorizing sibling syntax",
@@ -79,47 +120,6 @@ test("page proofs bind the session, canonical root, and normalized page", () => 
   assert.equal(normalizePageIdentity("./sub/../page.html"), "page.html");
   assert.equal(normalizePageIdentity("../outside.html"), null);
   assert.equal(normalizePageIdentity("C:\\outside.html"), null);
-});
-
-test("historical destination receipts bind exact navigation and document identity", () => {
-  const key = Buffer.alloc(32, 5);
-  const destination = {
-    page: "sub/page.html",
-    route: "alias.html",
-    url: "/artifact/session-1/alias.html?tab=2#form",
-    documentId: "document-a",
-  };
-  const receipt = signHistoricalDestinationReceipt(key, "session-1", "/tmp/root", destination);
-  const pageProof = signPageProof(key, "session-1", "/tmp/root", destination.page);
-  assert.deepEqual(
-    verifyHistoricalDestinationReceipt(key, "session-1", "/tmp/root", receipt, "document-a"),
-    destination,
-  );
-  assert.equal(verifyHistoricalDestinationReceipt(key, "session-2", "/tmp/root", receipt, "document-a"), null);
-  assert.equal(verifyHistoricalDestinationReceipt(key, "session-1", "/tmp/other", receipt, "document-a"), null);
-  assert.equal(verifyHistoricalDestinationReceipt(key, "session-1", "/tmp/root", receipt, "document-b"), null);
-  assert.equal(verifyPageProof(key, "session-1", "/tmp/root", destination.page, receipt), false);
-  assert.equal(
-    verifyHistoricalDestinationReceipt(key, "session-1", "/tmp/root", pageProof, "document-a"),
-    null,
-  );
-  assert.equal(
-    verifyHistoricalDestinationReceipt(
-      key,
-      "session-1",
-      "/tmp/root",
-      receipt.slice(0, -1) + (receipt.endsWith("a") ? "b" : "a"),
-      "document-a",
-    ),
-    null,
-  );
-  assert.notEqual(
-    signHistoricalDestinationReceipt(key, "session-1", "/tmp/root", {
-      ...destination,
-      url: "/artifact/session-1/alias.html?tab=3#other",
-    }),
-    receipt,
-  );
 });
 
 test(
