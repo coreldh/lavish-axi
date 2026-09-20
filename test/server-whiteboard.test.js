@@ -27,6 +27,7 @@ const ARTIFACT_HTML = `<!doctype html><html><body>
 const PNG_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
+/** @param {{ artifactPageOpen?: (...args: any[]) => any }} [options] */
 async function startWhiteboardServer({ artifactPageOpen } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-wb-server-"));
   const assetsDir = path.join(dir, "whiteboard-assets");

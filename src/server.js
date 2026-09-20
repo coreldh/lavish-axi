@@ -1010,6 +1010,15 @@ export async function serve({
     const root = path.dirname(session.file);
     const canonicalRoot = await canonicalArtifactRoot(root);
     const entryPage = normalizeReviewPageIdentity(entryRoute, session.file);
+    /**
+     * @type {{
+     *   ok: true,
+     *   artifactUrl: string,
+     *   page?: string,
+     *   pageProof?: string,
+     *   servedRoute?: string,
+     * }}
+     */
     const entry = {
       ok: true,
       artifactUrl: artifactEntryUrl(session),
@@ -1024,8 +1033,8 @@ export async function serve({
     if (destination === undefined || destination === null) {
       return entry;
     }
-    if (!destination || typeof destination !== "object" || Array.isArray(destination)) return { ok: false };
-    const invalid = () => ({ ok: false });
+    const invalid = () => /** @type {{ ok: false }} */ ({ ok: false });
+    if (!destination || typeof destination !== "object" || Array.isArray(destination)) return invalid();
     const route = destination.route;
     const page = destination.page;
     const proof = destination.page_proof;
