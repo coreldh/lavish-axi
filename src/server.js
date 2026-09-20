@@ -882,7 +882,7 @@ export async function serve({
     if (!context.modern) {
       // Legacy callers intentionally remain entry-only. They must never select a sibling by
       // omission, and the old direct sidecar paths stay readable for already queued prompts.
-      if (!source) return { session, context, file: session.file, page: undefined };
+      if (!source) return { session, context, file: session.file, storagePage: undefined };
       const entryFile = path.basename(session.file);
       const resolution = await resolveArtifactPage(path.dirname(session.file), entryFile, {
         entryFile,
@@ -901,7 +901,7 @@ export async function serve({
       }
       const html = await freshWhiteboardSource(resolution, res);
       if (html === null) return null;
-      return { session, context, file: resolution.file, page: undefined, source: html };
+      return { session, context, file: resolution.file, storagePage: undefined, source: html };
     }
 
     const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
@@ -917,6 +917,8 @@ export async function serve({
       res.status(403).json({ error: "invalid durable whiteboard page proof", code: "WHITEBOARD_PAGE_PROOF" });
       return null;
     }
+    const entryPage = normalizePageIdentity(path.basename(session.file));
+    const storagePage = normalized === entryPage ? undefined : normalized;
     if (source) {
       const entryFile = path.basename(session.file);
       const resolution = await resolveArtifactPage(path.dirname(session.file), normalized, {
@@ -939,11 +941,11 @@ export async function serve({
       }
       const html = await freshWhiteboardSource(resolution, res);
       if (html === null) return null;
-      return { session, context, file: resolution.file, page: normalized, source: html };
+      return { session, context, file: resolution.file, storagePage, source: html };
     }
     // Durable sidecars remain addressable after the source page is deleted. The proof is still
     // session/root/page-bound, but this operation deliberately does not re-read the page.
-    return { session, context, file: null, page: normalized };
+    return { session, context, file: null, storagePage };
   }
 
   function parseWhiteboardIndex(req, res) {
@@ -2331,8 +2333,8 @@ export async function serve({
       if (index === null) return;
       const authorized = await authorizeWhiteboardRequest(req, res);
       if (!authorized) return;
-      const whiteboard = authorized.page
-        ? await loadWhiteboardForPage(whiteboardStateRoot, req.params.key, authorized.page, index)
+      const whiteboard = authorized.storagePage
+        ? await loadWhiteboardForPage(whiteboardStateRoot, req.params.key, authorized.storagePage, index)
         : await loadWhiteboard(whiteboardStateRoot, req.params.key, index);
       res.json({ whiteboard });
     } catch (error) {
@@ -2451,8 +2453,8 @@ export async function serve({
         scene: body.scene ?? null,
         baseline: body.baseline ?? null,
       };
-      if (authorized.page) {
-        await saveWhiteboardForPage(whiteboardStateRoot, req.params.key, authorized.page, index, options);
+      if (authorized.storagePage) {
+        await saveWhiteboardForPage(whiteboardStateRoot, req.params.key, authorized.storagePage, index, options);
       } else {
         await saveWhiteboard(whiteboardStateRoot, req.params.key, index, options);
       }
@@ -2473,11 +2475,11 @@ export async function serve({
       if (!authorized) return;
       const body = req.body || {};
       const options = { scene: body.scene ?? null, pngDataUrl: String(body.pngDataUrl || body.png_data_url || "") };
-      const { scenePath, previewPath } = authorized.page
+      const { scenePath, previewPath } = authorized.storagePage
         ? await writeWhiteboardFeedbackFilesForPage(
             whiteboardStateRoot,
             req.params.key,
-            authorized.page,
+            authorized.storagePage,
             index,
             options,
           )

@@ -255,6 +255,69 @@ test("modern whiteboard content is page-scoped and reads each page fresh", async
   }
 });
 
+test("modern entry whiteboards retain the legacy namespace while siblings stay isolated", async () => {
+  const ctx = await startWhiteboardServer();
+  try {
+    await mkdir(path.join(ctx.dir, "sub"));
+    await writeFile(path.join(ctx.dir, "sub", "page.html"), ARTIFACT_HTML);
+    const entry = await pageContext(ctx, "artifact.html");
+    const sibling = await pageContext(ctx, "sub/page.html");
+
+    const legacyPut = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`, {
+      method: "PUT",
+      headers: ctx.sameOrigin,
+      body: JSON.stringify({ source_hash: "pre-upgrade", scene: { elements: [{ id: "legacy" }] } }),
+    });
+    assert.equal(legacyPut.status, 200);
+
+    const modernEntryRead = await fetch(
+      `${ctx.base}/api/${ctx.key}/whiteboard/0?page=${encodeURIComponent(entry.page)}&page_proof=${encodeURIComponent(entry.page_proof)}`,
+      { headers: { origin: ctx.base } },
+    );
+    assert.equal(modernEntryRead.status, 200);
+    assert.equal((await modernEntryRead.json()).whiteboard.source_hash, "pre-upgrade");
+
+    const modernEntryPut = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`, {
+      method: "PUT",
+      headers: ctx.sameOrigin,
+      body: JSON.stringify({
+        page: entry.page,
+        page_proof: entry.page_proof,
+        source_hash: "modern-entry",
+        scene: { elements: [{ id: "updated-entry" }] },
+      }),
+    });
+    assert.equal(modernEntryPut.status, 200);
+    const legacyRead = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`).then((response) => response.json());
+    assert.equal(legacyRead.whiteboard.source_hash, "modern-entry");
+    assert.equal(legacyRead.whiteboard.scene.elements[0].id, "updated-entry");
+
+    const feedback = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0/feedback-files`, {
+      method: "POST",
+      headers: ctx.sameOrigin,
+      body: JSON.stringify({
+        page: entry.page,
+        page_proof: entry.page_proof,
+        scene: { elements: [{ id: "entry-feedback", type: "rectangle" }] },
+        pngDataUrl: PNG_DATA_URL,
+      }),
+    });
+    assert.equal(feedback.status, 200);
+    const feedbackPaths = await feedback.json();
+    assert.ok(feedbackPaths.scene_path.endsWith(`${path.sep}whiteboards${path.sep}${ctx.key}${path.sep}0.excalidraw`));
+    assert.ok(feedbackPaths.preview_path.endsWith(`${path.sep}whiteboards${path.sep}${ctx.key}${path.sep}0.png`));
+
+    const siblingRead = await fetch(
+      `${ctx.base}/api/${ctx.key}/whiteboard/0?page=${encodeURIComponent(sibling.page)}&page_proof=${encodeURIComponent(sibling.page_proof)}`,
+      { headers: { origin: ctx.base } },
+    );
+    assert.equal(siblingRead.status, 200);
+    assert.equal((await siblingRead.json()).whiteboard, null);
+  } finally {
+    await ctx.close();
+  }
+});
+
 test("modern whiteboard routes fail closed for proof, page, origin and source races", async () => {
   const first = await startWhiteboardServer();
   const second = await startWhiteboardServer();
