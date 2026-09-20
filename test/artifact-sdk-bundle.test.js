@@ -355,6 +355,92 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   second.port1.close();
 });
 
+test("the protocol-1 SDK sends scoped uploads and authored destinations over its accepted port", async () => {
+  const sdk = bootSdk({
+    sdkOptions: {
+      pageProtocol: 1,
+      page: "sub/page.html",
+      pageProof: "proof-sub-page",
+      servedRoute: "sub/page.html",
+    },
+  });
+  const channel = new MessageChannel();
+  /** @type {any} */ (channel.port1).unref?.();
+  /** @type {any} */ (channel.port2).unref?.();
+  const responsePromise = nextPortMessage(channel.port1);
+  sdk.dispatchWindowEvent("message", {
+    data: { type: "lavish:challenge", challenge: "scoped-upload" },
+    ports: [channel.port2],
+  });
+  const response = await responsePromise;
+  assert.equal(response.destination, "/artifact/abc/sub/page.html?view=full#notes");
+  channel.port1.postMessage({ ...response, type: "lavish:activate", document_sequence: 7 });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const destinationPromise = nextPortMessage(channel.port1);
+  sdk.dispatchWindowEvent("hashchange");
+  const destination = await destinationPromise;
+  assert.deepEqual(
+    {
+      type: destination.type,
+      page: destination.page,
+      page_proof: destination.page_proof,
+      served_route: destination.served_route,
+      destination: destination.destination,
+      document_sequence: destination.document_sequence,
+    },
+    {
+      type: "lavish:documentDestination",
+      page: "sub/page.html",
+      page_proof: "proof-sub-page",
+      served_route: "sub/page.html",
+      destination: "/artifact/abc/sub/page.html?view=full#notes",
+      document_sequence: 7,
+    },
+  );
+
+  const { evidence } = buildTable(sdk);
+  sdk.click(evidence);
+  const card = sdk.card();
+  const input = card.querySelector(".lavish-attach-input");
+  input.files = [
+    {
+      name: "evidence.png",
+      type: "image/png",
+      size: 3,
+      arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer,
+    },
+  ];
+  const change = input.listeners.find((listener) => listener.type === "change");
+  assert.ok(change, "the emitted SDK wires the attachment picker");
+  const uploadPromise = nextPortMessage(channel.port1);
+  change.handler();
+  const upload = await uploadPromise;
+  assert.equal(upload.type, "lavish:uploadAttachment");
+  assert.equal(upload.page, "sub/page.html");
+  assert.equal(upload.page_proof, "proof-sub-page");
+  assert.equal(upload.served_route, "sub/page.html");
+  assert.equal(upload.destination, "/artifact/abc/sub/page.html?view=full#notes");
+  assert.equal(upload.document_sequence, 7);
+  assert.equal(upload.artifact_load_token, "load-token");
+  assert.equal(upload.localId, "att-1");
+  assert.equal(upload.bytes.byteLength, 3);
+  assert.ok(upload.nonce);
+
+  channel.port1.postMessage({
+    ...response,
+    type: "lavish:attachmentResult",
+    document_sequence: 7,
+    nonce: upload.nonce,
+    localId: upload.localId,
+    ok: true,
+    id: "stored-image",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(card.querySelector("[data-attachments]").innerHTML, /Ready/);
+  channel.port1.close();
+});
+
 test("a requested layout diagnostic publishes even when the result is unchanged", async () => {
   const sdk = bootSdk({ runAnimationFrames: true });
 

@@ -72,6 +72,7 @@ async function createChromeHarness({
   artifactSrc = "",
   storage = new Map(),
   beginLoadResponses = [],
+  bindingValidationResponses = [],
   handoffResponses = [],
   storedQueue = null,
   // Opt-in frozen clock. `reloadChromeAfterServerRestart` waits on wall-clock deadlines, so a
@@ -104,6 +105,7 @@ async function createChromeHarness({
   const modernPostedToFrame = [];
   const beginRequests = [];
   const artifactBeginRequests = [];
+  const bindingValidationRequests = [];
   const focusLog = [];
   const clipboardWrites = [];
   let activeElement = null;
@@ -371,6 +373,11 @@ async function createChromeHarness({
           artifact_load_token: `harness-load-${artifactRevision}`,
         }),
       };
+    }
+    if (String(url).includes("/artifact-bindings/validate")) {
+      bindingValidationRequests.push({ url, body: init?.body ? JSON.parse(init.body) : null });
+      if (bindingValidationResponses.length > 0) return bindingValidationResponses.shift();
+      return { ok: true, status: 204, json: async () => ({}) };
     }
     return fetchImpl(url, init);
   };
@@ -656,6 +663,7 @@ async function createChromeHarness({
     },
     beginRequests,
     artifactBeginRequests,
+    bindingValidationRequests,
     artifactLoadToken: frameLoadToken,
     mediaQueries,
     setMobile(matches) {
@@ -6557,6 +6565,54 @@ test("protocol 1 reloads the accepted authored destination for manual and live r
   assert.match(live, /#section-2$/);
   assert.match(live, /__lavish_reload=/);
   assert.notEqual(live, manual, "manual and live reloads each get a fresh discriminator");
+});
+
+test("protocol 1 does not activate page state before the server accepts the binding", async () => {
+  const binding = {
+    page: "page-a.html",
+    proof: "forged-proof-a",
+    route: "page-a.html",
+    destination: "/artifact/abc/page-a.html",
+    documentId: "forged-document",
+    token: "harness-load-1",
+    revision: 1,
+  };
+  const chrome = await createChromeHarness({
+    artifactSrc: binding.destination,
+    sessionData: {
+      ...defaultSessionData,
+      pageProtocol: 1,
+      initialArtifactLoadToken: "harness-load-1",
+      initialArtifactRevision: 1,
+    },
+    modernBinding: binding,
+    bindingValidationResponses: [{ ok: false, status: 403, json: async () => ({ status: "invalid-page-binding" }) }],
+  });
+  await flushPromises();
+  await flushPromises();
+
+  assert.deepEqual(chrome.bindingValidationRequests, [
+    {
+      url: "/api/abc/artifact-bindings/validate",
+      body: {
+        page: "page-a.html",
+        page_proof: "forged-proof-a",
+        served_route: "page-a.html",
+        artifact_load_token: "harness-load-1",
+        artifact_revision: 1,
+      },
+    },
+  ]);
+  assert.equal(
+    chrome.modernPostedToFrame.some((message) => message.type === "lavish:activate"),
+    false,
+  );
+  assert.equal(
+    chrome.modernPostedToFrame.some(
+      (message) => message.type === "lavish:restoreReviewState" || message.type === "lavish:restoreScroll",
+    ),
+    false,
+  );
 });
 
 test("protocol 1 whole-chrome reload retains the bound destination but not an unavailable one", async () => {

@@ -1910,6 +1910,48 @@ export async function serve({
     }
   });
 
+  app.post("/api/:key/artifact-bindings/validate", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ status: "cross-origin" });
+        return;
+      }
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ status: "session-not-found" });
+        return;
+      }
+      const generation = await store.verifyArtifactLoad(
+        req.params.key,
+        req.body?.artifact_load_token,
+        req.body?.artifact_revision,
+      );
+      if (!generation?.valid) {
+        res.status(409).json({ status: "stale" });
+        return;
+      }
+      const root = path.dirname(session.file);
+      const canonicalRoot = await canonicalArtifactRoot(root);
+      const claim = validatePageClaim(session, canonicalRoot, req.body?.page, req.body?.page_proof, {
+        allowMissing: false,
+      });
+      const route = req.body?.served_route;
+      if (!claim.ok || claim.page === null || typeof route !== "string" || !route) {
+        res.status(403).json({ status: "invalid-page-binding" });
+        return;
+      }
+      const entryRoute = path.basename(session.file);
+      const resolved = await resolveArtifactPage(root, route, { entryFile: entryRoute });
+      if (resolved.reason !== "ok" || resolved.page !== claim.page || resolved.servedRoute !== route) {
+        res.status(403).json({ status: "invalid-page-binding" });
+        return;
+      }
+      res.status(204).end();
+    } catch (error) {
+      next(error);
+    }
+  });
+
   const expiredArtifactLoad = (res) =>
     res
       .status(409)

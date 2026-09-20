@@ -1,11 +1,57 @@
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, readFile, unlink, writeFile, link, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 
 const PAGE_PROOF_DOMAIN = "page-v1";
 const PAGE_PROOF_KEY_BYTES = 32;
 const PAGE_PROOF_MAC_BYTES = 32;
 const PAGE_PROOF_MAX_PAGE_BYTES = 16 * 1024;
+const execFileAsync = promisify(execFile);
+const WINDOWS_PAGE_PROOF_ACL_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$operation = $args[0]
+$target = $args[1]
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
+$acl = Get-Acl -LiteralPath $target
+if ($operation -eq 'restrict') {
+  $acl.SetOwner($sid)
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $sid,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+  [void]$acl.AddAccessRule($rule)
+  Set-Acl -LiteralPath $target -AclObject $acl
+  exit 0
+}
+$ownerSid = try {
+  ([System.Security.Principal.NTAccount]::new($acl.Owner)).Translate(
+    [System.Security.Principal.SecurityIdentifier]
+  ).Value
+} catch {
+  [System.Security.Principal.SecurityIdentifier]::new($acl.Owner).Value
+}
+$rules = @($acl.GetAccessRules(
+  $true,
+  $true,
+  [System.Security.Principal.SecurityIdentifier]
+))
+$allows = @($rules | Where-Object {
+  $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
+})
+$foreignAllows = @($allows | Where-Object { $_.IdentityReference.Value -ne $sid.Value })
+$ownerAllows = @($allows | Where-Object { $_.IdentityReference.Value -eq $sid.Value })
+if (-not $acl.AreAccessRulesProtected -or $ownerSid -ne $sid.Value -or
+    $foreignAllows.Count -ne 0 -or $ownerAllows.Count -eq 0) {
+  throw 'the file ACL is not owner-only'
+}
+Write-Output 'PAGE_PROOF_ACL_OK'
+`;
 
 /**
  * A document reached through authored navigation is eligible for review only when it is a local
@@ -102,7 +148,18 @@ function pageProofKeyError(file, detail) {
   );
 }
 
-async function readExistingPageProofKey(file) {
+async function windowsPageProofAcl(file, operation) {
+  const result = await execFileAsync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PAGE_PROOF_ACL_SCRIPT, operation, file],
+    { encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 },
+  );
+  if (operation === "verify" && String(result.stdout || "").trim() !== "PAGE_PROOF_ACL_OK") {
+    throw new Error("the file ACL could not be verified as owner-only");
+  }
+}
+
+async function readExistingPageProofKey(file, { platform, windowsAcl }) {
   let details;
   try {
     details = await lstat(file);
@@ -111,7 +168,15 @@ async function readExistingPageProofKey(file) {
     throw pageProofKeyError(file, error?.message || String(error));
   }
   if (!details.isFile()) throw pageProofKeyError(file, "the path is not a regular file");
-  if ((details.mode & 0o077) !== 0) throw pageProofKeyError(file, "the file is not owner-only (expected mode 0600)");
+  if (platform === "win32") {
+    try {
+      await windowsAcl(file, "verify");
+    } catch (error) {
+      throw pageProofKeyError(file, error?.message || String(error));
+    }
+  } else if ((details.mode & 0o077) !== 0) {
+    throw pageProofKeyError(file, "the file is not owner-only (expected mode 0600)");
+  }
   let value;
   try {
     value = await readFile(file);
@@ -129,18 +194,22 @@ async function readExistingPageProofKey(file) {
  * written before a hard-link installs it at the final name; this avoids a concurrent server ever
  * observing a partially-written key. Losing creators read the winning file instead.
  */
-export async function loadPageProofKey(stateDir) {
+export async function loadPageProofKey(
+  stateDir,
+  { platform = process.platform, windowsAcl = windowsPageProofAcl } = {},
+) {
   const directory = path.resolve(String(stateDir));
   const file = path.join(directory, "page-proof.key");
   await mkdir(directory, { recursive: true });
-  const existing = await readExistingPageProofKey(file);
+  const existing = await readExistingPageProofKey(file, { platform, windowsAcl });
   if (existing) return existing;
 
   const temporary = path.join(directory, `.page-proof.key.${process.pid}.${crypto.randomUUID()}.tmp`);
   const candidate = crypto.randomBytes(PAGE_PROOF_KEY_BYTES);
   try {
     await writeFile(temporary, candidate, { flag: "wx", mode: 0o600 });
-    await chmod(temporary, 0o600);
+    if (platform === "win32") await windowsAcl(temporary, "restrict");
+    else await chmod(temporary, 0o600);
     try {
       await link(temporary, file);
     } catch (error) {
@@ -149,7 +218,7 @@ export async function loadPageProofKey(stateDir) {
   } finally {
     await unlink(temporary).catch(() => {});
   }
-  const winner = await readExistingPageProofKey(file);
+  const winner = await readExistingPageProofKey(file, { platform, windowsAcl });
   if (!winner) throw pageProofKeyError(file, "the key disappeared during initialization");
   return winner;
 }

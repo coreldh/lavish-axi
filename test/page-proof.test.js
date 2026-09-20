@@ -58,3 +58,42 @@ test("an existing corrupt page proof key fails without silent rotation", async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("Windows page proof keys are restricted and verified through ACLs", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-windows-"));
+  const calls = [];
+  const windowsAcl = async (file, operation) => calls.push({ file, operation });
+  try {
+    const key = await loadPageProofKey(root, { platform: "win32", windowsAcl });
+    assert.equal(key.length, 32);
+    assert.equal(calls[0].operation, "restrict");
+    assert.match(path.basename(calls[0].file), /^\.page-proof\.key\..+\.tmp$/);
+    assert.deepEqual(calls.at(-1), { file: path.join(root, "page-proof.key"), operation: "verify" });
+
+    calls.length = 0;
+    assert.deepEqual(await loadPageProofKey(root, { platform: "win32", windowsAcl }), key);
+    assert.deepEqual(calls, [{ file: path.join(root, "page-proof.key"), operation: "verify" }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Windows rejects a page proof key whose ACL is not owner-only", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-windows-open-"));
+  const keyFile = path.join(root, "page-proof.key");
+  try {
+    await writeFile(keyFile, Buffer.alloc(32, 9));
+    await assert.rejects(
+      loadPageProofKey(root, {
+        platform: "win32",
+        windowsAcl: async () => {
+          throw new Error("the file ACL is not owner-only");
+        },
+      }),
+      /page-proof\.key.*ACL is not owner-only.*invalidates existing queued page proofs/i,
+    );
+    assert.deepEqual(await readFile(keyFile), Buffer.alloc(32, 9));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

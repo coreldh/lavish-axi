@@ -216,6 +216,51 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
   }
 });
 
+test("issue 352 authenticates a live page binding before chrome activation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-binding-"));
+  const artifact = path.join(root, "entry.html");
+  try {
+    await writeFile(artifact, "<!doctype html><body>ENTRY</body>");
+    await writeFile(path.join(root, "other.html"), "<!doctype html><body>OTHER</body>");
+    const server = await serve({ port: 0, stateFile: path.join(root, "state.json"), version: "binding-test" });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const { session, load } = await openAndLoad(base, artifact);
+      const entryContext = injectedPageContext(
+        base,
+        await fetch(`${base}/artifact/${session.key}/entry.html`).then((response) => response.text()),
+      );
+      const otherContext = injectedPageContext(
+        base,
+        await fetch(`${base}/artifact/${session.key}/other.html`).then((response) => response.text()),
+      );
+      const validate = (body, origin = base) =>
+        fetch(`${base}/api/${session.key}/artifact-bindings/validate`, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin },
+          body: JSON.stringify(body),
+        });
+      const binding = {
+        page: entryContext.page,
+        page_proof: entryContext.page_proof,
+        served_route: entryContext.route,
+        artifact_load_token: load.artifact_load_token,
+        artifact_revision: load.artifact_revision,
+      };
+
+      assert.equal((await validate(binding)).status, 204);
+      assert.equal((await validate({ ...binding, page_proof: otherContext.page_proof })).status, 403);
+      assert.equal((await validate({ ...binding, served_route: "other.html" })).status, 403);
+      assert.equal((await validate({ ...binding, artifact_load_token: "stale" })).status, 409);
+      assert.equal((await validate(binding, "http://attacker.invalid")).status, 403);
+    } finally {
+      await server.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("issue 352 validates page claims atomically and keeps proofs out of poll output", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-352-context-"));
   const artifact = path.join(root, "entry.html");

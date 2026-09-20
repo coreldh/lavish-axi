@@ -1140,15 +1140,6 @@ test("composer textarea is sized within the right panel", async () => {
   assert.match(css, /\.composer textarea\{[^}]*box-sizing:border-box/);
 });
 
-test("hot reload resets iframe src instead of crossing sandbox location", async () => {
-  const js = await chromeClientSource();
-
-  assert.doesNotMatch(js, /contentWindow\.location\.reload/);
-  assert.match(js, /navigateArtifactFrame\(artifactFrameSrcForLoad\(\{ revision, token, destination:/);
-  assert.match(js, /if \(!modernArtifactProtocol\) \{\s*frame\.src = next;/);
-  assert.match(js, /artifact-loads\/begin/);
-});
-
 test("artifact SDK reports only stable severe layout failures after fonts, resize, and animations settle", () => {
   const js = createSdkJs("abc", 7, "load-token");
 

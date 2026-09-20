@@ -4933,17 +4933,19 @@ function challengeArtifactDocument(expectedDocumentId = "") {
   const channel = new MessageChannel();
   const challenge = randomBindingChallenge();
   let answered = false;
+  let expired = false;
   artifactChallengeInFlight = true;
   const finishChallenge = () => {
     artifactChallengeInFlight = false;
   };
   const timeout = setTimeout(() => {
     if (!answered) {
+      expired = true;
       finishChallenge();
       channel.port1.close();
     }
   }, 5000);
-  channel.port1.addEventListener("message", (event) => {
+  channel.port1.addEventListener("message", async (event) => {
     if (answered || (event.target !== channel.port1 && event.currentTarget !== channel.port1)) return;
     const message = event.data || {};
     if (
@@ -4959,6 +4961,23 @@ function challengeArtifactDocument(expectedDocumentId = "") {
       typeof message.page_proof !== "string"
     )
       return;
+    let validation;
+    try {
+      validation = await fetch("/api/" + key + "/artifact-bindings/validate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          page: message.page,
+          page_proof: message.page_proof,
+          served_route: String(message.served_route || ""),
+          artifact_load_token: String(message.artifact_load_token || ""),
+          artifact_revision: Number(message.artifact_revision),
+        }),
+      });
+    } catch {
+      return;
+    }
+    if (!validation.ok || answered || expired) return;
     answered = true;
     finishChallenge();
     clearTimeout(timeout);
