@@ -1945,6 +1945,62 @@ test("feedback guidance edits the attributed sibling instead of assuming the ses
   assert.doesNotMatch(output.next_step, /changes to \/tmp\/site\/start\.html/);
 });
 
+test("accepted legacy feedback keeps entry attribution while modern null remains unavailable", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-cli-attribution-"));
+  const artifact = path.join(dir, "entry.html");
+  await writeFile(artifact, "<!doctype html><body>Entry</body>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "attribution-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const opened = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+
+    const legacyPost = await fetch(`${base}/api/${opened.key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({
+        prompts: [{ prompt: "Update the entry", tag: "message" }],
+        domSnapshot: "body Entry",
+      }),
+    });
+    assert.equal(legacyPost.status, 200);
+    const legacyPoll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then(
+      (response) => response.json(),
+    );
+    const legacyOutput = createPollOutput({ file: artifact, response: legacyPoll });
+    assert.equal(legacyOutput.prompts[0].page, "entry.html");
+    assert.equal(legacyOutput.snapshot_page, "entry.html");
+    assert.match(legacyOutput.next_step, /Apply the requested changes to entry\.html/);
+
+    const modernPost = await fetch(`${base}/api/${opened.key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify({
+        page_protocol: 1,
+        prompts: [{ prompt: "Keep restored writing", tag: "message", page: null, page_proof: "" }],
+        domSnapshot: "body Unknown",
+        snapshot_page: null,
+        snapshot_page_proof: "",
+      }),
+    });
+    assert.equal(modernPost.status, 200);
+    const modernPoll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then(
+      (response) => response.json(),
+    );
+    const modernOutput = createPollOutput({ file: artifact, response: modernPoll });
+    assert.equal(modernOutput.prompts[0].page, null);
+    assert.equal(modernOutput.snapshot_page, null);
+    assert.match(modernOutput.next_step, /Page attribution is unavailable/);
+    assert.match(modernOutput.next_step, /do not assume the session entry is the edit target/);
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("mixed and unavailable attribution guidance keeps per-item pages and refuses an entry guess", () => {
   const output = createPollOutput({
     file: "/tmp/site/start.html",

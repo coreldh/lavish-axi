@@ -249,10 +249,17 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       await rm(path.join(root, "sub", "page.html"));
       const deleted = await begin("deleted-page", 6, destination);
       assert.equal(deleted.status, 400, "a historical proof is not fresh file-read authorization");
+      assert.deepEqual(await deleted.json(), { status: "invalid-destination" });
 
-      const retained = await begin("invalid-retained-page", 7, { ...destination, fallback_to_entry: true });
-      assert.equal(retained.status, 200, "an invalid destination restored by a new chrome falls back safely");
-      assert.equal((await retained.json()).artifact_url, `/artifact/${session.key}/entry.html`);
+      await writeFile(path.join(root, "sub", "page.html"), "<!doctype html><body>REPLACED</body>");
+      const retargeted = await begin("retargeted-page", 7, {
+        ...destination,
+        route: "entry.html",
+        url: `/artifact/${session.key}/entry.html?view=full&view=print#section-2`,
+        fallback_to_entry: true,
+      });
+      assert.equal(retargeted.status, 400);
+      assert.deepEqual(await retargeted.json(), { status: "invalid-destination" });
     } finally {
       await server.close();
     }

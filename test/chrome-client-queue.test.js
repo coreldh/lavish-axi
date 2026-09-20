@@ -6673,7 +6673,6 @@ test("protocol 1 encodes reserved characters in a served-route fallback", async 
     page_proof: "proof-reserved-page",
     query: "",
     fragment: "",
-    fallback_to_entry: false,
   });
   assert.equal(chrome.replacedDestinations.at(-1).startsWith(expectedPath + "?"), true);
   assert.match(chrome.replacedDestinations.at(-1), /__lavish_reload=/);
@@ -6813,6 +6812,8 @@ test("protocol 1 whole-chrome reload retains the bound destination but not an un
   });
   await flushPromises();
   await flushPromises();
+  const restoredBegin = JSON.parse(second.artifactBeginRequests[0].init.body);
+  assert.equal(Object.hasOwn(restoredBegin.destination, "fallback_to_entry"), false);
   const restored = second.replacedDestinations.at(-1);
   assert.match(restored, /^\/artifact\/abc\/sub\/page\.html\?/);
   assert.match(restored, /mode=review/);

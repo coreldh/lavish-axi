@@ -1006,7 +1006,7 @@ export async function serve({
       return entry;
     }
     if (!destination || typeof destination !== "object" || Array.isArray(destination)) return { ok: false };
-    const invalid = () => (destination.fallback_to_entry === true ? entry : { ok: false });
+    const invalid = () => ({ ok: false });
     const route = destination.route;
     const page = destination.page;
     const proof = destination.page_proof;
@@ -1069,6 +1069,7 @@ export async function serve({
   async function validatePromptContext(session, prompts, payload) {
     const modern = Number(payload?.page_protocol) === 1;
     const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
+    const entryPage = normalizePageIdentity(path.basename(session.file));
     const invalid = [];
     for (const [index, prompt] of prompts.entries()) {
       const claim = validatePageClaim(session, canonicalRoot, prompt?.page, prompt?.page_proof, {
@@ -1076,7 +1077,10 @@ export async function serve({
       });
       if (!claim.ok || (modern && !Object.hasOwn(prompt || {}, "page")))
         invalid.push({ index, prompt_id: prompt?.prompt_id || "" });
-      else if (claim.page !== undefined) {
+      else if (!modern) {
+        prompt.page = entryPage;
+        prompt.page_proof = "";
+      } else if (claim.page !== undefined) {
         prompt.page = claim.page;
         prompt.page_proof = claim.proof;
       }
@@ -1104,7 +1108,7 @@ export async function serve({
       };
     }
     if (snapshot) {
-      payload.snapshot_page = snapshotClaim.page === undefined ? null : snapshotClaim.page;
+      payload.snapshot_page = modern ? (snapshotClaim.page === undefined ? null : snapshotClaim.page) : entryPage;
       payload.snapshot_page_proof = snapshotClaim.proof;
     } else {
       payload.snapshot_page = null;

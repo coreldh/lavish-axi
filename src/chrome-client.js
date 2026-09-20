@@ -526,7 +526,6 @@ function readRetainedDestination() {
     route: String(record.route || ""),
     page: record.page === null ? null : String(record.page || ""),
     proof: String(record.page_proof || ""),
-    fallbackToEntry: true,
   };
 }
 
@@ -559,7 +558,6 @@ function destinationPayload(candidate) {
     page_proof: String(candidate.proof || candidate.page_proof || ""),
     query: queryIndex === -1 ? "" : beforeHash.slice(queryIndex + 1),
     fragment: hashIndex === -1 ? "" : destination.slice(hashIndex + 1),
-    fallback_to_entry: candidate.fallbackToEntry === true,
   };
 }
 
