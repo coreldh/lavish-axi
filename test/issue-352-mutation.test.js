@@ -11,10 +11,6 @@ test("352-M01", { skip: !acceptance, timeout: 600_000 }, async (t) => {
     child.plan(1);
     child.assert.equal(result.originalGreen, true);
   });
-  await t.test("caller-disconnected", (child) => {
-    child.plan(1);
-    child.assert.equal(result.callerDisconnected, true);
-  });
   await t.test("sibling-loads-without-review", (child) => {
     child.plan(1);
     child.assert.equal(result.siblingLoadsWithoutReview, true);

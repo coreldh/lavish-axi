@@ -321,6 +321,38 @@ export async function resolveArtifactPage(root, assetPath, { entryFile = "", sta
   return resolved;
 }
 
+export async function resolveArtifactEntry(file, { statFile = stat } = {}) {
+  const result = (resolvedFile, reason) => ({ file: resolvedFile, reason, page: null, servedRoute: null });
+  const absolute = path.resolve(file);
+  let canonical;
+  try {
+    canonical = await realpath(absolute);
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return result(null, "missing");
+    throw error;
+  }
+  if (canonical !== absolute) return result(null, "forbidden");
+  let details;
+  try {
+    details = await statFile(canonical, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return result(null, "missing");
+    throw error;
+  }
+  if (!details.isFile()) return result(null, "forbidden");
+  let verified;
+  try {
+    verified = await realpath(canonical);
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return result(null, "missing");
+    throw error;
+  }
+  if (verified !== canonical) return result(null, "forbidden");
+  const resolved = result(canonical, "ok");
+  artifactPageIdentities.set(resolved, { dev: details.dev, ino: details.ino });
+  return resolved;
+}
+
 /**
  * @param {{ file: string | null, reason: string }} resolution
  * @param {{ openFile?: typeof open }} [options]

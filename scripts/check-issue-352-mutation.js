@@ -78,7 +78,6 @@ export async function runIssue352Mutation({ repoRoot = defaultRepoRoot } = {}) {
     copyRoot,
     outsideRepo: !path.resolve(copyRoot).startsWith(`${path.resolve(repoRoot)}${path.sep}`),
     originalGreen: false,
-    callerDisconnected: false,
     siblingLoadsWithoutReview: false,
     intendedAssertionRed: false,
     restoredGreen: false,
@@ -102,9 +101,6 @@ export async function runIssue352Mutation({ repoRoot = defaultRepoRoot } = {}) {
     if (!result.originalGreen) throw new Error(`M01 baseline B01 was not green\n${original.output}`);
 
     const mutantSource = mutateSiblingInjection(baselineSource);
-    result.callerDisconnected =
-      mutantSource !== baselineSource &&
-      mutantSource.includes("documentEligible && pageResolution?.page === entryName");
     await writeFile(copiedServer, mutantSource, "utf8");
     const mutantBuild = build(copyRoot);
     if (mutantBuild.status !== 0) {

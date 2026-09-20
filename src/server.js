@@ -66,6 +66,7 @@ import {
   loadPageProofKey,
   normalizePageIdentity,
   readResolvedArtifactPage,
+  resolveArtifactEntry,
   resolveArtifactPage,
   signPageProof,
   verifyPageProof,
@@ -298,6 +299,21 @@ export function resolveIdleTimeoutMs(env = process.env) {
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return DEFAULT_IDLE_TIMEOUT_MS;
   return value;
+}
+
+function artifactDocumentUrl(key, servedRoute) {
+  const encodedRoute = String(servedRoute)
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  return `/artifact/${encodeURIComponent(String(key))}/${encodedRoute}`;
+}
+
+function artifactEntryUrl(session) {
+  const entryRoute = path.basename(session.file);
+  return normalizePageIdentity(entryRoute)
+    ? artifactDocumentUrl(session.key, entryRoute)
+    : `/artifact/${encodeURIComponent(String(session.key))}/index.html`;
 }
 
 /**
@@ -883,9 +899,7 @@ export async function serve({
       // Legacy callers intentionally remain entry-only. They must never select a sibling by
       // omission, and the old direct sidecar paths stay readable for already queued prompts.
       if (!source) return { session, context, file: session.file, storagePage: undefined };
-      const entryFile = path.basename(session.file);
-      const resolution = await resolveArtifactPage(path.dirname(session.file), entryFile, {
-        entryFile,
+      const resolution = await resolveArtifactEntry(session.file, {
         ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
       });
       if (resolution.reason !== "ok") {
@@ -991,14 +1005,6 @@ export async function serve({
     }
   }
 
-  function artifactDocumentUrl(key, servedRoute) {
-    const encodedRoute = String(servedRoute)
-      .split("/")
-      .map((part) => encodeURIComponent(part))
-      .join("/");
-    return `/artifact/${encodeURIComponent(String(key))}/${encodedRoute}`;
-  }
-
   async function validateReloadDestination(session, destination) {
     const entryRoute = path.basename(session.file);
     const root = path.dirname(session.file);
@@ -1006,10 +1012,14 @@ export async function serve({
     const entryPage = normalizePageIdentity(entryRoute);
     const entry = {
       ok: true,
-      artifactUrl: artifactDocumentUrl(session.key, entryRoute),
-      page: entryPage,
-      pageProof: signPageProof(pageProofKey, session.key, canonicalRoot, entryPage),
-      servedRoute: entryRoute,
+      artifactUrl: artifactEntryUrl(session),
+      ...(entryPage
+        ? {
+            page: entryPage,
+            pageProof: signPageProof(pageProofKey, session.key, canonicalRoot, entryPage),
+            servedRoute: entryRoute,
+          }
+        : {}),
     };
     if (destination === undefined || destination === null) {
       return entry;
@@ -1901,8 +1911,7 @@ export async function serve({
         sendSessionNotFound(req, res);
         return;
       }
-      const entryName = path.basename(session.file);
-      res.redirect(`/artifact/${req.params.key}/${encodeURIComponent(entryName)}`);
+      res.redirect(artifactEntryUrl(session));
     } catch (error) {
       next(error);
     }
@@ -2031,10 +2040,7 @@ export async function serve({
       expiredArtifactLoad(res);
       return;
     }
-    const root = path.dirname(beforeRead.session.file);
-    const entryFile = path.basename(beforeRead.session.file);
-    const resolution = await resolveArtifactPage(root, entryFile, {
-      entryFile,
+    const resolution = await resolveArtifactEntry(beforeRead.session.file, {
       ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
     });
     if (resolution.reason !== "ok") {
@@ -3739,7 +3745,7 @@ export function createChromeHtml(
     pageProtocol: 1,
   });
   const { head: pathHead, tail: pathTail } = displayPathParts(session.file);
-  const entryArtifactPath = `/artifact/${session.key}/${encodeURIComponent(path.basename(session.file))}`;
+  const entryArtifactPath = artifactEntryUrl(session);
   const bodyClass = layoutGateEnabled ? "lavish layout-gate-active" : "lavish";
   const layoutGateHidden = layoutGateEnabled ? "" : " hidden";
   const modeHotkeyUpper = MODE_TOGGLE_HOTKEY_KEY.toUpperCase();

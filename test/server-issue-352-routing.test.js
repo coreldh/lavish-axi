@@ -106,6 +106,53 @@ test("issue 352 routes the actual entry basename and keeps legacy virtual index 
   }
 });
 
+test(
+  "issue 352 preserves literal-backslash POSIX entries without admitting backslash siblings",
+  { skip: path.sep !== "/" },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lavish-352-backslash-entry-"));
+    const artifact = path.join(root, "report\\final.html");
+    const sibling = path.join(root, "sibling\\page.html");
+    try {
+      await writeFile(artifact, "<!doctype html><body>EXACT BACKSLASH ENTRY</body>");
+      await writeFile(sibling, "<!doctype html><body>BACKSLASH SIBLING</body>");
+      const server = await serve({ port: 0, stateFile: path.join(root, "state.json"), version: "entry-test" });
+      try {
+        const base = `http://127.0.0.1:${server.port}`;
+        const { session, load } = await openAndLoad(base, artifact);
+        assert.equal(load.artifact_url, `/artifact/${session.key}/index.html`);
+        assert.equal(load.page, undefined);
+        assert.equal(load.page_proof, undefined);
+
+        const redirect = await fetch(`${base}/artifact/${session.key}`, { redirect: "manual" });
+        assert.equal(redirect.status, 302);
+        assert.equal(redirect.headers.get("location"), `/artifact/${session.key}/index.html`);
+
+        const entryUrl = new URL(load.artifact_url, base);
+        entryUrl.searchParams.set("artifact_revision", String(load.artifact_revision));
+        entryUrl.searchParams.set("artifact_load_token", load.artifact_load_token);
+        const entryResponse = await fetch(entryUrl);
+        const entryBody = await entryResponse.text();
+        assert.equal(entryResponse.status, 200);
+        assert.match(entryBody, /EXACT BACKSLASH ENTRY/);
+        assert.match(entryBody, /<script src="\/sdk\.js\?/);
+        assert.doesNotMatch(entryBody, /page_protocol=1/);
+
+        const siblingResponse = await fetch(
+          `${base}/artifact/${session.key}/${encodeURIComponent(path.basename(sibling))}`,
+        );
+        const siblingBody = await siblingResponse.text();
+        assert.equal(siblingResponse.status, 403);
+        assert.doesNotMatch(siblingBody, /BACKSLASH SIBLING/);
+      } finally {
+        await server.close();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test("issue 352 artifact reads reject a validated path swapped to an outside symlink", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-352-artifact-swap-"));
   const outside = await mkdtemp(path.join(tmpdir(), "lavish-352-artifact-outside-"));
