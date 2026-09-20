@@ -1,10 +1,37 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { loadPageProofKey, normalizePageIdentity, signPageProof, verifyPageProof } from "../src/artifact-page.js";
+
+const execFileAsync = promisify(execFile);
+const WINDOWS_ACL_INSPECTION_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$target = $args[0]
+$currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$acl = Get-Acl -LiteralPath $target
+$ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+$foreignAllowCount = @(
+  $acl.GetAccessRules(
+    $true,
+    $true,
+    [System.Security.Principal.SecurityIdentifier]
+  ) | Where-Object {
+    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+    $_.IdentityReference.Value -ne $currentUserSid
+  }
+).Count
+[pscustomobject]@{
+  inheritanceProtected = [bool]$acl.AreAccessRulesProtected
+  currentUserSid = $currentUserSid
+  ownerSid = $ownerSid
+  foreignAllowCount = [int]$foreignAllowCount
+} | ConvertTo-Json -Compress
+`;
 
 test("page proofs bind the session, canonical root, and normalized page", () => {
   const key = Buffer.alloc(32, 7);
@@ -61,6 +88,16 @@ test(
       for (const key of keys) assert.deepEqual(key, first);
       assert.deepEqual(await loadPageProofKey(root), first);
       assert.deepEqual(await readdir(root), ["page-proof.key"]);
+      const inspection = await execFileAsync(
+        "powershell.exe",
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_ACL_INSPECTION_SCRIPT, keyFile],
+        { encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 },
+      );
+      const acl = JSON.parse(String(inspection.stdout || "").trim());
+      assert.equal(acl.inheritanceProtected, true);
+      assert.match(acl.currentUserSid, /^S-\d(?:-\d+)+$/);
+      assert.equal(acl.ownerSid, acl.currentUserSid);
+      assert.equal(acl.foreignAllowCount, 0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
