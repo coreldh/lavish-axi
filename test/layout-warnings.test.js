@@ -310,9 +310,11 @@ test("removing a global viewport marks matching warnings obsolete on every page"
   );
 });
 
-test("warning page normalization rejects backslashes like canonical artifact identity", () => {
+test("warning records preserve authenticated literal entry basenames without interpreting backslashes as paths", () => {
   const result = applyDiagnosticPass([], pass([OVERFLOW], { page: "nested\\page.html" }));
-  assert.equal(result.warnings[0].page, null);
+  assert.equal(result.warnings[0].page, "nested\\page.html");
+  const invalid = applyDiagnosticPass([], pass([OVERFLOW], { page: "sub/nested\\page.html" }));
+  assert.equal(invalid.warnings[0].page, null);
 });
 
 test("the configured diagnostic viewport set falls back to every class", () => {

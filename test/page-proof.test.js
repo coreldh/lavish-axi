@@ -9,6 +9,25 @@ import { promisify } from "node:util";
 import { loadPageProofKey, normalizePageIdentity, signPageProof, verifyPageProof } from "../src/artifact-page.js";
 
 const execFileAsync = promisify(execFile);
+
+test(
+  "literal POSIX entry proof binds exact saved identity without authorizing sibling syntax",
+  { skip: path.sep !== "/" },
+  () => {
+    const key = Buffer.alloc(32, 9);
+    const file = "/tmp/root/report\\final.html";
+    const page = path.basename(file);
+    const proof = signPageProof(key, "session", "/tmp/root", page, file);
+    assert.equal(normalizePageIdentity(page), null);
+    assert.equal(verifyPageProof(key, "session", "/tmp/root", page, proof, file), true);
+    assert.equal(verifyPageProof(key, "session", "/tmp/root", page, proof), false);
+    assert.equal(verifyPageProof(key, "other", "/tmp/root", page, proof, file), false);
+    assert.equal(verifyPageProof(key, "session", "/tmp/other", page, proof, file), false);
+    assert.equal(verifyPageProof(key, "session", "/tmp/root", "report/final.html", proof, file), false);
+    assert.equal(verifyPageProof(key, "session", "/tmp/root", page, proof, "/tmp/root/other.html"), false);
+    assert.throws(() => signPageProof(key, "session", "/tmp/root", "sibling\\page.html", file));
+  },
+);
 const WINDOWS_ACL_INSPECTION_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $target = $args[0]

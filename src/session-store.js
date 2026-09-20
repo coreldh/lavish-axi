@@ -1469,6 +1469,12 @@ function normalizeTarget(target) {
 function normalizeStoredPage(value) {
   if (value === null || value === undefined || value === "") return null;
   const page = String(value);
-  if (page.length > 16 * 1024 || page.includes("\0") || page.includes("\\") || page.startsWith("/")) return null;
+  if (
+    page.length > 16 * 1024 ||
+    page.includes("\0") ||
+    (page.includes("\\") && page.includes("/")) ||
+    page.startsWith("/")
+  )
+    return null;
   return page;
 }

@@ -421,7 +421,7 @@ function artifactPathPrefix() {
 
 function destinationForServedRoute(servedRoute) {
   const route = String(servedRoute || "");
-  if (!route || route.includes("\0") || route.includes("\\") || route.startsWith("/")) return "";
+  if (!route || route.includes("\0") || route.startsWith("/")) return "";
   // `served_route` is the server-accepted lexical route. It is deliberately not
   // decoded or normalized here: relative links may depend on its exact alias.
   return artifactPathPrefix() + route.split("/").map(encodeURIComponent).join("/");

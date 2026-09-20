@@ -115,10 +115,28 @@ function rootDigest(canonicalRoot) {
   return crypto.createHash("sha256").update(String(canonicalRoot), "utf8").digest("hex");
 }
 
-function proofPayload(sessionKey, canonicalRoot, page) {
-  const normalizedPage = normalizePageIdentity(page);
+// Only the server's canonical saved entry may use a literal POSIX backslash.
+// This is not a sibling-path normalizer; callers must supply the saved file,
+// never an identity taken from a request.
+export function normalizeReviewPageIdentity(page, entryFile = "") {
+  if (
+    path.sep === "/" &&
+    entryFile &&
+    page === path.basename(entryFile) &&
+    typeof page === "string" &&
+    page.includes("\\") &&
+    !page.includes("\0") &&
+    Buffer.byteLength(page, "utf8") <= PAGE_PROOF_MAX_PAGE_BYTES
+  )
+    return page;
+  return normalizePageIdentity(page);
+}
+
+function proofPayload(sessionKey, canonicalRoot, page, entryFile) {
+  const normalizedPage = normalizeReviewPageIdentity(page, entryFile);
   if (!normalizedPage) return null;
-  return JSON.stringify([PAGE_PROOF_DOMAIN, String(sessionKey), rootDigest(canonicalRoot), normalizedPage]);
+  const domain = normalizedPage.includes("\\") ? "saved-entry-v1" : PAGE_PROOF_DOMAIN;
+  return JSON.stringify([domain, String(sessionKey), rootDigest(canonicalRoot), normalizedPage]);
 }
 
 function decodeProof(proof) {
@@ -139,19 +157,19 @@ function decodeProof(proof) {
 }
 
 /** Create the fixed-size HMAC proof for an authoritative page identity. */
-export function signPageProof(key, sessionKey, canonicalRoot, page) {
+export function signPageProof(key, sessionKey, canonicalRoot, page, entryFile = "") {
   if (!Buffer.isBuffer(key) || key.length !== PAGE_PROOF_KEY_BYTES) {
     throw new TypeError("page proof key must be exactly 32 bytes");
   }
-  const payload = proofPayload(sessionKey, canonicalRoot, page);
+  const payload = proofPayload(sessionKey, canonicalRoot, page, entryFile);
   if (!payload) throw new TypeError("invalid page identity");
   return crypto.createHmac("sha256", key).update(payload, "utf8").digest("base64url");
 }
 
 /** Verify a proof without touching the filesystem. Source reads still require fresh resolution. */
-export function verifyPageProof(key, sessionKey, canonicalRoot, page, proof) {
+export function verifyPageProof(key, sessionKey, canonicalRoot, page, proof, entryFile = "") {
   if (!Buffer.isBuffer(key) || key.length !== PAGE_PROOF_KEY_BYTES) return false;
-  const expectedPayload = proofPayload(sessionKey, canonicalRoot, page);
+  const expectedPayload = proofPayload(sessionKey, canonicalRoot, page, entryFile);
   const actual = decodeProof(proof);
   if (!expectedPayload || !actual) return false;
   const expected = crypto.createHmac("sha256", key).update(expectedPayload, "utf8").digest();
@@ -265,6 +283,20 @@ export async function loadPageProofKey(
 export async function resolveArtifactPage(root, assetPath, { entryFile = "", statFile = stat } = {}) {
   const result = (file, reason, page = null, servedRoute = null) => ({ file, reason, page, servedRoute });
   const isEntry = typeof entryFile === "string" && entryFile !== "" && assetPath === entryFile;
+  if (
+    isEntry &&
+    path.sep === "/" &&
+    assetPath.includes("\\") &&
+    !assetPath.includes("/") &&
+    !assetPath.includes("\0")
+  ) {
+    const entry = await resolveArtifactEntry(path.join(root, entryFile), { statFile });
+    if (entry.reason === "ok") {
+      entry.page = entryFile;
+      entry.servedRoute = entryFile;
+    }
+    return entry;
+  }
   if ((!isArtifactHtmlPage(assetPath) && !isEntry) || assetPath.includes("\0") || assetPath.includes("\\")) {
     return result(null, "forbidden");
   }
@@ -290,6 +322,7 @@ export async function resolveArtifactPage(root, assetPath, { entryFile = "", sta
 
   const page = asRootRelative(realRoot, realFile);
   if (!page) return result(null, "forbidden");
+  if (!normalizePageIdentity(page)) return result(null, "forbidden");
   // Eligibility follows the canonical target, not merely an HTML-looking
   // symlink name. The saved entry is the sole extensionless exception because
   // CLI validation already established that exact route as the review target.

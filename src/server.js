@@ -64,7 +64,7 @@ import {
   canonicalArtifactRoot,
   isArtifactHtmlPage,
   loadPageProofKey,
-  normalizePageIdentity,
+  normalizeReviewPageIdentity,
   readResolvedArtifactPage,
   resolveArtifactEntry,
   resolveArtifactPage,
@@ -142,7 +142,7 @@ const BROWSER_DISCONNECT_GRACE_MS = 10_000;
 // server origin. Keep every artifact response sandboxed at the response layer
 // so active documents stay opaque-origin even when they are top-level.
 const ARTIFACT_CONTENT_SECURITY_POLICY =
-  "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads";
+  "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads; frame-ancestors 'self'";
 // Sweep orphaned/expired attachments periodically, not just at startup: a
 // detached server can run for days, and an upload whose /prompts follow-up never
 // arrived would otherwise linger until the next restart.
@@ -311,9 +311,7 @@ function artifactDocumentUrl(key, servedRoute) {
 
 function artifactEntryUrl(session) {
   const entryRoute = path.basename(session.file);
-  return normalizePageIdentity(entryRoute)
-    ? artifactDocumentUrl(session.key, entryRoute)
-    : `/artifact/${encodeURIComponent(String(session.key))}/index.html`;
+  return artifactDocumentUrl(session.key, entryRoute);
 }
 
 /**
@@ -757,9 +755,11 @@ export async function serve({
     if (page === null || page === "") {
       return { ok: String(proof || "") === "", page: null, proof: "" };
     }
-    const normalized = normalizePageIdentity(page);
+    const normalized = normalizeReviewPageIdentity(page, session.file);
     const valid = Boolean(
-      normalized && normalized === page && verifyPageProof(pageProofKey, session.key, canonicalRoot, normalized, proof),
+      normalized &&
+      normalized === page &&
+      verifyPageProof(pageProofKey, session.key, canonicalRoot, normalized, proof, session.file),
     );
     return { ok: valid, page: valid ? normalized : null, proof: valid ? String(proof) : "" };
   }
@@ -919,7 +919,7 @@ export async function serve({
     }
 
     const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
-    const normalized = normalizePageIdentity(context.page);
+    const normalized = normalizeReviewPageIdentity(context.page, session.file);
     if (!normalized || normalized !== context.page) {
       rejectWhiteboardRoute(
         res,
@@ -927,11 +927,11 @@ export async function serve({
       );
       return null;
     }
-    if (!verifyPageProof(pageProofKey, key, canonicalRoot, normalized, context.proof)) {
+    if (!verifyPageProof(pageProofKey, key, canonicalRoot, normalized, context.proof, session.file)) {
       res.status(403).json({ error: "invalid durable whiteboard page proof", code: "WHITEBOARD_PAGE_PROOF" });
       return null;
     }
-    const entryPage = normalizePageIdentity(path.basename(session.file));
+    const entryPage = normalizeReviewPageIdentity(path.basename(session.file), session.file);
     const storagePage = normalized === entryPage ? undefined : normalized;
     if (source) {
       const entryFile = path.basename(session.file);
@@ -1009,14 +1009,14 @@ export async function serve({
     const entryRoute = path.basename(session.file);
     const root = path.dirname(session.file);
     const canonicalRoot = await canonicalArtifactRoot(root);
-    const entryPage = normalizePageIdentity(entryRoute);
+    const entryPage = normalizeReviewPageIdentity(entryRoute, session.file);
     const entry = {
       ok: true,
       artifactUrl: artifactEntryUrl(session),
       ...(entryPage
         ? {
             page: entryPage,
-            pageProof: signPageProof(pageProofKey, session.key, canonicalRoot, entryPage),
+            pageProof: signPageProof(pageProofKey, session.key, canonicalRoot, entryPage, session.file),
             servedRoute: entryRoute,
           }
         : {}),
@@ -1092,7 +1092,7 @@ export async function serve({
   async function validatePromptContext(session, prompts, payload) {
     const modern = Number(payload?.page_protocol) === 1;
     const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
-    const entryPage = normalizePageIdentity(path.basename(session.file));
+    const entryPage = normalizeReviewPageIdentity(path.basename(session.file), session.file);
     const invalid = [];
     for (const [index, prompt] of prompts.entries()) {
       const claim = validatePageClaim(session, canonicalRoot, prompt?.page, prompt?.page_proof, {
@@ -2102,7 +2102,7 @@ export async function serve({
         return;
       }
       const canonicalRoot = await canonicalArtifactRoot(root);
-      const pageProof = signPageProof(pageProofKey, key, canonicalRoot, pageResolution.page);
+      const pageProof = signPageProof(pageProofKey, key, canonicalRoot, pageResolution.page, session.file);
       const beforeRead = await store.currentArtifactLoad(key);
       const hadActiveGeneration = Boolean(beforeRead?.valid);
       let html;
@@ -2250,14 +2250,16 @@ export async function serve({
         const servedRoute = String(req.query.served_route || "");
         const root = path.dirname(verified.session.file);
         const canonicalRoot = await canonicalArtifactRoot(root);
-        const pageValid = verifyPageProof(pageProofKey, key, canonicalRoot, page, proof);
+        const pageValid = verifyPageProof(pageProofKey, key, canonicalRoot, page, proof, verified.session.file);
+        const exactEntryRoute =
+          path.sep === "/" && page === path.basename(verified.session.file) && servedRoute === page;
         const routeValid =
           servedRoute &&
           !servedRoute.includes("\0") &&
-          !servedRoute.includes("\\") &&
+          (!servedRoute.includes("\\") || exactEntryRoute) &&
           !path.isAbsolute(servedRoute) &&
           !servedRoute.startsWith("/");
-        if (!pageValid || !routeValid) {
+        if (!pageValid || !routeValid || (page.includes("\\") && !exactEntryRoute)) {
           res.status(403).json({ status: "invalid-page-proof" });
           return;
         }
@@ -2389,7 +2391,7 @@ export async function serve({
       // not use these live fields; this check is intentionally scoped to channel establishment.
       if (context.modern) {
         const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
-        const normalized = normalizePageIdentity(context.page);
+        const normalized = normalizeReviewPageIdentity(context.page, session.file);
         if (!normalized || normalized !== context.page) {
           rejectWhiteboardRoute(
             res,
@@ -2397,7 +2399,7 @@ export async function serve({
           );
           return;
         }
-        if (!verifyPageProof(pageProofKey, req.params.key, canonicalRoot, normalized, context.proof)) {
+        if (!verifyPageProof(pageProofKey, req.params.key, canonicalRoot, normalized, context.proof, session.file)) {
           res.status(403).json({ error: "invalid durable whiteboard page proof", code: "WHITEBOARD_PAGE_PROOF" });
           return;
         }

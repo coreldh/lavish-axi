@@ -61,7 +61,9 @@ export function layoutWarningFingerprint({ rule, target, viewportClass, page = n
 export function normalizeWarningPage(value) {
   if (value === null || value === undefined || value === "") return null;
   if (typeof value !== "string") return null;
-  if (value.includes("\\")) return null;
+  // Already authenticated identities may be exact POSIX entry basenames.
+  // Preserve their literal bytes; this function never resolves a route.
+  if (value.includes("\\")) return !value.includes("/") && !value.includes("\0") ? value : null;
   const page = value.replace(/^\.\/+/, "");
   if (!page || page.startsWith("/") || /^[A-Za-z]:\//.test(page) || page.includes("\0")) return null;
   const parts = [];

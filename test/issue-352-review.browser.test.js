@@ -10,6 +10,85 @@ import { fileURLToPath } from "node:url";
 const runBrowserE2e = process.env.LAVISH_AXI_BROWSER_E2E === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+test(
+  "352 exact POSIX entry remains reviewable and foreign framing is blocked",
+  { skip: !runBrowserE2e || path.sep !== "/", timeout: 180_000 },
+  async () => {
+    const temp = await mkdtemp(path.join(tmpdir(), "lavish-352-exact-entry-"));
+    const entry = path.join(temp, "report\\final.html");
+    const stateDir = path.join(temp, "state");
+    const port = await freePort();
+    const env = {
+      LAVISH_AXI_PORT: String(port),
+      LAVISH_AXI_STATE_DIR: stateDir,
+      LAVISH_AXI_NO_OPEN: "1",
+      LAVISH_AXI_TELEMETRY: "0",
+      LAVISH_AXI_HOST: "127.0.0.1",
+      LAVISH_AXI_LINK_HOST: "127.0.0.1",
+    };
+    const chromeEnv = {
+      CHROME_DEVTOOLS_AXI_SESSION: `lavish-exact-${process.pid}`,
+      CHROME_DEVTOOLS_AXI_USER_DATA_DIR: path.join(temp, "chrome"),
+    };
+    const cli = path.join(repoRoot, "dist", "cli.mjs");
+    const browser = (...args) => run("chrome-devtools-axi", args, chromeEnv);
+    const readState = async () => JSON.parse(await readFile(path.join(stateDir, "state.json"), "utf8"));
+    try {
+      await writeFile(entry, '<!doctype html><body style="font:16px system-ui"><p>Exact entry target</p></body>');
+      const opened = run(process.execPath, [cli, entry, "--no-open"], env);
+      const url = opened.match(/url:\s*"([^"]+)"/)?.[1];
+      assert.ok(url, opened);
+      const key = new URL(url).pathname.split("/").pop();
+      browser("open", url);
+      const click = (label) => {
+        const line = browser("snapshot")
+          .split("\n")
+          .find((line) => line.includes(label));
+        assert.ok(line, label);
+        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+      };
+      await eventually(
+        async () => browser("snapshot"),
+        (tree) => tree.includes("Exact entry target") && !tree.includes("Checking layout."),
+        "exact entry did not bind",
+      );
+      click("Exact entry target");
+      browser("type", "Literal entry draft");
+      const revision = (await readState()).sessions[key].artifact_revision;
+      browser("eval", '() => { document.getElementById("reloadArtifact").click(); return true; }');
+      await eventually(readState, (state) => state.sessions[key].artifact_revision > revision, "reload did not start");
+      await eventually(
+        async () => browser("snapshot"),
+        (tree) => tree.includes("Literal entry draft"),
+        "entry draft did not survive reload",
+      );
+      click('button "Queue"');
+      browser("eval", '() => { document.getElementById("send").click(); return true; }');
+      const state = await eventually(
+        readState,
+        (state) => state.sessions[key].prompts.length > 0,
+        "annotation was not delivered",
+      );
+      assert.equal(state.sessions[key].prompts[0].page, path.basename(entry));
+      assert.equal(state.sessions[key].snapshot_page, path.basename(entry));
+
+      const artifactUrl = new URL(`/artifact/${key}/${encodeURIComponent(path.basename(entry))}`, url).href;
+      const hostile = `<script>window.received=[];addEventListener('message',e=>{received.push(e.data);e.source.postMessage({type:'lavish:bind',...e.data},'*')})</script><iframe src="${artifactUrl}"></iframe>`;
+      browser("open", "data:text/html," + encodeURIComponent(hostile));
+      const result = browser(
+        "eval",
+        "async () => { await new Promise(r => setTimeout(r, 500)); return { received: window.received.length }; }",
+      );
+      assert.match(result, /"received":\s*0/);
+      assert.match(browser("console"), /frame-ancestors|refused to frame/i);
+    } finally {
+      cleanupRun(process.execPath, [cli, "stop", "--port", String(port)], env);
+      cleanupRun("chrome-devtools-axi", ["stop"], chromeEnv);
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);
+
 function run(command, args, env, timeout = 45_000) {
   const result = spawnSync(command, args, {
     cwd: repoRoot,

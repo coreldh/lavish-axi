@@ -116,17 +116,19 @@ test(
     try {
       await writeFile(artifact, "<!doctype html><body>EXACT BACKSLASH ENTRY</body>");
       await writeFile(sibling, "<!doctype html><body>BACKSLASH SIBLING</body>");
+      await symlink(artifact, path.join(root, "alias.html"));
       const server = await serve({ port: 0, stateFile: path.join(root, "state.json"), version: "entry-test" });
       try {
         const base = `http://127.0.0.1:${server.port}`;
         const { session, load } = await openAndLoad(base, artifact);
-        assert.equal(load.artifact_url, `/artifact/${session.key}/index.html`);
-        assert.equal(load.page, undefined);
-        assert.equal(load.page_proof, undefined);
+        const exactUrl = `/artifact/${session.key}/${encodeURIComponent(path.basename(artifact))}`;
+        assert.equal(load.artifact_url, exactUrl);
+        assert.equal(load.page, path.basename(artifact));
+        assert.ok(load.page_proof);
 
         const redirect = await fetch(`${base}/artifact/${session.key}`, { redirect: "manual" });
         assert.equal(redirect.status, 302);
-        assert.equal(redirect.headers.get("location"), `/artifact/${session.key}/index.html`);
+        assert.equal(redirect.headers.get("location"), exactUrl);
 
         const entryUrl = new URL(load.artifact_url, base);
         entryUrl.searchParams.set("artifact_revision", String(load.artifact_revision));
@@ -136,7 +138,63 @@ test(
         assert.equal(entryResponse.status, 200);
         assert.match(entryBody, /EXACT BACKSLASH ENTRY/);
         assert.match(entryBody, /<script src="\/sdk\.js\?/);
-        assert.doesNotMatch(entryBody, /page_protocol=1/);
+        assert.match(entryBody, /page_protocol=1/);
+        assert.match(entryResponse.headers.get("content-security-policy"), /frame-ancestors 'self'/);
+        const sdkSource = entryBody.match(/<script src="([^"]*\/sdk\.js\?[^"]+)">/)[1];
+        assert.equal((await fetch(new URL(sdkSource, base))).status, 200);
+        const context = { page: load.page, page_proof: load.page_proof };
+        const headers = { "content-type": "application/json", origin: base };
+        const diagnostic = await fetch(`${base}/api/${session.key}/layout-diagnostics`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            ...context,
+            page_protocol: 1,
+            artifact_revision: load.artifact_revision,
+            artifact_load_token: load.artifact_load_token,
+            artifact_pass_sequence: 1,
+            document_sequence: 1,
+            complete: true,
+            viewport_width: 1440,
+            findings: [{ selector: "p", kind: "clipped-text", axis: "vertical", overflowPx: 30, severity: "error" }],
+          }),
+        });
+        assert.equal(diagnostic.status, 200);
+        assert.equal((await diagnostic.json()).warnings[0].page, path.basename(artifact));
+        const sdkUrl = new URL(sdkSource, base);
+        sdkUrl.searchParams.set("served_route", path.basename(sibling));
+        assert.equal((await fetch(sdkUrl)).status, 403, "entry proof does not authorize a sibling backslash route");
+        sdkUrl.searchParams.set("served_route", "ordinary.html");
+        assert.equal((await fetch(sdkUrl)).status, 403, "exact-entry proof also requires the exact served route");
+        const saved = await fetch(`${base}/api/${session.key}/whiteboard/0`, {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({ ...context, source_hash: "entry", scene: { elements: [{ id: "entry-scene" }] } }),
+        });
+        assert.equal(saved.status, 200);
+        const legacyScene = await fetch(`${base}/api/${session.key}/whiteboard/0`).then((r) => r.json());
+        assert.equal(legacyScene.whiteboard.scene.elements[0].id, "entry-scene");
+        const sources = await fetch(`${base}/api/${session.key}/mermaid-sources?${new URLSearchParams(context)}`, {
+          headers,
+        });
+        assert.equal(sources.status, 200);
+        const queued = await fetch(`${base}/api/${session.key}/prompts`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            page_protocol: 1,
+            prompts: [{ uid: "exact-entry", tag: "p", selector: "p", prompt: "Review exact entry", ...context }],
+            domSnapshot: "EXACT ENTRY SNAPSHOT",
+            snapshot_page: load.page,
+            snapshot_page_proof: load.page_proof,
+          }),
+        });
+        assert.equal(queued.status, 200);
+        const feedback = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then((r) =>
+          r.json(),
+        );
+        assert.equal(feedback.prompts[0].page, path.basename(artifact));
+        assert.equal(feedback.snapshot_page, path.basename(artifact));
 
         const siblingResponse = await fetch(
           `${base}/artifact/${session.key}/${encodeURIComponent(path.basename(sibling))}`,
@@ -144,6 +202,11 @@ test(
         const siblingBody = await siblingResponse.text();
         assert.equal(siblingResponse.status, 403);
         assert.doesNotMatch(siblingBody, /BACKSLASH SIBLING/);
+        assert.equal(
+          (await fetch(`${base}/artifact/${session.key}/alias.html`)).status,
+          403,
+          "an ordinary sibling alias cannot invoke the exact saved-entry exception",
+        );
       } finally {
         await server.close();
       }
