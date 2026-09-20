@@ -1144,7 +1144,8 @@ test("hot reload resets iframe src instead of crossing sandbox location", async 
   const js = await chromeClientSource();
 
   assert.doesNotMatch(js, /contentWindow\.location\.reload/);
-  assert.match(js, /frame\.src\s*=\s*artifactFrameSrcForLoad\(\{ revision, token \}\)/);
+  assert.match(js, /navigateArtifactFrame\(artifactFrameSrcForLoad\(\{ revision, token, destination:/);
+  assert.match(js, /if \(!modernArtifactProtocol\) \{\s*frame\.src = next;/);
   assert.match(js, /artifact-loads\/begin/);
 });
 
@@ -2757,10 +2758,11 @@ test("begin-load requires the current chrome handoff before any first or direct 
 
     const directRedirect = await fetch(`${base}/artifact/${key}`, { redirect: "manual" });
     assert.equal(directRedirect.status, 302);
+    assert.equal(directRedirect.headers.get("location"), `/artifact/${key}/artifact.html`);
     const directArtifact = await fetch(`${base}${directRedirect.headers.get("location")}`);
-    assert.equal(directArtifact.status, 409);
+    assert.equal(directArtifact.status, 200);
     assert.match(directArtifact.headers.get("content-type") || "", /text\/html/);
-    assert.match(await directArtifact.text(), /Artifact load expired/);
+    assert.match(await directArtifact.text(), /page_protocol=1/);
     const revision = await fetch(`${base}/api/${key}/layout-warnings`).then((response) => response.json());
     assert.equal(revision.revision, firstLoad.artifact_revision);
   } finally {
@@ -6213,7 +6215,7 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(html, /<body class="lavish layout-gate-active">/);
   assert.match(
     html,
-    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
+    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="\/artifact\/abc\/artifact\.html"><\/iframe>/,
   );
   assert.doesNotMatch(html, /<iframe id="artifact"[^>]* src=/);
   assert.match(html, /class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"/);

@@ -37,7 +37,22 @@ test("the SDK bundle scopes every upload and result to this document (E1)", () =
   assert.match(sdk, /nonce: ATTACHMENT_NONCE/);
   assert.match(sdk, /const isTrustedAttachmentResult=/);
   assert.match(sdk, /if \(event\.source !== parent\) return;/);
-  assert.match(sdk, /isTrustedAttachmentResult\(event, \{ parentWindow: parent, nonce: ATTACHMENT_NONCE \}\)/);
+  assert.match(sdk, /transportPort \? \{ port: transportPort \} : \{ parentWindow: parent \}/);
+  assert.match(sdk, /nonce: ATTACHMENT_NONCE/);
+});
+
+test("protocol 1 reports the authored query and fragment from inside the sandboxed document", () => {
+  const modernSdk = createSdkJs("0123456789abcdef", 4, "load-token", {
+    pageProtocol: 1,
+    page: "sub/page.html",
+    pageProof: "proof",
+    servedRoute: "sub/page.html",
+  });
+  assert.match(modernSdk, /destination: currentDocumentDestination\(\)/);
+  assert.match(modernSdk, /window\.location\?\.search/);
+  assert.match(modernSdk, /window\.location\?\.hash/);
+  assert.match(modernSdk, /addEventListener\("hashchange", announceDestination\)/);
+  assert.match(modernSdk, /postArtifactMessage\("lavish:documentDestination"\)/);
 });
 
 test("the SDK bundle applies upload results and offers a retry", () => {

@@ -1813,6 +1813,9 @@ test("poll feedback and the next step are emitted before the bulky DOM snapshot"
     status: "feedback",
     prompts: [{ prompt: "Ship it", tag: "message" }],
     artifact_failures: [{ kind: "artifact-unavailable", detail: "HTTP 404", severity: "fatal" }],
+    session_ended: true,
+    ended_by: "user",
+    snapshot_page: "sub/index.html",
     dom_snapshot: "large snapshot",
   };
   const server = createServer((req, res) => {
@@ -1859,18 +1862,38 @@ test("poll feedback and the next step are emitted before the bulky DOM snapshot"
     const promptsIndex = stdout.indexOf("prompts[");
     const failuresIndex = stdout.indexOf("artifact_failures[");
     const nextStepIndex = stdout.indexOf("next_step:");
+    const snapshotPageIndex = stdout.indexOf("snapshot_page:");
     const snapshotIndex = stdout.indexOf("dom_snapshot:");
     assert.ok(promptsIndex >= 0, "poll stdout contains prompts");
     assert.ok(failuresIndex >= 0, "poll stdout contains artifact_failures");
     assert.ok(nextStepIndex >= 0, "poll stdout contains next_step");
+    assert.ok(snapshotPageIndex >= 0, "poll stdout contains snapshot_page");
     assert.ok(snapshotIndex >= 0, "poll stdout contains dom_snapshot");
     assert.ok(promptsIndex < failuresIndex, "prompts precede artifact_failures in poll stdout");
     assert.ok(failuresIndex < nextStepIndex, "artifact_failures precede next_step in poll stdout");
-    assert.ok(nextStepIndex < snapshotIndex, "next_step precedes dom_snapshot in poll stdout");
+    assert.ok(nextStepIndex < snapshotPageIndex, "next_step precedes snapshot_page in poll stdout");
+    assert.ok(snapshotPageIndex < snapshotIndex, "snapshot_page immediately precedes dom_snapshot in poll stdout");
+    assert.equal(
+      stdout.slice(snapshotPageIndex, snapshotIndex).trim(),
+      "snapshot_page: sub/index.html",
+      "no output field separates the snapshot label from its content",
+    );
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(stateDir, { force: true, recursive: true });
   }
+});
+
+test("empty feedback keeps the null snapshot label adjacent to empty snapshot content", () => {
+  const output = createPollOutput({
+    file: "/tmp/report.html",
+    response: { status: "feedback", prompts: [], snapshot_page: "must-not-survive", dom_snapshot: "" },
+  });
+  const keys = Object.keys(output);
+  const pageIndex = keys.indexOf("snapshot_page");
+  assert.equal(output.snapshot_page, null);
+  assert.equal(output.dom_snapshot, "");
+  assert.equal(keys[pageIndex + 1], "dom_snapshot");
 });
 
 test("feedback next step is Codex-aware when requested", () => {
@@ -1898,6 +1921,56 @@ test("detected layout warnings never appear in poll output", () => {
   assert.equal("layout_warnings" in output, false);
   assert.equal("artifact_failures" in output, false);
   assert.match(output.next_step, /Apply the requested changes/);
+});
+
+test("feedback guidance edits the attributed sibling instead of assuming the session entry", () => {
+  const output = createPollOutput({
+    file: "/tmp/site/start.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [
+        {
+          prompt: "Tighten this heading",
+          tag: "annotation",
+          text: "Details",
+          page: "sub/details.html",
+        },
+      ],
+    },
+  });
+
+  assert.match(output.next_step, /Apply the requested changes to sub\/details\.html/);
+  assert.match(output.next_step, /start\.html remains only the session control target/);
+  assert.doesNotMatch(output.next_step, /changes to \/tmp\/site\/start\.html/);
+});
+
+test("mixed and unavailable attribution guidance keeps per-item pages and refuses an entry guess", () => {
+  const output = createPollOutput({
+    file: "/tmp/site/start.html",
+    response: {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [
+        {
+          prompt: "Fix selected warnings",
+          tag: "layout-warnings",
+          target: {
+            type: "layout-warnings",
+            warnings: [
+              { id: "wa", page: "a.html" },
+              { id: "wb", page: "b.html" },
+              { id: "wu", page: null },
+            ],
+          },
+        },
+      ],
+    },
+  });
+
+  assert.match(output.next_step, /page named on that prompt, warning, or failure/);
+  assert.match(output.next_step, /a\.html, b\.html/);
+  assert.match(output.next_step, /do not assume the session entry is that target/);
 });
 
 test("a queued layout-warnings batch reads as ordinary feedback with lifecycle guidance", () => {

@@ -9,8 +9,10 @@ import {
   MAX_DELIVERED_ATTACHMENTS,
   MAX_REQUEST_ATTACHMENT_REFS,
   SessionStore,
+  migrateLegacySession,
 } from "../src/session-store.js";
 import { MAX_CHAT_STORED_BYTES, storedChatBytes } from "../src/chat-messages.js";
+import { layoutWarningFingerprint } from "../src/layout-warnings.js";
 
 let beginRequestSequence = 0;
 
@@ -37,7 +39,7 @@ function diagnosticPayload(load, sequence, body = {}) {
 
 function feedbackResult(result) {
   assert.equal(result.status, "feedback");
-  return /** @type {{ status: string, dom_snapshot: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string }} */ (
+  return /** @type {{ status: string, dom_snapshot: string, snapshot_page?: string|null, snapshot_page_proof?: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string }} */ (
     result
   );
 }
@@ -1659,6 +1661,125 @@ test("queuePrompts and takeFeedback serialize so a mid-resolution poll never clo
   }
 });
 
+test("snapshot content and page attribution are one replaceable pair", async () => {
+  await withStore(async ({ store, session }) => {
+    await store.queuePrompts(session.key, {
+      domSnapshot: "FIRST snapshot",
+      snapshot_page: "first.html",
+      snapshot_page_proof: "first-proof",
+      prompts: [{ uid: "A", prompt: "First", selector: "", tag: "message", text: "" }],
+    });
+    await store.queuePrompts(session.key, {
+      domSnapshot: "SECOND snapshot",
+      snapshot_page: "sub/second.html",
+      snapshot_page_proof: "second-proof",
+      prompts: [{ uid: "B", prompt: "Second", selector: "", tag: "message", text: "" }],
+    });
+    const replaced = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(replaced.dom_snapshot, "SECOND snapshot");
+    assert.equal(replaced.snapshot_page, "sub/second.html");
+    assert.equal(replaced.snapshot_page_proof, "second-proof");
+
+    await store.queuePrompts(session.key, {
+      domSnapshot: "THIRD snapshot",
+      snapshot_page: "third.html",
+      snapshot_page_proof: "third-proof",
+      prompts: [{ uid: "C", prompt: "Third", selector: "", tag: "message", text: "" }],
+    });
+    await store.queuePrompts(session.key, {
+      domSnapshot: "",
+      snapshot_page: "must-not-survive.html",
+      snapshot_page_proof: "must-not-survive",
+      prompts: [{ uid: "D", prompt: "No snapshot", selector: "", tag: "message", text: "" }],
+    });
+    const cleared = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(cleared.dom_snapshot, "");
+    assert.equal(cleared.snapshot_page, null);
+    assert.equal(cleared.snapshot_page_proof, "");
+  });
+});
+
+test("snapshot pair restore yields to both a newer pair and a newer explicit clear", async () => {
+  await withStore(async ({ store, session }) => {
+    const old = { uid: "old", prompt: "Old", selector: "", tag: "message", text: "" };
+    await store.queuePrompts(session.key, {
+      domSnapshot: "OLD snapshot",
+      snapshot_page: "old.html",
+      snapshot_page_proof: "old-proof",
+      prompts: [old],
+    });
+    const taken = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting", "take consumes the whole pair");
+
+    await store.queuePrompts(
+      session.key,
+      {
+        dom_snapshot: taken.dom_snapshot,
+        snapshot_page: taken.snapshot_page,
+        snapshot_page_proof: taken.snapshot_page_proof,
+        prompts: taken.prompts,
+      },
+      { restore: true },
+    );
+    const restored = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(restored.snapshot_page, "old.html");
+    assert.equal(restored.snapshot_page_proof, "old-proof");
+
+    await store.queuePrompts(session.key, {
+      domSnapshot: "OLD AGAIN",
+      snapshot_page: "old.html",
+      snapshot_page_proof: "old-proof",
+      prompts: [old],
+    });
+    const secondTaken = feedbackResult(await store.takeFeedback(session.key));
+    await store.queuePrompts(session.key, {
+      domSnapshot: "NEW snapshot",
+      snapshot_page: "new.html",
+      snapshot_page_proof: "new-proof",
+      prompts: [{ uid: "new", prompt: "New", selector: "", tag: "message", text: "" }],
+    });
+    await store.queuePrompts(
+      session.key,
+      {
+        dom_snapshot: secondTaken.dom_snapshot,
+        snapshot_page: secondTaken.snapshot_page,
+        snapshot_page_proof: secondTaken.snapshot_page_proof,
+        prompts: secondTaken.prompts,
+      },
+      { restore: true },
+    );
+    const newerWins = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(newerWins.snapshot_page, "new.html");
+    assert.equal(newerWins.snapshot_page_proof, "new-proof");
+
+    await store.queuePrompts(session.key, {
+      domSnapshot: "OLD THIRD",
+      snapshot_page: "old.html",
+      snapshot_page_proof: "old-proof",
+      prompts: [old],
+    });
+    const thirdTaken = feedbackResult(await store.takeFeedback(session.key));
+    await store.queuePrompts(session.key, {
+      domSnapshot: "",
+      prompts: [{ uid: "clear", prompt: "Newer clear", selector: "", tag: "message", text: "" }],
+    });
+    await store.queuePrompts(
+      session.key,
+      {
+        dom_snapshot: thirdTaken.dom_snapshot,
+        snapshot_page: thirdTaken.snapshot_page,
+        snapshot_page_proof: thirdTaken.snapshot_page_proof,
+        prompts: thirdTaken.prompts,
+      },
+      { restore: true },
+    );
+    const clearWins = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(clearWins.dom_snapshot, "");
+    assert.equal(clearWins.snapshot_page, null);
+    assert.equal(clearWins.snapshot_page_proof, "");
+  });
+});
+
 test("restoring a taken batch preserves newer prompts, snapshot, chat, and artifact failures", async () => {
   await withStore(async ({ store, session }) => {
     const first = { uid: "A", prompt: "First", selector: "", tag: "message", text: "" };
@@ -2575,5 +2696,183 @@ test("an oversized agent reply preserves evicted prompt acks without exceeding t
     });
     const afterRetry = await store.findByKey(session.key);
     assert.equal(afterRetry.prompts.length, 1, "the evicted note must not be delivered twice");
+  });
+});
+
+test("legacy server state migrates by typed provenance once and preserves durable content", async () => {
+  await withStore(async ({ store, session, stateFile, artifact }) => {
+    const annotationId = "11111111-1111-4111-8111-111111111111";
+    const questionId = "22222222-2222-4222-8222-222222222222";
+    const whiteboardId = "33333333-3333-4333-8333-333333333333";
+    const chatId = "44444444-4444-4444-8444-444444444444";
+    const ackId = "55555555-5555-4555-8555-555555555555";
+    const warningId = "legacy-warning-id";
+    const entryPage = path.basename(artifact);
+    const attachment = { id: "legacy-attachment", name: "reference.png" };
+    const warning = {
+      id: warningId,
+      fingerprint: "legacy-fingerprint",
+      rule: "clipped-text",
+      selector: "p#copy",
+      viewport_class: "desktop",
+      status: "open",
+      history: [{ event: "detected", revision: 1 }],
+    };
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    const legacy = state.sessions[session.key];
+    delete legacy.page_schema;
+    legacy.prompts = [
+      {
+        uid: "annotation-uid",
+        prompt: "Make this warmer",
+        selector: "h1",
+        tag: "h1",
+        text: "Hello",
+        prompt_id: annotationId,
+        attachments: [attachment],
+      },
+      {
+        uid: "question-uid",
+        prompt: "Choose a direction",
+        selector: "#direction",
+        tag: "question",
+        text: "",
+        prompt_id: questionId,
+      },
+      {
+        uid: "whiteboard-uid",
+        prompt: "Move this shape",
+        selector: "",
+        tag: "whiteboard",
+        text: "",
+        prompt_id: whiteboardId,
+        target: { type: "excalidraw-scene", index: 0, scenePath: ".lavish/scene.excalidraw" },
+        attachments: [attachment],
+      },
+      {
+        uid: "chat-uid",
+        prompt: "A note with no proven page",
+        selector: "",
+        tag: "message",
+        text: "A note with no proven page",
+        prompt_id: chatId,
+      },
+      {
+        uid: "warning-batch",
+        prompt: "Fix this layout issue",
+        selector: "",
+        tag: "layout-warnings",
+        text: "Layout issue",
+        target: {
+          type: "layout-warnings",
+          warnings: [{ id: warningId, rule: warning.rule, selector: warning.selector }],
+        },
+      },
+    ];
+    legacy.chat = [
+      { role: "user", text: "A note with no proven page", prompt_id: chatId, attachments: [attachment] },
+      { role: "agent", text: "Acknowledged", prompt_id: ackId },
+    ];
+    legacy.chat_ack_ids = [ackId];
+    legacy.layout_warnings = [warning];
+    legacy.artifact_failures = [{ kind: "asset-load", detail: "missing image" }];
+    legacy.dom_snapshot = "h1 Hello";
+    delete legacy.snapshot_page;
+    delete legacy.snapshot_page_proof;
+    await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`);
+
+    const migrated = await store.findByKey(session.key);
+    assert.equal(migrated.page_schema, 1);
+    assert.equal(migrated.prompts[0].page, entryPage, "annotation provenance maps to the entry");
+    assert.equal(migrated.prompts[1].page, entryPage, "typed question provenance maps to the entry");
+    assert.equal(migrated.prompts[2].page, entryPage, "whiteboard provenance maps to the entry");
+    assert.equal(migrated.prompts[3].page, null, "composer/chat prompts remain unavailable");
+    assert.equal(migrated.prompts[4].target.warnings[0].page, entryPage, "warning batches resolve per record");
+    assert.deepEqual(migrated.prompts[0].attachments, [attachment]);
+    assert.deepEqual(migrated.prompts[2].attachments, [attachment]);
+    assert.equal(migrated.prompts[0].prompt_id, annotationId);
+    assert.equal(migrated.prompts[2].prompt_id, whiteboardId);
+    assert.deepEqual(migrated.chat[0].attachments, [attachment]);
+    assert.deepEqual(migrated.chat_ack_ids, [ackId]);
+    assert.ok(
+      migrated.chat.every((entry) => entry.page === null),
+      "legacy chat is explicitly unavailable",
+    );
+    assert.equal(migrated.artifact_failures[0].page, null);
+    assert.equal(migrated.snapshot_page, entryPage);
+    assert.equal(migrated.snapshot_page_proof, undefined, "migration never mints a page proof");
+    assert.equal(migrated.layout_warnings[0].id, warningId, "legacy warning selection identity is retained");
+    assert.equal(migrated.layout_warnings[0].page, entryPage);
+    assert.equal(
+      migrated.layout_warnings[0].fingerprint,
+      layoutWarningFingerprint({
+        rule: warning.rule,
+        target: warning.selector,
+        viewportClass: warning.viewport_class,
+        page: entryPage,
+      }),
+    );
+    assert.notEqual(migrated.layout_warnings[0].id, migrated.layout_warnings[0].fingerprint);
+    assert.deepEqual(migrated.layout_warnings[0].history, warning.history);
+
+    const once = await readFile(stateFile, "utf8");
+    const migratedAgain = await store.findByKey(session.key);
+    const twice = await readFile(stateFile, "utf8");
+    assert.deepEqual(migratedAgain, migrated);
+    assert.equal(twice, once, "the second state read is byte-stable and creates no feedback");
+    assert.equal(migratedAgain.prompts.length, 5);
+    assert.deepEqual(migratedAgain.chat_ack_ids, [ackId]);
+  });
+});
+
+test("legacy state waits for entry context and preserves explicit null attribution", async () => {
+  await withStore(async ({ store, session, stateFile }) => {
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    const legacy = state.sessions[session.key];
+    delete legacy.page_schema;
+    legacy.prompts = [
+      { uid: "modern-null", prompt: "Unavailable", selector: "", tag: "message", text: "", page: null },
+    ];
+    legacy.dom_snapshot = "old snapshot";
+    legacy.snapshot_page = null;
+    legacy.layout_warnings = [
+      {
+        id: "modern-null-warning",
+        fingerprint: "kept",
+        rule: "clipped-text",
+        selector: "p",
+        viewport_class: "desktop",
+        page: null,
+        status: "open",
+      },
+    ];
+    await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`);
+
+    // Without the canonical entry identity, the read path deliberately leaves legacy data alone
+    // so a later authoritative caller can retry rather than guessing from arbitrary text.
+    const withoutContext = { ...legacy };
+    delete withoutContext.file;
+    const before = JSON.parse(JSON.stringify(withoutContext));
+    assert.equal(migrateLegacySession(withoutContext), false);
+    assert.deepEqual(withoutContext, before);
+
+    const emptySnapshot = {
+      file: session.file,
+      dom_snapshot: "",
+      snapshot_page: "stale-entry.html",
+      snapshot_page_proof: "stale-proof",
+    };
+    assert.equal(migrateLegacySession(emptySnapshot), true);
+    assert.equal(emptySnapshot.snapshot_page, null, "an empty legacy snapshot clears its label");
+    assert.equal(emptySnapshot.snapshot_page_proof, "", "an empty legacy snapshot clears its proof");
+
+    const first = await store.findByKey(session.key);
+    assert.equal(first.page_schema, 1);
+    assert.equal(first.prompts[0].page, null);
+    assert.equal(first.snapshot_page, null, "explicit modern null never becomes entry attribution");
+    assert.equal(first.layout_warnings[0].page, null);
+    const once = await readFile(stateFile, "utf8");
+    await store.findByKey(session.key);
+    assert.equal(await readFile(stateFile, "utf8"), once);
   });
 });

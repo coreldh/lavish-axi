@@ -13,6 +13,16 @@ const warningSelectionStorageKey = "lavish-axi:warning-selection:" + key;
 // destroy it unless the chrome persists what the SDK reports. Keyed per session like the queue,
 // so a draft can never reappear over a different artifact.
 const reviewStateStorageKey = "lavish-axi:review-state:" + key;
+// Protocol-1 review state is an envelope of canonical page records. The array
+// is intentional: page identities are data, not object-property names, so a
+// page called "__proto__" (or any other special property) cannot collide with
+// the registry itself. Legacy single-page chrome keeps using the value above
+// directly; migration of an old object is deferred until the first page binds.
+const pageReviewStateVersion = 1;
+// The current artifact destination is chrome-owned navigation state. It is kept
+// separately from the page identity/proof: query strings and fragments belong to
+// the authored URL, while page/proof belong to the server-established document.
+const destinationStorageKey = "lavish-axi:destination:" + key;
 // Drafts Lavish could not replay. The text outlives the draft that carried it, so the user can
 // still read and copy it after the anchor it was written against is gone for good.
 const retiredDraftStorageKey = "lavish-axi:retired-drafts:" + key;
@@ -190,6 +200,11 @@ const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementByI
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
 const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardError"));
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
+// Protocol 1 keeps the generation in the injected SDK context rather than in
+// the document URL.  In particular, a real user-authored `index.html` must not
+// acquire the legacy revision/token query pair: that pair intentionally selects
+// the historical virtual entry route on the server.
+const modernArtifactProtocol = sessionData.pageProtocol === 1;
 
 const queued = loadQueuedPrompts();
 let annotation = true;
@@ -234,7 +249,8 @@ const selectedWarningIds = new Set(loadJsonState(warningSelectionStorageKey, [])
 let warningsDrawerOpen = false;
 /** @typedef {{ done: Promise<boolean>, finish: (succeeded: boolean) => void }} FeedbackPreparation */
 /** @typedef {{ prompts: any[], inFlight: boolean, order: number }} TerminalSubmission */
-/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], chatAtRequest?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, acknowledgement?: object, order?: number, timeout?: ReturnType<typeof setTimeout> }>} */
+/** @typedef {{ version: number, page: string | null, proof: string, route: string, destination: string, documentId: string, documentSequence: number, token: string, revision: number }} SnapshotBinding */
+/** @type {Map<string, { action: "copy" | "submit", prompts?: any[], chatAtRequest?: any[], endAfter?: boolean, terminal?: TerminalSubmission | null, acknowledgement?: object, order?: number, timeout?: ReturnType<typeof setTimeout>, binding?: SnapshotBinding | null }>} */
 const snapshotRequests = new Map();
 let nextSnapshotRequestId = 0;
 let nextSendOperationOrder = 0;
@@ -265,7 +281,16 @@ let lastScroll = { x: 0, y: 0 };
 // answers). The sandbox means the chrome cannot read it back after a reload, so the SDK reports
 // it as it changes and the chrome replays it once the new document is up. It is persisted per
 // session so a full page reload replays it too.
-let lastReviewState = loadJsonState(reviewStateStorageKey, null);
+const loadedPageReviewState = modernArtifactProtocol ? loadPageReviewState() : null;
+/** @type {Map<string, { page: string | null, scroll: { x: number, y: number }, reviewState: any, unrestorableDraftMiss: { selector: string, revision: number } | null }>} */
+const pageReviewStates = loadedPageReviewState?.records || new Map();
+let legacyReviewState = loadedPageReviewState?.legacyReviewState || null;
+let legacyReviewStateMigrated = false;
+// The currently bound page is the only page whose state can be sent back into the iframe.
+// `activeReviewPage` remains useful during the short no-binding gap between pagehide and the
+// next challenge; stale messages are still rejected by the binding tuple before it is consulted.
+let activeReviewPage = null;
+let lastReviewState = modernArtifactProtocol ? null : loadJsonState(reviewStateStorageKey, null);
 if (lastReviewState && typeof lastReviewState !== "object") lastReviewState = null;
 const ARTIFACT_SILENCE_PROBE_MS = 8000;
 const ARTIFACT_LOAD_BEGIN_RETRY_DELAYS_MS = [100, 300];
@@ -313,6 +338,11 @@ artifactLoadToken = String(sessionData.initialArtifactLoadToken || "");
 let artifactSpokeToken = "";
 let artifactMessageSequence = 0;
 let layoutDiagnosticSequence = 0;
+/** @type {{ port: MessagePort, page: string|null, proof: string, route: string, destination: string, documentId: string, documentSequence: number, token: string, revision: number, version: number, window: WindowProxy } | null} */
+let currentArtifactBinding = null;
+let artifactChallengeInFlight = false;
+let nextDocumentSequence = 0;
+let nextBindingVersion = 0;
 let artifactLoadRecoveryAttempt = 0;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let artifactLoadRecoveryTimer;
@@ -327,7 +357,247 @@ let sendHintPersistent = false;
 let sendFailureOwner = null;
 let sendAcknowledgementWarningVisible = false;
 
-function artifactFrameSrcForLoad(load) {
+let artifactLoadDestination = "";
+let topLevelTeardown = false;
+
+function decodeNavigationPart(value) {
+  try {
+    return decodeURIComponent(String(value || "").replace(/\+/g, " "));
+  } catch {
+    return String(value || "");
+  }
+}
+
+function stripReservedReloadParameters(destination) {
+  const raw = String(destination || "");
+  const hashIndex = raw.indexOf("#");
+  const beforeHash = hashIndex === -1 ? raw : raw.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : raw.slice(hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  if (queryIndex === -1) return beforeHash + hash;
+  const pathname = beforeHash.slice(0, queryIndex);
+  const query = beforeHash.slice(queryIndex + 1);
+  const kept = query
+    .split("&")
+    .filter((part) => {
+      // Empty pairs are authored navigation state too. Keep them so a controlled
+      // reload does not silently rewrite the query string (the fresh discriminator
+      // is appended as one additional pair below).
+      if (!part) return true;
+      const equals = part.indexOf("=");
+      const name = equals === -1 ? part : part.slice(0, equals);
+      return decodeNavigationPart(name) !== "__lavish_reload";
+    })
+    .join("&");
+  return pathname + (kept ? "?" + kept : "") + hash;
+}
+
+function freshReloadDestination(destination) {
+  const clean = stripReservedReloadParameters(destination || artifactSrc);
+  const hashIndex = clean.indexOf("#");
+  const beforeHash = hashIndex === -1 ? clean : clean.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : clean.slice(hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  const hasQuery = queryIndex !== -1 && queryIndex < beforeHash.length - 1;
+  const separator = hasQuery ? "&" : "?";
+  return beforeHash + separator + "__lavish_reload=" + encodeURIComponent(randomBindingChallenge()) + hash;
+}
+
+function navigationPath(destination) {
+  const raw = String(destination || "");
+  const hashIndex = raw.indexOf("#");
+  const beforeHash = hashIndex === -1 ? raw : raw.slice(0, hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  return queryIndex === -1 ? beforeHash : beforeHash.slice(0, queryIndex);
+}
+
+function artifactPathPrefix() {
+  return "/artifact/" + encodeURIComponent(key) + "/";
+}
+
+function destinationForServedRoute(servedRoute) {
+  const route = String(servedRoute || "");
+  if (!route || route.includes("\0") || route.includes("\\") || route.startsWith("/")) return "";
+  // `served_route` is the server-accepted lexical route. It is deliberately not
+  // decoded or normalized here: relative links may depend on its exact alias.
+  // Browsers encode spaces and other URL characters when assigning the URL.
+  return artifactPathPrefix() + route;
+}
+
+function fallbackLocationDestination(candidate) {
+  const raw = String(candidate || "");
+  if (!raw) return "";
+  if (raw.startsWith("/")) return raw;
+  const origin = String(location.protocol || "") + "//" + String(location.host || "");
+  if (origin !== "//" && raw.startsWith(origin)) return raw.slice(origin.length) || "/";
+  return "";
+}
+
+function frameLocationDestination() {
+  try {
+    const href = frame.contentWindow?.location?.href;
+    return fallbackLocationDestination(href);
+  } catch {
+    // A sandboxed artifact normally has an opaque origin. Its WindowProxy permits
+    // navigation but not reading location, so the challenged served route remains
+    // the authoritative fallback in that case.
+    return "";
+  }
+}
+
+function normalizeArtifactDestination(value, servedRoute = "") {
+  const candidate = String(value || "");
+  const fallback = destinationForServedRoute(servedRoute);
+  if (!candidate) return fallback;
+  if (candidate.includes("\0") || candidate.includes("\\")) return fallback;
+  try {
+    const parsed =
+      typeof URL === "function"
+        ? new URL(candidate, location.href)
+        : (() => {
+            const relative = fallbackLocationDestination(candidate);
+            if (!relative) return null;
+            const hashIndex = relative.indexOf("#");
+            const beforeHash = hashIndex === -1 ? relative : relative.slice(0, hashIndex);
+            const hash = hashIndex === -1 ? "" : relative.slice(hashIndex);
+            const queryIndex = beforeHash.indexOf("?");
+            const pathname = queryIndex === -1 ? beforeHash : beforeHash.slice(0, queryIndex);
+            const search = queryIndex === -1 ? "" : beforeHash.slice(queryIndex);
+            return {
+              origin: String(location.protocol || "") + "//" + String(location.host || ""),
+              pathname,
+              search,
+              hash,
+            };
+          })();
+    if (!parsed || (typeof URL === "function" && parsed.origin !== location.origin)) return fallback;
+    const pathName = parsed.pathname;
+    if (!pathName.startsWith(artifactPathPrefix())) return fallback;
+    if (fallback && pathName !== navigationPath(fallback)) return fallback;
+    return stripReservedReloadParameters(pathName + parsed.search + parsed.hash);
+  } catch {
+    return fallback;
+  }
+}
+
+function bindingDestination(binding) {
+  if (!binding) return "";
+  const routeDestination = destinationForServedRoute(binding.route);
+  const observed = binding.destination || binding.authoredDestination || frameLocationDestination() || routeDestination;
+  return normalizeArtifactDestination(observed, binding.route) || routeDestination;
+}
+
+function destinationRecord(bindingOrDestination) {
+  if (!bindingOrDestination) return null;
+  const binding = bindingOrDestination;
+  const destination = bindingDestination(binding);
+  if (!destination) return null;
+  return {
+    available: true,
+    destination,
+    // Keep the server-issued, root-relative route. The public `/artifact/...`
+    // pathname is only a transport URL and cannot be used to re-resolve the
+    // underlying file safely after a chrome reload.
+    route: String(binding.route || ""),
+    page: binding.page ?? null,
+    page_proof: String(binding.proof || ""),
+  };
+}
+
+function persistDestinationRecord(record) {
+  if (!modernArtifactProtocol) return;
+  saveJsonState(destinationStorageKey, record);
+}
+
+function markDestinationUnavailable() {
+  if (!modernArtifactProtocol || topLevelTeardown) return;
+  persistDestinationRecord({ available: false });
+}
+
+function readRetainedDestination() {
+  if (!modernArtifactProtocol) return null;
+  const record = loadJsonState(destinationStorageKey, null);
+  if (!record || record.available !== true) return null;
+  const destination = normalizeArtifactDestination(record.destination, record.route);
+  if (!destination) return null;
+  return {
+    destination,
+    route: String(record.route || ""),
+    page: record.page === null ? null : String(record.page || ""),
+    proof: String(record.page_proof || ""),
+    fallbackToEntry: true,
+  };
+}
+
+function currentDestinationCandidate(explicit = null) {
+  if (explicit) return explicit;
+  if (currentArtifactBinding) return destinationRecord(currentArtifactBinding);
+  return readRetainedDestination();
+}
+
+function destinationPayload(candidate) {
+  if (!candidate) return null;
+  if (
+    typeof candidate.route !== "string" ||
+    !candidate.route ||
+    typeof candidate.page !== "string" ||
+    !candidate.page ||
+    typeof (candidate.proof || candidate.page_proof) !== "string" ||
+    !(candidate.proof || candidate.page_proof)
+  )
+    return null;
+  const destination = String(candidate.destination || candidate.url || candidate.route || "");
+  if (!destination) return null;
+  const hashIndex = destination.indexOf("#");
+  const beforeHash = hashIndex === -1 ? destination : destination.slice(0, hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  return {
+    url: destination,
+    route: candidate.route || navigationPath(destination),
+    page: candidate.page === undefined ? null : candidate.page,
+    page_proof: String(candidate.proof || candidate.page_proof || ""),
+    query: queryIndex === -1 ? "" : beforeHash.slice(queryIndex + 1),
+    fragment: hashIndex === -1 ? "" : destination.slice(hashIndex + 1),
+    fallback_to_entry: candidate.fallbackToEntry === true,
+  };
+}
+
+function navigateArtifactFrame(destination) {
+  const next = String(destination || "");
+  // Legacy loads intentionally assign `src`: existing recovery/availability
+  // accounting observes that navigation, and the legacy URL carries its load
+  // token in the query string.  Protocol 1 uses `location.replace` so a
+  // controlled reload does not add a synthetic entry to authored history.
+  if (!modernArtifactProtocol) {
+    frame.src = next;
+    return;
+  }
+  try {
+    const childLocation = frame.contentWindow?.location;
+    if (childLocation && typeof childLocation.replace === "function") {
+      childLocation.replace(next);
+      return;
+    }
+  } catch {
+    // Cross-origin/sandboxed frames may deny reading location; assigning the
+    // iframe source remains the compatibility fallback for those browsers.
+  }
+  frame.src = next;
+}
+
+function artifactFrameSrcForLoad(load = {}) {
+  if (modernArtifactProtocol) {
+    const requested = load.destination || load.artifact_url || load.artifactUrl || currentDestinationCandidate();
+    const candidate =
+      typeof requested === "string" ? { destination: requested, route: navigationPath(requested) } : requested;
+    const destination = normalizeArtifactDestination(
+      candidate?.destination || candidate?.url || candidate?.route || artifactSrc,
+      candidate?.route || "",
+    );
+    // A malformed or no-longer-current route is never allowed to turn a reload
+    // into an arbitrary URL. Fall back to the chrome's canonical entry path.
+    return freshReloadDestination(destination || artifactSrc);
+  }
   const separator = artifactSrc.includes("?") ? "&" : "?";
   return (
     artifactSrc +
@@ -370,6 +640,79 @@ function saveJsonState(storageKey, value) {
     // The in-memory state still works if browser storage is unavailable.
     return false;
   }
+}
+
+function isReviewStateObject(value) {
+  return Boolean(value && typeof value === "object" && (Object.hasOwn(value, "card") || Array.isArray(value.fields)));
+}
+
+function reviewStatePageKey(page) {
+  // JSON is used only as a Map key. It distinguishes the entry/null namespace
+  // from a literal page string without assigning untrusted text to an object.
+  return JSON.stringify(page === null || page === undefined ? null : String(page));
+}
+
+function normalizeReviewStateScroll(value) {
+  if (!value || typeof value !== "object") return { x: 0, y: 0 };
+  const x = Number(value.x);
+  const y = Number(value.y);
+  return {
+    x: Number.isFinite(x) && x >= 0 ? x : 0,
+    y: Number.isFinite(y) && y >= 0 ? y : 0,
+  };
+}
+
+function normalizeReviewStatePageRecord(value) {
+  if (!value || typeof value !== "object") return null;
+  if (!Object.hasOwn(value, "page")) return null;
+  if (value.page !== null && typeof value.page !== "string") return null;
+  const miss = value.unrestorable_draft_miss;
+  return {
+    page: value.page === null ? null : value.page,
+    scroll: normalizeReviewStateScroll(value.scroll),
+    reviewState: isReviewStateObject(value.review_state) ? value.review_state : null,
+    unrestorableDraftMiss:
+      miss &&
+      typeof miss === "object" &&
+      typeof miss.selector === "string" &&
+      Number.isSafeInteger(Number(miss.revision))
+        ? { selector: miss.selector, revision: Number(miss.revision) }
+        : null,
+  };
+}
+
+function loadPageReviewState() {
+  const stored = loadJsonState(reviewStateStorageKey, null);
+  const records = new Map();
+  let legacyReviewState = null;
+  if (stored && stored.version === pageReviewStateVersion && Array.isArray(stored.pages)) {
+    for (const raw of stored.pages) {
+      const record = normalizeReviewStatePageRecord(raw);
+      if (record) records.set(reviewStatePageKey(record.page), record);
+    }
+  } else if (isReviewStateObject(stored)) {
+    // Do not destroy a pre-page-protocol draft merely because the new chrome
+    // cannot know its page until the first document completes its handshake.
+    legacyReviewState = stored;
+  }
+  return { records, legacyReviewState };
+}
+
+function serializePageReviewState(records) {
+  return {
+    version: pageReviewStateVersion,
+    pages: [...records.values()].map((record) => ({
+      page: record.page,
+      scroll: normalizeReviewStateScroll(record.scroll),
+      review_state: isReviewStateObject(record.reviewState) ? record.reviewState : null,
+      unrestorable_draft_miss: record.unrestorableDraftMiss
+        ? {
+            selector: String(record.unrestorableDraftMiss.selector || ""),
+            revision: Number(record.unrestorableDraftMiss.revision) || 0,
+          }
+        : null,
+    })),
+  };
 }
 
 // A queued prompt is authored by the untrusted artifact iframe, so its attachment
@@ -457,7 +800,20 @@ function loadQueuedPrompts() {
     // the bad prompt on disk and would otherwise stay wedged after an upgrade.
     // Keep a stored identity so a reload can settle an already-accepted note; mint
     // one only when the restored prompt predates identity.
-    return Array.isArray(parsed) ? parsed.map((item) => adoptQueuedPrompt(item, true)).filter(Boolean) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => adoptQueuedPrompt(item, true))
+      .filter(Boolean)
+      .map((prompt) => {
+        // Pre-page-protocol tabs persisted no attribution fields. Preserve the
+        // user's writing and make its unavailable context explicit so the
+        // protocol-1 server can accept it instead of wedging every retry.
+        if (modernArtifactProtocol && !Object.hasOwn(prompt, "page")) {
+          prompt.page = null;
+          prompt.page_proof = "";
+        }
+        return prompt;
+      });
   } catch {
     return [];
   }
@@ -1044,23 +1400,98 @@ function setChromeOutdated(visible, reason = chromeOutdatedReason) {
   if (outdatedBanner) outdatedBanner.hidden = ended || !visible;
 }
 
-function setReviewState(state) {
+function statePageIdentity(pageOverride) {
+  if (pageOverride !== undefined) return pageOverride === null ? null : String(pageOverride);
+  return modernArtifactProtocol ? activeReviewPage : null;
+}
+
+function emptyPageReviewState(page) {
+  return { page, scroll: { x: 0, y: 0 }, reviewState: null, unrestorableDraftMiss: null };
+}
+
+function pageReviewRecord(page) {
+  return pageReviewStates.get(reviewStatePageKey(page)) || emptyPageReviewState(page);
+}
+
+function persistPageReviewStates() {
+  if (!modernArtifactProtocol) return true;
+  return saveJsonState(reviewStateStorageKey, serializePageReviewState(pageReviewStates));
+}
+
+function updatePageReviewState(page, patch) {
+  const current = pageReviewRecord(page);
+  const next = {
+    page,
+    scroll: normalizeReviewStateScroll(patch.scroll === undefined ? current.scroll : patch.scroll),
+    reviewState: patch.reviewState === undefined ? current.reviewState : patch.reviewState,
+    unrestorableDraftMiss:
+      patch.unrestorableDraftMiss === undefined ? current.unrestorableDraftMiss : patch.unrestorableDraftMiss,
+  };
+  pageReviewStates.set(reviewStatePageKey(page), next);
+  persistPageReviewStates();
+  return next;
+}
+
+function activatePageReviewState(page) {
+  if (!modernArtifactProtocol) return;
+  const canonicalPage = page === null || page === undefined ? null : String(page);
+  activeReviewPage = canonicalPage;
+  let record = pageReviewStates.get(reviewStatePageKey(canonicalPage));
+  if (!record && legacyReviewState && !legacyReviewStateMigrated) {
+    // An older chrome had one unlabelled slot. Assign it once to the first
+    // accepted page, and only then replace the old value with the typed envelope.
+    record = emptyPageReviewState(canonicalPage);
+    record.reviewState = legacyReviewState;
+    pageReviewStates.set(reviewStatePageKey(canonicalPage), record);
+    legacyReviewStateMigrated = true;
+    legacyReviewState = null;
+    persistPageReviewStates();
+  }
+  if (!record) record = emptyPageReviewState(canonicalPage);
+  lastScroll = normalizeReviewStateScroll(record.scroll);
+  lastReviewState = record.reviewState;
+  unrestorableDraftMiss = record.unrestorableDraftMiss;
+}
+
+function setScrollPosition(x, y, pageOverride) {
+  lastScroll = normalizeReviewStateScroll({ x, y });
+  if (modernArtifactProtocol) updatePageReviewState(statePageIdentity(pageOverride), { scroll: lastScroll });
+}
+
+function setReviewState(state, pageOverride) {
   lastReviewState = state;
   // The artifact reported a card, so its anchor exists: whatever miss was recorded is answered.
   if (state?.card) unrestorableDraftMiss = null;
-  if (!state || (!state.card && !(Array.isArray(state.fields) && state.fields.length))) {
-    try {
-      sessionStorage.removeItem(reviewStateStorageKey);
-    } catch {
-      // The in-memory state still works if browser storage is unavailable.
+  if (!modernArtifactProtocol) {
+    if (!state || (!state.card && !(Array.isArray(state.fields) && state.fields.length))) {
+      try {
+        sessionStorage.removeItem(reviewStateStorageKey);
+      } catch {
+        // The in-memory state still works if browser storage is unavailable.
+      }
+      return;
     }
+    saveJsonState(reviewStateStorageKey, state);
     return;
   }
-  saveJsonState(reviewStateStorageKey, state);
+  const page = statePageIdentity(pageOverride);
+  updatePageReviewState(page, {
+    // An empty state means the card was queued/cancelled. It must clear that
+    // page's draft and any first-miss evidence, but must not touch another page.
+    reviewState: state && (state.card || (Array.isArray(state.fields) && state.fields.length)) ? state : null,
+    unrestorableDraftMiss: state?.card ? null : null,
+  });
+}
+
+function reviewStateHasUnsentDraft(state) {
+  return Boolean(state && state.card && String(state.card.text || "").trim());
 }
 
 function hasUnsentDraft() {
-  return Boolean(lastReviewState && lastReviewState.card && String(lastReviewState.card.text || "").trim());
+  if (!modernArtifactProtocol) return reviewStateHasUnsentDraft(lastReviewState);
+  if (reviewStateHasUnsentDraft(legacyReviewState)) return true;
+  if (reviewStateHasUnsentDraft(lastReviewState)) return true;
+  return [...pageReviewStates.values()].some((record) => reviewStateHasUnsentDraft(record.reviewState));
 }
 
 // The SDK looked for this draft's anchor in a loaded artifact and did not find it. Retiring a
@@ -1070,18 +1501,37 @@ function hasUnsentDraft() {
 // rewritten comes back, and a report on the revision already recorded is the same answer twice,
 // not two answers. Any report for a different draft, or for a draft that is no longer stored,
 // leaves the stored text alone.
-function discardUnrestorableDraft(selector) {
-  if (!selector || !lastReviewState || !lastReviewState.card) return;
-  if (String(lastReviewState.card.selector || "") !== selector) return;
+function discardUnrestorableDraft(selector, pageOverride) {
+  if (!selector) return;
+  const page = statePageIdentity(pageOverride);
+  const record = modernArtifactProtocol ? pageReviewRecord(page) : null;
+  const state = modernArtifactProtocol ? record.reviewState : lastReviewState;
+  const miss = modernArtifactProtocol ? record.unrestorableDraftMiss : unrestorableDraftMiss;
+  if (!state || !state.card) return;
+  if (String(state.card.selector || "") !== selector) return;
   const revision = artifactLoadRevision;
-  if (unrestorableDraftMiss?.selector !== selector) {
-    unrestorableDraftMiss = { selector, revision };
+  if (miss?.selector !== selector) {
+    const nextMiss = { selector, revision };
+    if (modernArtifactProtocol) updatePageReviewState(page, { unrestorableDraftMiss: nextMiss });
+    else unrestorableDraftMiss = nextMiss;
     return;
   }
-  if (unrestorableDraftMiss.revision === revision) return;
+  if (miss.revision === revision) return;
+  if (modernArtifactProtocol) {
+    keepRetiredDraft(String(state.card.text || ""), page);
+    const next = updatePageReviewState(page, {
+      reviewState: { ...state, card: null },
+      unrestorableDraftMiss: null,
+    });
+    if (page === activeReviewPage) {
+      lastReviewState = next.reviewState;
+      unrestorableDraftMiss = null;
+    }
+    return;
+  }
   unrestorableDraftMiss = null;
-  keepRetiredDraft(String(lastReviewState.card.text || ""));
-  setReviewState({ ...lastReviewState, card: null });
+  keepRetiredDraft(String(state.card.text || ""));
+  setReviewState({ ...state, card: null });
 }
 
 // Retiring a draft ends Lavish's ability to replay it, so the text itself is handed back to the
@@ -1091,22 +1541,33 @@ function discardUnrestorableDraft(selector) {
 function loadRetiredDrafts() {
   const stored = loadJsonState(retiredDraftStorageKey, []);
   if (!Array.isArray(stored)) return [];
-  return stored.filter((entry) => typeof entry === "string" && entry.trim());
+  return stored
+    .map((entry) => {
+      if (typeof entry === "string" && entry.trim()) return { text: entry, page: null };
+      if (!entry || typeof entry !== "object" || typeof entry.text !== "string" || !entry.text.trim()) return null;
+      return { text: entry.text, page: entry.page === null ? null : String(entry.page || "") || null };
+    })
+    .filter(Boolean);
 }
 
 // No entry already handed back is ever dropped to make room for a new one. When browser storage
 // refuses the write, the note says so on the spot instead of an older one quietly disappearing at
 // the next page load - the text the user wrote is the thing being protected here.
-function keepRetiredDraft(text) {
+function keepRetiredDraft(text, pageOverride) {
   if (!text.trim()) return;
-  retiredDrafts = [...retiredDrafts, text];
-  renderRetiredDraft(text, saveJsonState(retiredDraftStorageKey, retiredDrafts));
+  const page = modernArtifactProtocol ? statePageIdentity(pageOverride) : null;
+  const entry = { text, page };
+  retiredDrafts = [...retiredDrafts, entry];
+  renderRetiredDraft(entry, saveJsonState(retiredDraftStorageKey, retiredDrafts));
 }
 
-function renderRetiredDraft(text, stored = true) {
+function renderRetiredDraft(entry, stored = true) {
   if (!chatLog) return;
+  const text = String(entry?.text || entry || "");
+  const page = entry && typeof entry === "object" ? entry.page : null;
   const el = document.createElement("div");
   el.className = "bubble note";
+  if (el.dataset) el.dataset.lavishPage = page || "";
   el.innerHTML =
     "<small>Unsent annotation</small><div>The element this note was attached to is no longer in the artifact, so Lavish could not reopen the card. Your text is kept here:</div>" +
     '<div class="note-draft">' +
@@ -1351,7 +1812,30 @@ function removeQueuedPrompt(index, event) {
 }
 
 function promptQueueKey(prompt) {
-  return prompt && typeof prompt[internalQueueKeyField] === "string" ? prompt[internalQueueKeyField].trim() : "";
+  const key = prompt && typeof prompt[internalQueueKeyField] === "string" ? prompt[internalQueueKeyField].trim() : "";
+  if (!key || !modernArtifactProtocol) return key;
+  // Replacement is local to the authored document. Identical question names
+  // and selectors on sibling pages are independent review inputs.
+  const page = Object.hasOwn(prompt, "page") ? prompt.page : null;
+  return reviewStatePageKey(page) + "\0" + key;
+}
+
+function stampPromptBinding(prompt, binding = currentArtifactBinding) {
+  if (!modernArtifactProtocol || !prompt || typeof prompt !== "object") return prompt;
+  // A layout-warning batch is intentionally heterogeneous: each authoritative
+  // warning record carries its own page.  Stamping the batch with whichever
+  // page happens to be visible would mislabel warnings selected across pages.
+  if (prompt.tag === "layout-warnings" && prompt.target?.type === "layout-warnings") {
+    prompt.page = null;
+    prompt.page_proof = "";
+    return prompt;
+  }
+  // The artifact is untrusted and may include look-alike page fields.  Replace
+  // them with the chrome's accepted binding, or an explicit null when the
+  // composer has no eligible current document.
+  prompt.page = binding?.page ?? null;
+  prompt.page_proof = binding?.proof || "";
+  return prompt;
 }
 
 function beginFeedbackPreparation() {
@@ -1372,11 +1856,16 @@ function beginFeedbackPreparation() {
   return preparation;
 }
 
-function enqueuePrompt(rawPrompt, /** @type {FeedbackPreparation | null} */ preparation = null) {
+function enqueuePrompt(
+  rawPrompt,
+  /** @type {FeedbackPreparation | null} */ preparation = null,
+  /** @type {any} */ sourceBinding = currentArtifactBinding,
+) {
   if ((preparation && !feedbackPreparations.has(preparation)) || (terminalSubmission && !preparation)) return false;
   // The sandboxed iframe is untrusted: never accept a caller-supplied settlement identity.
   const prompt = adoptQueuedPrompt(rawPrompt, false);
   if (!prompt) return false;
+  stampPromptBinding(prompt, sourceBinding);
 
   const queueKey = promptQueueKey(prompt);
   if (queueKey) {
@@ -1401,12 +1890,84 @@ function stripInternalPromptFields(prompt) {
   return clean;
 }
 
+function randomBindingChallenge() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return "challenge-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+}
+
+function bindingTuple(binding = currentArtifactBinding) {
+  if (!binding) return {};
+  return {
+    page_protocol: 1,
+    page: binding.page,
+    page_proof: binding.proof,
+    served_route: binding.route,
+    document_id: binding.documentId,
+    document_sequence: binding.documentSequence,
+    artifact_load_token: binding.token,
+    artifact_revision: binding.revision,
+  };
+}
+
+function retireArtifactBinding() {
+  const binding = currentArtifactBinding;
+  if (binding) retireWhiteboardChannelsForBinding?.(binding);
+  currentArtifactBinding = null;
+  if (binding?.port) {
+    try {
+      binding.port.close();
+    } catch {
+      // A closed MessagePort is already retired.
+    }
+  }
+}
+
 function postToFrame(message) {
+  if (modernArtifactProtocol) {
+    const binding = currentArtifactBinding;
+    if (!binding) return;
+    try {
+      binding.port.postMessage({ ...message, ...bindingTuple(binding) });
+    } catch {
+      retireArtifactBinding();
+    }
+    return;
+  }
   if (frame.contentWindow) frame.contentWindow.postMessage(message, "*");
+}
+
+// An asynchronous operation started by a protocol-1 document must keep the
+// binding that accepted it.  Looking up currentArtifactBinding when the
+// request settles would let a result from document A land in replacement
+// document B (including when both documents reuse the same localId/nonce).
+function postToBindingFrame(binding, message) {
+  if (!modernArtifactProtocol) {
+    postToFrame(message);
+    return;
+  }
+  if (!binding || currentArtifactBinding !== binding) return;
+  try {
+    binding.port.postMessage({ ...message, ...bindingTuple(binding) });
+  } catch {
+    if (currentArtifactBinding === binding) retireArtifactBinding();
+  }
 }
 
 function requestSnapshot(action, prompts = [], endAfter = false, terminal = null) {
   const requestId = "snapshot-" + ++nextSnapshotRequestId;
+  const capturedBinding = currentArtifactBinding
+    ? {
+        version: currentArtifactBinding.version,
+        page: currentArtifactBinding.page,
+        proof: currentArtifactBinding.proof,
+        route: currentArtifactBinding.route,
+        destination: currentArtifactBinding.destination,
+        documentId: currentArtifactBinding.documentId,
+        documentSequence: currentArtifactBinding.documentSequence,
+        token: currentArtifactBinding.token,
+        revision: currentArtifactBinding.revision,
+      }
+    : null;
   const request =
     action === "submit"
       ? {
@@ -1416,8 +1977,9 @@ function requestSnapshot(action, prompts = [], endAfter = false, terminal = null
           endAfter,
           terminal,
           order: terminal?.order || ++nextSendOperationOrder,
+          binding: capturedBinding,
         }
-      : { action };
+      : { action, binding: capturedBinding };
   snapshotRequests.set(requestId, request);
   if (action === "submit") {
     request.acknowledgement = {};
@@ -1436,9 +1998,28 @@ function takeSnapshotRequest(requestId) {
   return request || null;
 }
 
-function completeSnapshotRequest(requestId, snapshot) {
+function completeSnapshotRequest(requestId, snapshot, responseBinding = null) {
   const request = takeSnapshotRequest(requestId);
   if (!request) return;
+  if (modernArtifactProtocol) {
+    const expected = request.binding;
+    const actual = responseBinding;
+    const sameBinding =
+      expected &&
+      actual &&
+      expected.version === actual.version &&
+      expected.page === actual.page &&
+      expected.proof === actual.proof &&
+      expected.documentId === actual.documentId &&
+      expected.documentSequence === actual.documentSequence &&
+      expected.token === actual.token &&
+      expected.revision === actual.revision;
+    if (!sameBinding) {
+      // A navigation/rebind won the race.  Deliver the frozen words without
+      // asking the new document to answer an old snapshot request.
+      snapshot = "";
+    }
+  }
   if (request.action === "copy") {
     copyText(snapshot || "");
     return;
@@ -1448,6 +2029,9 @@ function completeSnapshotRequest(requestId, snapshot) {
     prompts: request.prompts || [],
     chatAtRequest: request.chatAtRequest || [],
     domSnapshot: snapshot || "",
+    snapshotPage: snapshot ? (request.binding?.page ?? null) : null,
+    snapshotPageProof: snapshot ? request.binding?.proof || "" : "",
+    binding: request.binding || null,
     endAfter: request.endAfter === true,
     terminal: request.terminal || null,
     acknowledgement: request.acknowledgement || null,
@@ -1675,6 +2259,7 @@ function sendQueued(endAfter) {
     if (text || attachments.length) {
       const prompt = { uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" };
       if (attachments.length) prompt.attachments = attachments;
+      stampPromptBinding(prompt);
       assignPromptIdentity(prompt, false);
       queued.push(prompt);
       persistQueuedPrompts();
@@ -1829,7 +2414,18 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
     settleAcknowledgementGuidance(submission, preserveFailureState);
     return;
   }
-  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: submission.domSnapshot };
+  /** @type {{ prompts: any[], domSnapshot: string, page_protocol?: number, snapshot_page?: string | null, snapshot_page_proof?: string, endSession?: boolean }} */
+  const body = {
+    prompts: prompts.map(stripInternalPromptFields),
+    domSnapshot: submission.domSnapshot,
+    ...(modernArtifactProtocol
+      ? {
+          page_protocol: 1,
+          snapshot_page: submission.domSnapshot ? (submission.snapshotPage ?? null) : null,
+          snapshot_page_proof: submission.domSnapshot ? submission.snapshotPageProof || "" : "",
+        }
+      : {}),
+  };
   if (shouldEndSession) body.endSession = true;
   let response;
   try {
@@ -1843,6 +2439,10 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
     // without it; never mutate or split the user's exact feedback batch.
     if (response.status === 413 && body.domSnapshot) {
       body.domSnapshot = "";
+      if (modernArtifactProtocol) {
+        body.snapshot_page = null;
+        body.snapshot_page_proof = "";
+      }
       response = await fetch("/api/" + key + "/prompts", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2155,6 +2755,9 @@ async function submitLayoutDiagnostics(pass) {
       artifact_revision: Number(pass?.artifactRevision) || 0,
       artifact_load_token: String(pass?.artifactLoadToken || artifactLoadToken),
       artifact_pass_sequence: Number(pass?.artifactPassSequence) || 0,
+      document_sequence: Number(pass?.documentSequence) || 0,
+      page: typeof pass?.page === "string" ? pass.page : null,
+      page_proof: String(pass?.pageProof || ""),
       viewport_width: Number(pass?.viewportWidth) || 0,
       findings: normalizeLayoutFindings(pass?.findings),
     }),
@@ -2163,12 +2766,22 @@ async function submitLayoutDiagnostics(pass) {
   return response.json();
 }
 
-async function reportArtifactFailures(failures, loadToken = artifactLoadToken) {
-  if (loadToken !== artifactLoadToken) return;
+async function reportArtifactFailures(failures, context = {}) {
+  const loadToken = String(context.loadToken || artifactLoadToken);
+  const revision = Number(context.revision ?? artifactLoadRevision) || 0;
+  const binding = context.binding || null;
+  if (loadToken !== artifactLoadToken || revision !== artifactLoadRevision) return;
   await fetch("/api/" + key + "/artifact-failures", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ failures, artifact_load_token: loadToken, artifact_revision: artifactLoadRevision }),
+    body: JSON.stringify({
+      failures,
+      artifact_load_token: loadToken,
+      artifact_revision: revision,
+      page: binding?.page ?? null,
+      page_proof: binding?.proof || "",
+      document_sequence: Number(binding?.documentSequence) || 0,
+    }),
   });
 }
 
@@ -2178,35 +2791,58 @@ async function reportArtifactFailures(failures, loadToken = artifactLoadToken) {
 // signal that separates "the review is unusable" from "the review has layout problems".
 function armArtifactAvailabilityProbe(loadToken = artifactLoadToken) {
   clearTimeout(artifactSilenceTimer);
+  const binding = currentArtifactBinding;
+  const context = {
+    loadToken,
+    revision: artifactLoadRevision,
+    binding,
+    destination: binding?.destination || artifactLoadDestination || artifactSrc,
+  };
   artifactSilenceTimer = setTimeout(() => {
     if (loadToken !== artifactLoadToken) return;
-    probeArtifactAvailability(loadToken).catch(() => {});
+    probeArtifactAvailability(context).catch(() => {});
   }, ARTIFACT_SILENCE_PROBE_MS);
   artifactSilenceTimer?.unref?.();
 }
 
-function artifactProbeSrc() {
-  const separator = artifactSrc.includes("?") ? "&" : "?";
+function artifactProbeSrc(destination, revision, loadToken) {
+  const source = String(destination || artifactSrc);
+  const hashIndex = source.indexOf("#");
+  const beforeHash = hashIndex === -1 ? source : source.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : source.slice(hashIndex);
+  const separator = beforeHash.includes("?") ? "&" : "?";
   return (
-    artifactSrc +
+    beforeHash +
     separator +
     "probe=1&artifact_revision=" +
-    encodeURIComponent(artifactLoadRevision) +
+    encodeURIComponent(revision) +
     "&artifact_load_token=" +
-    encodeURIComponent(artifactLoadToken)
+    encodeURIComponent(loadToken) +
+    hash
   );
 }
 
-async function probeArtifactAvailability(loadToken) {
-  if (loadToken !== artifactLoadToken) return;
+async function probeArtifactAvailability(context) {
+  const { loadToken, revision, binding, destination } = context;
+  if (
+    loadToken !== artifactLoadToken ||
+    revision !== artifactLoadRevision ||
+    (binding ? currentArtifactBinding !== binding : currentArtifactBinding)
+  )
+    return;
   try {
-    const response = await fetch(artifactProbeSrc(), { cache: "no-store" });
-    if (loadToken !== artifactLoadToken) return;
+    const response = await fetch(artifactProbeSrc(destination, revision, loadToken), { cache: "no-store" });
+    if (
+      loadToken !== artifactLoadToken ||
+      revision !== artifactLoadRevision ||
+      (binding ? currentArtifactBinding !== binding : currentArtifactBinding)
+    )
+      return;
     if (response.status === 409) return;
     if (response.ok) return;
     await reportArtifactFailures(
       [{ kind: "artifact-unavailable", detail: "the artifact document responded with HTTP " + response.status }],
-      loadToken,
+      context,
     );
   } catch {
     // A transient fetch failure is uncertainty, not proof - stay silent.
@@ -2311,6 +2947,7 @@ function createWarningRow(warning) {
   meta.appendChild(createWarningChip("Severe", "severity"));
   meta.appendChild(createWarningChip(statusLabel, "status-" + warning.status));
   meta.appendChild(createWarningChip(warning.viewport_label + " · " + warning.viewport_width + "px"));
+  if (warning.page) meta.appendChild(createWarningChip("Page " + warning.page, "page"));
   const seen = warningRelativeTime(warning.last_seen_at);
   if (seen) meta.appendChild(createWarningChip("Seen " + seen));
   body.appendChild(meta);
@@ -2322,7 +2959,10 @@ function createWarningRow(warning) {
 
   const actions = document.createElement("div");
   actions.className = "warning-actions";
-  if (warning.selector) {
+  if (
+    warning.selector &&
+    (!modernArtifactProtocol || (currentArtifactBinding && warning.page === currentArtifactBinding.page))
+  ) {
     const reveal = document.createElement("button");
     reveal.type = "button";
     reveal.className = "warning-action";
@@ -2434,6 +3074,7 @@ function closeWarningsDrawer({ restoreFocus = false } = {}) {
 }
 
 function revealWarning(warning) {
+  if (modernArtifactProtocol && (!currentArtifactBinding || warning.page !== currentArtifactBinding.page)) return;
   postToFrame({ type: "lavish:revealElement", selector: warning.selector });
 }
 
@@ -3102,6 +3743,8 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   cancelArtifactLoadRecovery();
   if (!recoveryRetry) artifactLoadRecoveryAttempt = 0;
   clearTimeout(artifactSilenceTimer);
+  const destinationCandidate = currentDestinationCandidate();
+  const requestedDestination = destinationPayload(destinationCandidate);
   // The iframe is sandboxed, so reload by resetting the iframe URL from chrome.
   if (!artifactSrc) {
     // The next document reports its own registry once it loads; until then the
@@ -3110,8 +3753,8 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
     // load (superseded/out-of-order/exhausted retries below) must leave it intact.
     resetRevisionLegend();
     startLayoutGateCycle();
-    const currentSrc = frame.src || "about:blank";
-    frame.src = currentSrc + (currentSrc.includes("?") ? "&" : "?") + "lavish_reload=" + Date.now();
+    const currentSrc = frame.src || artifactSrc;
+    navigateArtifactFrame(freshReloadDestination(currentSrc || artifactSrc));
     return true;
   }
   const requestSequence = ++artifactLoadRequestSequence;
@@ -3164,6 +3807,9 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
           request_id: requestId,
           request_sequence: requestSequence,
           chrome_load_token: chromeLoadToken,
+          ...(modernArtifactProtocol && requestedDestination
+            ? { destination: requestedDestination, reload_reason: recoveryRetry ? "recovery" : "reload" }
+            : {}),
         }),
       });
       const candidate = await response.json().catch(() => ({}));
@@ -3199,6 +3845,20 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
           return preservePreviousLoad();
         }
         if (status === "out-of-order") return preservePreviousLoad();
+        if (status === "invalid-destination") {
+          setLayoutGateFailure(
+            "Lavish could not reload this page.",
+            "The page is no longer an eligible local HTML document. The current review was kept intact; reload the saved entry to continue.",
+            "Reload entry",
+            () => {
+              retireArtifactBinding();
+              markDestinationUnavailable();
+              artifactLoadDestination = "";
+              replaceArtifactFrame().catch(() => {});
+            },
+          );
+          return preservePreviousLoad();
+        }
         throw new Error("failed to begin artifact load");
       }
       const candidateRevision = Number(candidate?.artifact_revision);
@@ -3206,7 +3866,11 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
       if (!Number.isSafeInteger(candidateRevision) || candidateRevision < 0 || !candidateToken) {
         throw new Error("invalid artifact load");
       }
-      load = { artifact_revision: candidateRevision, artifact_load_token: candidateToken };
+      load = {
+        artifact_revision: candidateRevision,
+        artifact_load_token: candidateToken,
+        artifact_url: typeof candidate?.artifact_url === "string" ? candidate.artifact_url : "",
+      };
       break;
     } catch {
       const delay = ARTIFACT_LOAD_BEGIN_RETRY_DELAYS_MS[transportAttempt++];
@@ -3222,20 +3886,34 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   artifactLoadRevision = revision;
   artifactLoadToken = token;
   artifactSpokeToken = "";
-  inlineWhiteboardChannels.clear();
+  retireAllWhiteboardChannels();
   setHandoffSuperseded(false);
   startLayoutGateCycle();
+  const responseDestination = String(load?.artifact_url || "");
+  const validatedResponseDestination = responseDestination
+    ? normalizeArtifactDestination(responseDestination, destinationCandidate?.route || "")
+    : "";
+  const selectedDestination =
+    validatedResponseDestination ||
+    normalizeArtifactDestination(
+      destinationCandidate?.destination || destinationCandidate?.route || artifactSrc,
+      destinationCandidate?.route || "",
+    ) ||
+    artifactSrc;
+  artifactLoadDestination = stripReservedReloadParameters(selectedDestination);
   // The next document reports its own registry once it loads; until then the
   // previous revision's legend would point at blocks that may no longer exist.
+  // This reset stays adjacent to the navigation that actually replaces the
+  // document, after every preserve/fail-closed return above.
   resetRevisionLegend();
-  frame.src = artifactFrameSrcForLoad({ revision, token });
+  navigateArtifactFrame(artifactFrameSrcForLoad({ revision, token, destination: artifactLoadDestination }));
   return true;
 }
 
 function resetFrame() {
   if (artifactResetPromise) return artifactResetPromise;
-  const hasLiveInlineWhiteboard = [...inlineWhiteboardChannels].some(
-    ([index, channel]) => channel.initialized && index !== overlayIndex,
+  const hasLiveInlineWhiteboard = [...inlineWhiteboardChannels.values()].some(
+    (channel) => channel.initialized && channel.active && channel.context !== overlayContext,
   );
   if (!hasLiveInlineWhiteboard) {
     return replaceArtifactFrame();
@@ -3260,13 +3938,34 @@ function resetFrame() {
 // one sidecar.
 // ---------------------------------------------------------------------------
 
-/** @type {Map<number, { diagramId: string, source: string, sourceHash: string }>} */
+/**
+ * @typedef {{
+ *   key: string,
+ *   index: number,
+ *   page: string | null,
+ *   proof: string,
+ *   binding: any,
+ *   token: string,
+ *   revision: number,
+ *   documentId: string,
+ *   documentSequence: number,
+ *   placement?: "inline" | "overlay",
+ *   channel?: any,
+ *   channelId?: string,
+ *   active?: boolean,
+ * }} WhiteboardContext
+ */
+
+/** @type {Map<string, { diagramId: string, source: string, sourceHash: string, page: string | null, index: number }>} */
 const whiteboards = new Map();
 /** @type {number | null} */
 let overlayIndex = null;
 let overlayFrameReady = false;
 let overlayChannelId = "";
-let overlayOpeningIndex = null;
+/** @type {WhiteboardContext | null} */
+let overlayContext = null;
+/** @type {WhiteboardContext | null} */
+let overlayOpeningContext = null;
 let nextWhiteboardFlushId = 0;
 let artifactResetPromise = null;
 let chromeRestartReloadPromise = null;
@@ -3275,38 +3974,120 @@ const whiteboardFlushes = new Map();
 const whiteboardSaveChains = new Map();
 const inlineWhiteboardChannels = new Map();
 
+function whiteboardIdentityKey(page, index) {
+  return JSON.stringify([page === null || page === undefined ? null : String(page), Number(index)]);
+}
+
+function captureWhiteboardContext(index, binding = currentArtifactBinding, placement = "inline") {
+  const normalizedIndex = validWhiteboardIndex(index);
+  if (normalizedIndex === null) return null;
+  const modern = modernArtifactProtocol;
+  const page = modern ? (binding?.page ?? null) : null;
+  return {
+    key: whiteboardIdentityKey(page, normalizedIndex),
+    index: normalizedIndex,
+    page,
+    proof: modern ? String(binding?.proof || "") : "",
+    binding,
+    token: String(binding?.token || ""),
+    revision: Number(binding?.revision) || 0,
+    documentId: String(binding?.documentId || ""),
+    documentSequence: Number(binding?.documentSequence) || 0,
+    placement,
+  };
+}
+
+function whiteboardContextIsLive(context) {
+  if (!context || context.active === false || ended) return false;
+  // The legacy page-less transport has no binding to compare. Its channel
+  // remains authenticated by the existing source + channel-id checks.
+  return !modernArtifactProtocol || Boolean(context.binding && currentArtifactBinding === context.binding);
+}
+
+function whiteboardPageQuery(context) {
+  if (!modernArtifactProtocol || !context || context.page === null || !context.proof) return "";
+  return "?page=" + encodeURIComponent(context.page) + "&page_proof=" + encodeURIComponent(context.proof);
+}
+
+function whiteboardEndpoint(pathname, context) {
+  return String(pathname) + whiteboardPageQuery(context);
+}
+
+function whiteboardPageBody(context) {
+  if (!modernArtifactProtocol || !context || context.page === null || !context.proof) return {};
+  // Durable operations deliberately carry only the captured page credential.
+  // Live generation fields belong to channel authentication, not to delayed
+  // saves or feedback exports, which must remain valid across handoff/restart.
+  return { page: context.page, page_proof: context.proof };
+}
+
+function whiteboardChannelAuthBody(token, context) {
+  const body = { token: String(token || "") };
+  if (modernArtifactProtocol && context?.binding) {
+    Object.assign(body, {
+      page_protocol: 1,
+      page: context.page,
+      page_proof: context.proof,
+      artifact_load_token: context.token,
+      artifact_revision: context.revision,
+      document_sequence: context.documentSequence,
+    });
+  }
+  return body;
+}
+
+function retireWhiteboardChannelsForBinding(binding) {
+  if (!binding) return;
+  for (const channel of inlineWhiteboardChannels.values()) {
+    if (channel.context?.binding === binding) channel.active = false;
+  }
+  if (overlayContext?.binding === binding) overlayContext.active = false;
+  if (overlayOpeningContext?.binding === binding) overlayOpeningContext.active = false;
+}
+
+function retireAllWhiteboardChannels() {
+  for (const channel of inlineWhiteboardChannels.values()) channel.active = false;
+  inlineWhiteboardChannels.clear();
+  if (overlayContext) overlayContext.active = false;
+  if (overlayOpeningContext) overlayOpeningContext.active = false;
+}
+
 function whiteboardTheme() {
   return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function postToWhiteboardOverlay(message) {
-  if (whiteboardFrame.contentWindow && overlayChannelId) {
-    whiteboardFrame.contentWindow.postMessage({ ...message, channelId: overlayChannelId }, "*");
+function postToWhiteboardOverlay(message, context = overlayContext, allowInactive = false) {
+  if (!context || (!allowInactive && !whiteboardContextIsLive(context))) return;
+  const channelId = String(context.channelId || overlayChannelId || "");
+  if (whiteboardFrame.contentWindow && channelId) {
+    whiteboardFrame.contentWindow.postMessage({ ...message, channelId }, "*");
   }
 }
 
-function postToInlineWhiteboard(index, message) {
-  const channel = inlineWhiteboardChannels.get(index);
-  if (channel?.window) channel.window.postMessage({ ...message, channelId: channel.channelId }, "*");
+function postToInlineWhiteboard(context, message, allowInactive = false) {
+  const channel = context?.channel || inlineWhiteboardChannels.get(context?.key);
+  if (!channel || (!allowInactive && (!channel.active || !whiteboardContextIsLive(context)))) return;
+  if (channel.window) channel.window.postMessage({ ...message, channelId: channel.channelId }, "*");
 }
 
-function postToWhiteboard(index, placement, message) {
-  if (placement === "overlay") postToWhiteboardOverlay(message);
-  else postToInlineWhiteboard(index, message);
+function postToWhiteboard(context, message, allowInactive = false) {
+  if (!context) return;
+  if (context.placement === "overlay") postToWhiteboardOverlay(message, context, allowInactive);
+  else postToInlineWhiteboard(context, message, allowInactive);
 }
 
-async function fetchMermaidSources() {
-  const response = await fetch("/api/" + key + "/mermaid-sources");
+async function fetchMermaidSources(context = null) {
+  const response = await fetch(whiteboardEndpoint("/api/" + key + "/mermaid-sources", context));
   if (!response.ok) throw new Error("could not read the artifact's Mermaid sources");
   const data = await response.json();
   return Array.isArray(data.sources) ? data.sources : [];
 }
 
-async function authenticateWhiteboardChannel(token) {
+async function authenticateWhiteboardChannel(token, context = null) {
   const response = await fetch("/api/" + key + "/whiteboard-channel", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token }),
+    body: JSON.stringify(whiteboardChannelAuthBody(token, context)),
   });
   return response.ok;
 }
@@ -3317,27 +4098,33 @@ function showWhiteboardError(text) {
   whiteboardOverlay.hidden = false;
 }
 
-function whiteboardRecord(index) {
-  let record = whiteboards.get(index);
+function whiteboardRecord(index, page = modernArtifactProtocol ? (currentArtifactBinding?.page ?? null) : null) {
+  const normalizedIndex = validWhiteboardIndex(index);
+  if (normalizedIndex === null) return null;
+  const identityKey = whiteboardIdentityKey(page, normalizedIndex);
+  let record = whiteboards.get(identityKey);
   if (!record) {
-    record = { diagramId: "", source: "", sourceHash: "" };
-    whiteboards.set(index, record);
+    record = { diagramId: "", source: "", sourceHash: "", page, index: normalizedIndex };
+    whiteboards.set(identityKey, record);
   }
   return record;
 }
 
-async function handleWhiteboardReady(index, mode, isCurrent) {
+async function handleWhiteboardReady(context, mode, isCurrent) {
+  if (!context) return false;
+  const { index } = context;
   try {
-    const sources = await fetchMermaidSources();
+    const sources = await fetchMermaidSources(context);
     const source = sources.find((item) => item.index === index);
     if (!source) throw new Error("this diagram's Mermaid source was not found in the artifact file");
-    const savedResponse = await fetch("/api/" + key + "/whiteboard/" + index);
+    const savedResponse = await fetch(whiteboardEndpoint("/api/" + key + "/whiteboard/" + index, context));
     const saved = savedResponse.ok ? (await savedResponse.json()).whiteboard : null;
-    const record = whiteboardRecord(index);
+    const record = whiteboardRecord(index, context.page);
+    if (!record) return false;
     record.source = String(source.source || "");
     record.sourceHash = String(source.hash || "");
     if (!isCurrent()) return false;
-    postToWhiteboard(index, mode, {
+    postToWhiteboard(context, {
       type: "lavish-whiteboard:init",
       mode,
       diagramIndex: index,
@@ -3356,39 +4143,49 @@ async function handleWhiteboardReady(index, mode, isCurrent) {
   }
 }
 
-function showWhiteboardOverlay(index) {
-  if (ended) return;
-  overlayIndex = index;
+function showWhiteboardOverlay(context) {
+  if (!context || ended || !whiteboardContextIsLive(context)) return;
+  overlayContext = { ...context, placement: "overlay", active: true, channel: null, channelId: "" };
+  overlayIndex = context.index;
   overlayFrameReady = false;
   overlayChannelId = "";
-  inlineWhiteboardChannels.delete(index);
+  inlineWhiteboardChannels.delete(context.key);
   whiteboardError.hidden = true;
   whiteboardOverlay.hidden = false;
-  postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: index });
+  postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: context.index, page: context.page });
   // A fresh document per open: the frame boots, posts ready, and receives its
   // init - no stale editor state can leak between opens.
   whiteboardFrame.src =
-    "/whiteboard-frame?diagramIndex=" + encodeURIComponent(String(index)) + "&key=" + encodeURIComponent(key);
+    "/whiteboard-frame?diagramIndex=" + encodeURIComponent(String(context.index)) + "&key=" + encodeURIComponent(key);
 }
 
-function finishWhiteboardClose(index) {
+function finishWhiteboardClose(context = overlayContext) {
+  const index = context?.index ?? overlayIndex;
+  const shouldResume = Boolean(!ended && context && whiteboardContextIsLive(context));
   whiteboardOverlay.hidden = true;
   whiteboardError.hidden = true;
   whiteboardFrame.src = "about:blank";
   overlayIndex = null;
   overlayFrameReady = false;
   overlayChannelId = "";
-  inlineWhiteboardChannels.delete(index);
-  if (!ended) postToFrame({ type: "lavish:resumeWhiteboard", diagramIndex: index });
+  if (context) {
+    context.active = false;
+    if (context.key) inlineWhiteboardChannels.delete(context.key);
+  }
+  overlayContext = null;
+  if (shouldResume) {
+    postToFrame({ type: "lavish:resumeWhiteboard", diagramIndex: index, page: context.page });
+  }
 }
 
-function whiteboardTeardownKey(index, placement) {
-  return placement + ":" + index;
+function whiteboardTeardownKey(context, placement) {
+  return placement + ":" + (context?.key || "");
 }
 
-function beginWhiteboardTeardown(index, placement, onComplete) {
-  const key = whiteboardTeardownKey(index, placement);
-  const pending = whiteboardTeardowns.get(key);
+function beginWhiteboardTeardown(context, placement, onComplete) {
+  if (!context) return Promise.resolve(false);
+  const teardownKey = whiteboardTeardownKey(context, placement);
+  const pending = whiteboardTeardowns.get(teardownKey);
   if (pending) {
     if (onComplete) pending.promise.then(onComplete);
     return pending.promise;
@@ -3398,39 +4195,54 @@ function beginWhiteboardTeardown(index, placement, onComplete) {
   const promise = new Promise((complete) => {
     resolve = complete;
   });
-  const teardown = { index, placement, flushId, promise, resolve, onComplete };
-  whiteboardTeardowns.set(key, teardown);
+  const teardown = { context, index: context.index, placement, flushId, promise, resolve, onComplete };
+  whiteboardTeardowns.set(teardownKey, teardown);
   const message = { type: "lavish-whiteboard:prepareTeardown", flushId };
-  postToWhiteboard(index, placement, message);
+  postToWhiteboard(context, message);
   return promise;
 }
 
-function finishWhiteboardTeardown(index, message, placement) {
+function finishWhiteboardTeardown(context, message, placement) {
   const flushId = String(message.flushId || "");
-  const key = whiteboardTeardownKey(index, placement);
-  const teardown = whiteboardTeardowns.get(key);
-  if (!teardown || teardown.index !== index || teardown.placement !== placement || teardown.flushId !== flushId) return;
-  whiteboardTeardowns.delete(key);
+  const teardownKey = whiteboardTeardownKey(context, placement);
+  const teardown = whiteboardTeardowns.get(teardownKey);
+  if (
+    !teardown ||
+    teardown.index !== context?.index ||
+    teardown.placement !== placement ||
+    teardown.flushId !== flushId ||
+    teardown.context?.channelId !== context?.channelId
+  )
+    return;
+  whiteboardTeardowns.delete(teardownKey);
   teardown.onComplete?.(true);
   teardown.resolve(true);
 }
 
-function failWhiteboardTeardown(index, message, placement) {
+function failWhiteboardTeardown(context, message, placement) {
   const flushId = String(message.flushId || "");
-  const key = whiteboardTeardownKey(index, placement);
-  const teardown = whiteboardTeardowns.get(key);
-  if (!teardown || teardown.index !== index || teardown.placement !== placement || teardown.flushId !== flushId) return;
-  whiteboardTeardowns.delete(key);
+  const teardownKey = whiteboardTeardownKey(context, placement);
+  const teardown = whiteboardTeardowns.get(teardownKey);
+  if (
+    !teardown ||
+    teardown.index !== context?.index ||
+    teardown.placement !== placement ||
+    teardown.flushId !== flushId ||
+    teardown.context?.channelId !== context?.channelId
+  )
+    return;
+  whiteboardTeardowns.delete(teardownKey);
   teardown.onComplete?.(false);
   teardown.resolve(false);
 }
 
-function whiteboardFlushKey(index, placement) {
-  return placement + ":" + index;
+function whiteboardFlushKey(context, placement) {
+  return placement + ":" + (context?.key || "");
 }
 
-function beginWhiteboardFlush(index, placement) {
-  const flushKey = whiteboardFlushKey(index, placement);
+function beginWhiteboardFlush(context, placement) {
+  if (!context) return Promise.resolve(false);
+  const flushKey = whiteboardFlushKey(context, placement);
   const pending = whiteboardFlushes.get(flushKey);
   if (pending) return pending.promise;
   const flushId = `whiteboard-flush-${++nextWhiteboardFlushId}`;
@@ -3438,26 +4250,35 @@ function beginWhiteboardFlush(index, placement) {
   const promise = new Promise((complete) => {
     resolve = complete;
   });
-  whiteboardFlushes.set(flushKey, { index, placement, flushId, promise, resolve });
-  postToWhiteboard(index, placement, { type: "lavish-whiteboard:flush", flushId });
+  whiteboardFlushes.set(flushKey, { context, index: context.index, placement, flushId, promise, resolve });
+  postToWhiteboard(context, { type: "lavish-whiteboard:flush", flushId });
   return promise;
 }
 
-function finishWhiteboardFlush(index, message, placement) {
+function finishWhiteboardFlush(context, message, placement) {
   const flushId = String(message.flushId || "");
-  const flushKey = whiteboardFlushKey(index, placement);
+  const flushKey = whiteboardFlushKey(context, placement);
   const flush = whiteboardFlushes.get(flushKey);
-  if (!flush || flush.index !== index || flush.placement !== placement || flush.flushId !== flushId) return;
+  if (
+    !flush ||
+    flush.index !== context?.index ||
+    flush.placement !== placement ||
+    flush.flushId !== flushId ||
+    flush.context?.channelId !== context?.channelId
+  )
+    return;
   whiteboardFlushes.delete(flushKey);
   flush.resolve(Boolean(message.ok));
 }
 
 async function flushWhiteboardsBeforeChromeReload() {
   const flushes = [];
-  for (const [index, channel] of inlineWhiteboardChannels) {
-    if (channel.initialized && index !== overlayIndex) flushes.push(beginWhiteboardFlush(index, "inline"));
+  for (const channel of inlineWhiteboardChannels.values()) {
+    if (channel.initialized && channel.active && channel.context !== overlayContext) {
+      flushes.push(beginWhiteboardFlush(channel.context, "inline"));
+    }
   }
-  if (overlayIndex !== null && overlayFrameReady) flushes.push(beginWhiteboardFlush(overlayIndex, "overlay"));
+  if (overlayContext && overlayFrameReady) flushes.push(beginWhiteboardFlush(overlayContext, "overlay"));
   if (flushes.length === 0) return;
   let timeout;
   await Promise.race([
@@ -3470,37 +4291,46 @@ async function flushWhiteboardsBeforeChromeReload() {
 }
 
 async function flushInlineWhiteboards() {
-  for (const [index, channel] of [...inlineWhiteboardChannels]) {
-    if (!channel.initialized || index === overlayIndex) continue;
-    if (!(await beginWhiteboardTeardown(index, "inline"))) return false;
+  for (const channel of [...inlineWhiteboardChannels.values()]) {
+    if (!channel.initialized || !channel.active || channel.context === overlayContext) continue;
+    if (!(await beginWhiteboardTeardown(channel.context, "inline"))) return false;
   }
   return true;
 }
 
-function openWhiteboardOverlay(index) {
-  if (ended || overlayIndex !== null || overlayOpeningIndex !== null) return;
-  overlayOpeningIndex = index;
-  beginWhiteboardTeardown(index, "inline", (flushed) => {
-    if (overlayOpeningIndex !== index) return;
-    overlayOpeningIndex = null;
-    if (flushed && !ended && overlayIndex === null) showWhiteboardOverlay(index);
+function openWhiteboardOverlay(context) {
+  if (!context || ended || overlayIndex !== null || overlayOpeningContext !== null) return;
+  if (!whiteboardContextIsLive(context)) return;
+  overlayOpeningContext = context;
+  beginWhiteboardTeardown(context, "inline", (flushed) => {
+    if (overlayOpeningContext !== context) return;
+    overlayOpeningContext = null;
+    if (flushed && !ended && overlayIndex === null && whiteboardContextIsLive(context)) showWhiteboardOverlay(context);
   });
 }
 
 function closeWhiteboard() {
-  const index = overlayIndex;
-  if (index === null) return;
-  if (!overlayFrameReady) {
-    finishWhiteboardClose(index);
+  const context = overlayContext;
+  if (!context || overlayIndex === null) return;
+  // Navigation retires the artifact binding while the standalone overlay can
+  // still be visible. Its channel may no longer start any user action, but the
+  // chrome must still be able to discard the departed editor instead of
+  // waiting forever for a teardown response from a stale page.
+  if (!whiteboardContextIsLive(context)) {
+    finishWhiteboardClose(context);
     return;
   }
-  beginWhiteboardTeardown(index, "overlay", (flushed) => {
-    if (flushed && overlayIndex === index) finishWhiteboardClose(index);
+  if (!overlayFrameReady) {
+    finishWhiteboardClose(context);
+    return;
+  }
+  beginWhiteboardTeardown(context, "overlay", (flushed) => {
+    if (flushed && overlayContext === context) finishWhiteboardClose(context);
   });
 }
 
-async function persistWhiteboardScene(index, message) {
-  const response = await fetch("/api/" + key + "/whiteboard/" + index, {
+async function persistWhiteboardScene(context, message) {
+  const response = await fetch(whiteboardEndpoint("/api/" + key + "/whiteboard/" + context.index, context), {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -3508,36 +4338,48 @@ async function persistWhiteboardScene(index, message) {
       text_metrics_version: Number(message.textMetricsVersion) || 0,
       scene: message.scene || null,
       baseline: message.baseline || null,
+      ...whiteboardPageBody(context),
     }),
   });
   if (!response.ok) throw new Error("failed to save whiteboard scene");
 }
 
-function saveWhiteboardScene(index, message) {
-  const previous = whiteboardSaveChains.get(index) || Promise.resolve();
-  const result = previous.catch(() => {}).then(() => persistWhiteboardScene(index, message));
+function saveWhiteboardScene(context, message) {
+  if (!context) return Promise.reject(new Error("whiteboard context is unavailable"));
+  // The context and payload are captured before entering the chain. The
+  // current page may change while either the prior save or this request is
+  // waiting on the server; neither await is allowed to retarget the write.
+  const capturedContext = { ...context };
+  const capturedMessage = { ...message };
+  const previous = whiteboardSaveChains.get(context.key) || Promise.resolve();
+  const result = previous.catch(() => {}).then(() => persistWhiteboardScene(capturedContext, capturedMessage));
   const tail = result.catch(() => {});
-  whiteboardSaveChains.set(index, tail);
+  whiteboardSaveChains.set(context.key, tail);
   tail.finally(() => {
-    if (whiteboardSaveChains.get(index) === tail) whiteboardSaveChains.delete(index);
+    if (whiteboardSaveChains.get(context.key) === tail) whiteboardSaveChains.delete(context.key);
   });
   return result;
 }
 
-function handleWhiteboardSave(index, message, mode) {
+function handleWhiteboardSave(context, message) {
+  const capturedContext = { ...context };
   const flushId = String(message.flushId || "");
-  saveWhiteboardScene(index, message).then(
+  saveWhiteboardScene(capturedContext, message).then(
     () => {
-      if (flushId) postToWhiteboard(index, mode, { type: "lavish-whiteboard:saveResult", flushId, ok: true });
+      if (flushId) postToWhiteboard(capturedContext, { type: "lavish-whiteboard:saveResult", flushId, ok: true }, true);
     },
     (error) => {
       if (flushId) {
-        postToWhiteboard(index, mode, {
-          type: "lavish-whiteboard:saveResult",
-          flushId,
-          ok: false,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        postToWhiteboard(
+          capturedContext,
+          {
+            type: "lavish-whiteboard:saveResult",
+            flushId,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          true,
+        );
       }
     },
   );
@@ -3551,27 +4393,41 @@ function whiteboardSummaryText(summaryLines) {
     .join("\n");
 }
 
-async function queueWhiteboardFeedback(index, message, mode) {
+async function queueWhiteboardFeedback(context, message) {
+  const capturedContext = { ...context };
+  const index = capturedContext.index;
   const preparation = beginFeedbackPreparation();
   if (!preparation) {
-    postToWhiteboard(index, mode, {
-      type: "lavish-whiteboard:queueResult",
-      ok: false,
-      error: "Feedback delivery is already ending this review.",
-    });
+    postToWhiteboard(
+      capturedContext,
+      {
+        type: "lavish-whiteboard:queueResult",
+        ok: false,
+        error: "Feedback delivery is already ending this review.",
+      },
+      true,
+    );
     return;
   }
-  const diagramId = whiteboardRecord(index).diagramId;
+  const record = whiteboardRecord(index, capturedContext.page);
+  const diagramId = record?.diagramId || "";
   let succeeded = false;
   try {
     // Persist the exact reviewed state before queueing, so the paths in the
     // prompt point at what the user actually saw.
-    await saveWhiteboardScene(index, message);
-    const response = await fetch("/api/" + key + "/whiteboard/" + index + "/feedback-files", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ scene: message.scene || null, pngDataUrl: String(message.pngDataUrl || "") }),
-    });
+    await saveWhiteboardScene(capturedContext, message);
+    const response = await fetch(
+      whiteboardEndpoint("/api/" + key + "/whiteboard/" + index + "/feedback-files", capturedContext),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scene: message.scene || null,
+          pngDataUrl: String(message.pngDataUrl || ""),
+          ...whiteboardPageBody(capturedContext),
+        }),
+      },
+    );
     if (!response.ok) throw new Error("failed to write whiteboard feedback files");
     const files = await response.json();
     const note = String(message.note || "").slice(0, 4000);
@@ -3603,27 +4459,33 @@ async function queueWhiteboardFeedback(index, message, mode) {
             previewPath: String(files.preview_path || ""),
             imageFallback: Boolean(message.imageFallback),
             stats: message.stats && typeof message.stats === "object" ? message.stats : {},
+            page: capturedContext.page,
           },
           // Re-queueing the same diagram's whiteboard before sending replaces the
           // earlier unsent prompt instead of stacking duplicates.
           [internalQueueKeyField]: "whiteboard:" + index,
         },
         preparation,
+        capturedContext,
       )
     )
       throw new Error("failed to retain whiteboard feedback");
     // Queued from the whiteboard inside the artifact, like any other in-artifact prompt.
     pulseSheetDock();
-    postToWhiteboard(index, mode, { type: "lavish-whiteboard:queueResult", ok: true });
-    if (mode === "overlay") closeWhiteboard();
+    postToWhiteboard(capturedContext, { type: "lavish-whiteboard:queueResult", ok: true }, true);
+    if (capturedContext.placement === "overlay") closeWhiteboard();
     clearPreparationFailure("whiteboard");
     succeeded = true;
   } catch (error) {
-    postToWhiteboard(index, mode, {
-      type: "lavish-whiteboard:queueResult",
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    postToWhiteboard(
+      capturedContext,
+      {
+        type: "lavish-whiteboard:queueResult",
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      true,
+    );
   } finally {
     preparation.finish(succeeded);
   }
@@ -3634,21 +4496,26 @@ async function queueWhiteboardFeedback(index, message, mode) {
 // open overlay outlives the reload; tell it when its diagram's source changed
 // underneath it so the frame can surface staleness (never silently merge).
 async function refreshWhiteboardSource() {
-  if (overlayIndex === null) return;
-  const index = overlayIndex;
+  const context = overlayContext;
+  if (!context || overlayIndex === null) return;
+  const index = context.index;
   try {
-    const sources = await fetchMermaidSources();
+    const sources = await fetchMermaidSources(context);
     const source = sources.find((item) => item.index === index);
     const nextHash = source ? String(source.hash || "") : "";
-    const record = whiteboardRecord(index);
+    const record = whiteboardRecord(index, context.page);
+    if (!record || overlayContext !== context) return;
     if (nextHash !== record.sourceHash) {
       record.source = source ? String(source.source || "") : "";
       record.sourceHash = nextHash;
-      postToWhiteboardOverlay({
-        type: "lavish-whiteboard:sourceChanged",
-        source: record.source,
-        sourceHash: record.sourceHash,
-      });
+      postToWhiteboardOverlay(
+        {
+          type: "lavish-whiteboard:sourceChanged",
+          source: record.source,
+          sourceHash: record.sourceHash,
+        },
+        context,
+      );
     }
   } catch {
     // Best effort - the staleness banner also re-arms on the next open.
@@ -3660,14 +4527,22 @@ function validWhiteboardIndex(value) {
   return Number.isInteger(index) && index >= 0 && index <= 999 ? index : null;
 }
 
-function handleAuthenticatedWhiteboardMessage(index, message, mode) {
-  if (message.type === "lavish-whiteboard:save") handleWhiteboardSave(index, message, mode);
-  if (message.type === "lavish-whiteboard:queueFeedback") queueWhiteboardFeedback(index, message, mode);
-  if (message.type === "lavish-whiteboard:maximize" && mode === "inline") openWhiteboardOverlay(index);
-  if (message.type === "lavish-whiteboard:close" && mode === "overlay") closeWhiteboard();
-  if (message.type === "lavish-whiteboard:teardownReady") finishWhiteboardTeardown(index, message, mode);
-  if (message.type === "lavish-whiteboard:teardownFailed") failWhiteboardTeardown(index, message, mode);
-  if (message.type === "lavish-whiteboard:flushComplete") finishWhiteboardFlush(index, message, mode);
+function handleAuthenticatedWhiteboardMessage(context, message, mode) {
+  if (!context) return;
+  const completion =
+    message.type === "lavish-whiteboard:teardownReady" ||
+    message.type === "lavish-whiteboard:teardownFailed" ||
+    message.type === "lavish-whiteboard:flushComplete";
+  // A departed frame may finish a save/flush that chrome accepted earlier, but
+  // it cannot start a new persistence action after the binding has changed.
+  if (!completion && !whiteboardContextIsLive(context)) return;
+  if (message.type === "lavish-whiteboard:save") handleWhiteboardSave(context, message);
+  if (message.type === "lavish-whiteboard:queueFeedback") queueWhiteboardFeedback(context, message);
+  if (message.type === "lavish-whiteboard:maximize" && mode === "inline") openWhiteboardOverlay(context);
+  if (message.type === "lavish-whiteboard:close" && mode === "overlay" && overlayContext === context) closeWhiteboard();
+  if (message.type === "lavish-whiteboard:teardownReady") finishWhiteboardTeardown(context, message, mode);
+  if (message.type === "lavish-whiteboard:teardownFailed") failWhiteboardTeardown(context, message, mode);
+  if (message.type === "lavish-whiteboard:flushComplete") finishWhiteboardFlush(context, message, mode);
 }
 
 // Inline whiteboard frames are created by the SDK inside the artifact document,
@@ -3695,51 +4570,74 @@ function handleInlineWhiteboardMessage(event, message) {
   const index = validWhiteboardIndex(message.diagramIndex);
   if (index === null) return;
   if (message.type === "lavish-whiteboard:ready") {
-    if (inlineWhiteboardChannels.has(index)) return;
+    const binding = modernArtifactProtocol ? currentArtifactBinding : null;
+    if (modernArtifactProtocol && !binding) return;
+    const context = captureWhiteboardContext(index, binding, "inline");
+    if (!context || inlineWhiteboardChannels.has(context.key)) return;
     const channelId = String(message.channelToken || "");
     if (!channelId) return;
-    authenticateWhiteboardChannel(channelId).then((authenticated) => {
-      if (!authenticated || ended || inlineWhiteboardChannels.has(index)) return;
-      const channel = { window: event.source, channelId, initialized: false };
-      inlineWhiteboardChannels.set(index, channel);
-      whiteboardRecord(index).diagramId = String(message.diagramId || "");
-      handleWhiteboardReady(index, "inline", () => inlineWhiteboardChannels.get(index) === channel).then(
-        (initialized) => {
-          if (inlineWhiteboardChannels.get(index) === channel) channel.initialized = initialized;
-        },
-      );
+    context.channelId = channelId;
+    const channel = { context, window: event.source, channelId, initialized: false, active: true };
+    context.channel = channel;
+    authenticateWhiteboardChannel(channelId, context).then((authenticated) => {
+      if (!authenticated || ended || !whiteboardContextIsLive(context) || inlineWhiteboardChannels.has(context.key)) {
+        channel.active = false;
+        return;
+      }
+      inlineWhiteboardChannels.set(context.key, channel);
+      const record = whiteboardRecord(index, context.page);
+      if (!record) return;
+      record.diagramId = String(message.diagramId || "");
+      handleWhiteboardReady(
+        context,
+        "inline",
+        () =>
+          channel.active && whiteboardContextIsLive(context) && inlineWhiteboardChannels.get(context.key) === channel,
+      ).then((initialized) => {
+        if (inlineWhiteboardChannels.get(context.key) === channel) channel.initialized = initialized;
+      });
     });
     return;
   }
-  const channel = inlineWhiteboardChannels.get(index);
-  if (!channel || channel.window !== event.source || channel.channelId !== message.channelId) return;
-  handleAuthenticatedWhiteboardMessage(index, message, "inline");
+  // Look up by the sender's captured channel, not by the current page. A late
+  // message from page A must never be reinterpreted as diagram 0 on page B.
+  const channel = [...inlineWhiteboardChannels.values()].find(
+    (candidate) => candidate.window === event.source && candidate.channelId === message.channelId,
+  );
+  if (!channel || !channel.active || channel.context.index !== index) return;
+  handleAuthenticatedWhiteboardMessage(channel.context, message, "inline");
 }
 
 function handleOverlayWhiteboardMessage(event, message) {
-  if (event.source !== whiteboardFrame.contentWindow || overlayIndex === null) return;
+  if (event.source !== whiteboardFrame.contentWindow || overlayIndex === null || !overlayContext) return;
   const index = validWhiteboardIndex(message.diagramIndex);
   if (index === null || index !== overlayIndex) return;
+  const context = overlayContext;
   if (message.type === "lavish-whiteboard:ready") {
     if (overlayFrameReady || overlayChannelId) return;
     const channelId = String(message.channelToken || "");
     if (!channelId) return;
     overlayChannelId = channelId;
-    authenticateWhiteboardChannel(channelId).then(async (authenticated) => {
+    context.channelId = channelId;
+    authenticateWhiteboardChannel(channelId, context).then(async (authenticated) => {
       const isCurrent = () =>
-        overlayIndex === index && overlayChannelId === channelId && event.source === whiteboardFrame.contentWindow;
+        overlayIndex === index &&
+        overlayContext === context &&
+        overlayChannelId === channelId &&
+        event.source === whiteboardFrame.contentWindow &&
+        whiteboardContextIsLive(context);
       if (!authenticated) {
         if (isCurrent()) overlayChannelId = "";
         return;
       }
       if (!isCurrent()) return;
-      const initialized = await handleWhiteboardReady(index, "overlay", isCurrent);
+      const initialized = await handleWhiteboardReady(context, "overlay", isCurrent);
       if (initialized && isCurrent()) overlayFrameReady = true;
     });
     return;
   }
   if (!overlayFrameReady || message.channelId !== overlayChannelId) return;
-  handleAuthenticatedWhiteboardMessage(index, message, "overlay");
+  handleAuthenticatedWhiteboardMessage(context, message, "overlay");
 }
 
 window.addEventListener("message", (event) => {
@@ -3753,9 +4651,10 @@ window.addEventListener("message", (event) => {
 
 function loadFrame() {
   if (artifactSrc) {
-    if (artifactLoadToken) {
-      frame.src = artifactFrameSrcForLoad({ revision: artifactLoadRevision, token: artifactLoadToken });
-    }
+    // `replaceArtifactFrame` owns every controlled navigation. Keeping this
+    // single path prevents a bootstrap assignment to the entry from briefly
+    // replacing a retained sibling destination (and avoids an intermediate
+    // blank/history entry before the fresh generation is ready).
     replaceArtifactFrame().catch(() => {});
   }
 }
@@ -3886,20 +4785,49 @@ async function reloadChromeForOutdatedBanner() {
   }
 }
 
-window.addEventListener("message", (event) => {
-  if (event.source !== frame.contentWindow) return;
+function handleArtifactMessage(event, binding = null) {
+  if (binding) {
+    if (currentArtifactBinding !== binding || (event.target !== binding.port && event.currentTarget !== binding.port))
+      return;
+  } else if (event.source !== frame.contentWindow) return;
 
   const msg = event.data || {};
-  const messageToken = String(msg.artifact_load_token || "");
-  if (messageToken !== artifactLoadToken) {
+  const messageToken = String(msg.artifact_load_token || (binding ? binding.token : ""));
+  if (
+    (binding &&
+      (msg.document_id !== binding.documentId ||
+        Number(msg.document_sequence) !== binding.documentSequence ||
+        msg.page !== binding.page ||
+        msg.page_proof !== binding.proof ||
+        messageToken !== binding.token ||
+        Number(msg.artifact_revision) !== binding.revision)) ||
+    (!binding && messageToken !== artifactLoadToken)
+  ) {
     // A pass can be stamped by the load that just lost a token race. Ask the current artifact
     // document to run the audit again instead of consuming the only pass for this cycle.
-    if (msg.type === "lavish:layoutDiagnostics") postToFrame({ type: "lavish:requestLayoutDiagnostics" });
+    if (!binding && msg.type === "lavish:layoutDiagnostics") postToFrame({ type: "lavish:requestLayoutDiagnostics" });
     return;
   }
   const messageSequence = ++artifactMessageSequence;
   artifactSpokeToken = messageToken;
   clearTimeout(artifactSilenceTimer);
+  if (binding && typeof msg.destination === "string") {
+    const destination = normalizeArtifactDestination(msg.destination, binding.route);
+    if (destination) {
+      binding.destination = destination;
+      artifactLoadDestination = destination;
+      persistDestinationRecord(destinationRecord(binding));
+    }
+  }
+  if (msg.type === "lavish:documentDeparting") {
+    // A child navigation may land on a non-reviewable page (or nowhere at all).
+    // Do not let the last accepted page masquerade as current on a later
+    // whole-chrome reload. `beforeunload` sets the teardown guard first when
+    // the top-level reviewer itself is being refreshed.
+    markDestinationUnavailable();
+    retireArtifactBinding();
+    return;
+  }
   if (msg.type === "lavish:layoutDiagnostics") {
     const diagnosticSequence = ++layoutDiagnosticSequence;
     const complete = msg.complete !== false;
@@ -3913,6 +4841,9 @@ window.addEventListener("message", (event) => {
       artifactRevision: msg.artifact_revision,
       artifactLoadToken: msg.artifact_load_token,
       artifactPassSequence: msg.artifact_pass_sequence,
+      documentSequence: binding?.documentSequence || 0,
+      page: binding?.page ?? null,
+      pageProof: binding?.proof || "",
       viewportWidth: msg.viewport_width,
       findings: msg.findings,
     })
@@ -3935,29 +4866,53 @@ window.addEventListener("message", (event) => {
   }
   // The artifact spoke, so it rendered and ran its SDK - there is nothing fatal to probe for.
   if (msg.type === "lavish:queuePrompt") {
-    enqueuePrompt(msg.prompt);
+    enqueuePrompt(msg.prompt, null, binding || currentArtifactBinding);
     // Queued from inside the artifact, where the closed dock is the only sign it landed.
     pulseSheetDock();
   }
   if (msg.type === "lavish:snapshot") {
-    completeSnapshotRequest(msg.snapshot_request_id, msg.snapshot || "");
+    completeSnapshotRequest(
+      msg.snapshot_request_id,
+      msg.snapshot || "",
+      binding
+        ? {
+            version: binding.version,
+            page: binding.page,
+            proof: binding.proof,
+            route: binding.route,
+            destination: binding.destination,
+            documentId: binding.documentId,
+            documentSequence: binding.documentSequence,
+            token: binding.token,
+            revision: binding.revision,
+          }
+        : null,
+    );
   }
   if (msg.type === "lavish:scroll") {
-    lastScroll = { x: Number(msg.x) || 0, y: Number(msg.y) || 0 };
+    setScrollPosition(Number(msg.x) || 0, Number(msg.y) || 0, binding ? binding.page : undefined);
   }
   if (msg.type === "lavish:reviewState") {
-    setReviewState(msg.state && typeof msg.state === "object" ? msg.state : null);
+    setReviewState(msg.state && typeof msg.state === "object" ? msg.state : null, binding ? binding.page : undefined);
   }
   if (msg.type === "lavish:reviewDraftUnrestorable") {
-    discardUnrestorableDraft(String(msg.selector || ""));
+    discardUnrestorableDraft(String(msg.selector || ""), binding ? binding.page : undefined);
   }
   if (msg.type === "lavish:artifactAssetFailure") {
     reportArtifactFailures(
       [{ kind: "artifact-asset-unavailable", detail: String(msg.detail || "a local artifact asset failed to load") }],
-      messageToken,
+      {
+        loadToken: messageToken,
+        revision: binding?.revision ?? artifactLoadRevision,
+        binding,
+      },
     ).catch(() => {});
   }
-  if (msg.type === "lavish:uploadAttachment") uploadAttachment(msg);
+  if (msg.type === "lavish:uploadAttachment") {
+    // Keep the result on the document that supplied the bytes.  The upload may
+    // outlive navigation, so the generic postToFrame path is unsafe here.
+    uploadAttachment(msg, binding ? (result) => postToBindingFrame(binding, result) : postToFrame);
+  }
   // There is deliberately no attachment-delete message. See removeAttachment's
   // removal note below: the iframe cannot be trusted to decide a delete, and the
   // chrome cannot see every live reference, so reclamation is the sweeper's job.
@@ -3965,7 +4920,103 @@ window.addEventListener("message", (event) => {
   if (msg.type === "lavish:endSession") endSession();
   if (msg.type === "lavish:revisions") applyRevisionMessage(msg);
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
-});
+}
+
+function challengeArtifactDocument(expectedDocumentId = "") {
+  if (!modernArtifactProtocol || !frame.contentWindow || artifactChallengeInFlight) return;
+  if (
+    currentArtifactBinding &&
+    (!expectedDocumentId || currentArtifactBinding.documentId === String(expectedDocumentId))
+  )
+    return;
+  const source = frame.contentWindow;
+  const channel = new MessageChannel();
+  const challenge = randomBindingChallenge();
+  let answered = false;
+  artifactChallengeInFlight = true;
+  const finishChallenge = () => {
+    artifactChallengeInFlight = false;
+  };
+  const timeout = setTimeout(() => {
+    if (!answered) {
+      finishChallenge();
+      channel.port1.close();
+    }
+  }, 5000);
+  channel.port1.addEventListener("message", (event) => {
+    if (answered || (event.target !== channel.port1 && event.currentTarget !== channel.port1)) return;
+    const message = event.data || {};
+    if (
+      message.type !== "lavish:challengeResponse" ||
+      message.challenge !== challenge ||
+      (expectedDocumentId && message.document_id !== String(expectedDocumentId)) ||
+      typeof message.document_id !== "string" ||
+      !message.document_id ||
+      Number(message.artifact_revision) !== Number(artifactLoadRevision) ||
+      String(message.artifact_load_token || "") !== String(artifactLoadToken || "") ||
+      message.page_protocol !== 1 ||
+      typeof message.page !== "string" ||
+      typeof message.page_proof !== "string"
+    )
+      return;
+    answered = true;
+    finishChallenge();
+    clearTimeout(timeout);
+    const binding = {
+      port: channel.port1,
+      page: message.page,
+      proof: message.page_proof,
+      route: String(message.served_route || ""),
+      // Newer SDKs may echo the authored URL they observed. Older protocol-1
+      // documents only expose the accepted served route; in that case the
+      // helper falls back to the route without inventing a query or fragment.
+      destination: String(message.destination || message.authored_destination || message.url || ""),
+      documentId: String(message.document_id),
+      documentSequence: ++nextDocumentSequence,
+      token: String(message.artifact_load_token || ""),
+      revision: Number(message.artifact_revision),
+      version: ++nextBindingVersion,
+      window: source,
+    };
+    retireArtifactBinding();
+    currentArtifactBinding = binding;
+    activatePageReviewState(binding.page);
+    const destination = bindingDestination(binding);
+    binding.destination = destination;
+    artifactLoadDestination = destination;
+    persistDestinationRecord(destinationRecord(binding));
+    channel.port1.addEventListener("message", (boundEvent) => handleArtifactMessage(boundEvent, binding));
+    channel.port1.start?.();
+    channel.port1.postMessage({ type: "lavish:activate", ...bindingTuple(binding) });
+    artifactSpokeToken = binding.token;
+    clearTimeout(artifactSilenceTimer);
+    // The initial load handler may have run before the SDK announced readiness.
+    // Release the retained chrome state only after the accepted binding exists.
+    postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
+    postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
+    if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
+  });
+  channel.port1.start?.();
+  // Node's MessageChannel (used by the deterministic client harness) keeps the
+  // process alive unless both endpoints are unreferenced. Browsers do not
+  // expose `unref`, so these calls are inert in production.
+  /** @type {any} */ (channel.port1).unref?.();
+  /** @type {any} */ (channel.port2).unref?.();
+  source.postMessage({ type: "lavish:challenge", challenge }, "*", [channel.port2]);
+}
+
+if (modernArtifactProtocol) {
+  // The global channel is readiness-only.  All review traffic is accepted on
+  // the transferred port after the challenge and tuple checks above.
+  window.addEventListener("message", (event) => {
+    if (event.source !== frame.contentWindow) return;
+    const message = event.data || {};
+    if (message.type !== "lavish:ready" || message.page_protocol !== 1) return;
+    challengeArtifactDocument(String(message.document_id || ""));
+  });
+} else {
+  window.addEventListener("message", (event) => handleArtifactMessage(event));
+}
 
 // The sandboxed artifact iframe can't reach the loopback server (opaque origin),
 // so it hands captured image bytes here and the chrome performs the same-origin
@@ -4288,16 +5339,31 @@ document.addEventListener(
   true,
 );
 frame.addEventListener("load", () => {
+  if (modernArtifactProtocol && !currentArtifactBinding) challengeArtifactDocument();
   if (artifactSpokeToken !== artifactLoadToken) armArtifactAvailabilityProbe(artifactLoadToken);
   postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
   // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.
   postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
   if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
-  if (overlayIndex !== null) {
-    inlineWhiteboardChannels.delete(overlayIndex);
-    postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: overlayIndex });
+  if (overlayContext && overlayIndex !== null && whiteboardContextIsLive(overlayContext)) {
+    inlineWhiteboardChannels.delete(overlayContext.key);
+    postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: overlayIndex, page: overlayContext.page });
   }
 });
+
+if (modernArtifactProtocol) {
+  // A top-level reload tears down the child iframe too. Snapshot the already
+  // validated destination first so the child's pagehide message cannot erase
+  // it before the next chrome bootstrap can restore it. This is deliberately
+  // not a beforeunload prompt: it only records state and never sets
+  // `returnValue` or calls preventDefault().
+  window.addEventListener("beforeunload", () => {
+    const record = destinationRecord(currentArtifactBinding);
+    if (!record) return;
+    topLevelTeardown = true;
+    persistDestinationRecord(record);
+  });
+}
 
 initializeLayoutGate();
 
@@ -4378,7 +5444,7 @@ setChromeOutdated(false);
 setWarningsDrawerOpen(false);
 renderWarnings();
 initialChat.forEach((item) => addChat(item));
-retiredDrafts.forEach((text) => renderRetiredDraft(text));
+retiredDrafts.forEach((entry) => renderRetiredDraft(entry));
 setAgentPresence("waiting");
 // The session already ended before this page (re)loaded, so there is no future live `ended` event
 // to wait for - start read-only instead of looking live until a Send gets silently refused.

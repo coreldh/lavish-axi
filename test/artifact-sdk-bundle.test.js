@@ -104,7 +104,12 @@ function cell(tag, text) {
   return element;
 }
 
-function bootSdk({ runAnimationFrames = false, revisionsScript = null, revisionMarkElements = [] } = {}) {
+function bootSdk({
+  runAnimationFrames = false,
+  revisionsScript = null,
+  revisionMarkElements = [],
+  sdkOptions = undefined,
+} = {}) {
   const posted = [];
   const documentListeners = [];
   // Deferred work the SDK schedules, run only when a test asks for it: the draft-anchor settle
@@ -174,12 +179,18 @@ function bootSdk({ runAnimationFrames = false, revisionsScript = null, revisionM
     innerHeight: 800,
     scrollX: 0,
     scrollY: 0,
-    location: { origin: "http://127.0.0.1" },
+    location: {
+      origin: "http://127.0.0.1",
+      pathname: "/artifact/abc/sub/page.html",
+      search: "?view=full",
+      hash: "#notes",
+    },
     URL: sandbox.URL,
   };
+  sandbox.top = sandbox.parent;
   sandbox.globalThis = sandbox;
 
-  vm.runInNewContext(createSdkJs("abc", 3, "load-token"), sandbox);
+  vm.runInNewContext(createSdkJs("abc", 3, "load-token", sdkOptions), sandbox);
 
   return {
     posted,
@@ -221,6 +232,14 @@ function bootSdk({ runAnimationFrames = false, revisionsScript = null, revisionM
       assert.ok(listeners.length > 0, "the SDK registers a window message listener");
       for (const listener of listeners) listener.handler({ source: sandbox.parent, data });
     },
+    dispatchWindowEvent(type, properties = {}) {
+      for (const listener of windowListeners.filter((entry) => entry.type === type)) {
+        listener.handler({ source: sandbox.parent, ...properties });
+      }
+    },
+    documentListenerCount(type) {
+      return documentListeners.filter((entry) => entry.type === type).length;
+    },
     cards() {
       return documentElement.children
         .flatMap((child) => child.shadowRoot?.children || [])
@@ -240,6 +259,17 @@ function bootSdk({ runAnimationFrames = false, revisionsScript = null, revisionM
   };
 }
 
+function nextPortMessage(port) {
+  return new Promise((resolve) => {
+    const handler = (event) => {
+      port.removeEventListener("message", handler);
+      resolve(event.data);
+    };
+    port.addEventListener("message", handler);
+    port.start?.();
+  });
+}
+
 function buildTable(sdk) {
   const table = appendTo(sdk.body, createElement("table"));
   const thead = appendTo(table, createElement("thead"));
@@ -255,6 +285,75 @@ function buildTable(sdk) {
   const badge = appendTo(evidence, cell("code", "Drive"));
   return { evidence, badge };
 }
+
+test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM listeners", async () => {
+  const sdk = bootSdk({
+    sdkOptions: {
+      pageProtocol: 1,
+      page: "sub/page.html",
+      pageProof: "proof-sub-page",
+      servedRoute: "sub/page.html",
+    },
+  });
+  const initialReady = sdk.posted.at(-1);
+  assert.equal(initialReady.type, "lavish:ready");
+
+  const first = new MessageChannel();
+  /** @type {any} */ (first.port1).unref?.();
+  /** @type {any} */ (first.port2).unref?.();
+  const firstResponsePromise = nextPortMessage(first.port1);
+  sdk.dispatchWindowEvent("message", {
+    data: { type: "lavish:challenge", challenge: "first-challenge" },
+    ports: [first.port2],
+  });
+  const firstResponse = await firstResponsePromise;
+  first.port1.postMessage({ ...firstResponse, type: "lavish:activate", document_sequence: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
+  const clickListeners = sdk.documentListenerCount("click");
+  assert.ok(clickListeners > 0, "the accepted document installs the full SDK once");
+
+  const departingPromise = nextPortMessage(first.port1);
+  sdk.dispatchWindowEvent("pagehide");
+  const departing = await departingPromise;
+  assert.equal(departing.type, "lavish:documentDeparting");
+  assert.equal(departing.document_sequence, 1);
+
+  sdk.dispatchWindowEvent("pageshow", { persisted: true });
+  const resumedReady = sdk.posted.at(-1);
+  assert.equal(resumedReady.type, "lavish:ready");
+  assert.equal(resumedReady.document_id, initialReady.document_id, "BFCache keeps the document identity");
+
+  const second = new MessageChannel();
+  /** @type {any} */ (second.port1).unref?.();
+  /** @type {any} */ (second.port2).unref?.();
+  const secondResponsePromise = nextPortMessage(second.port1);
+  sdk.dispatchWindowEvent("message", {
+    data: { type: "lavish:challenge", challenge: "second-challenge" },
+    ports: [second.port2],
+  });
+  const secondResponse = await secondResponsePromise;
+  second.port1.postMessage({ ...secondResponse, type: "lavish:activate", document_sequence: 2 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sdk.documentListenerCount("click"), clickListeners, "rebind does not duplicate the SDK");
+
+  const snapshotPromise = nextPortMessage(second.port1);
+  second.port1.postMessage({
+    type: "lavish:requestSnapshot",
+    snapshot_request_id: "after-bfcache",
+    page: secondResponse.page,
+    page_proof: secondResponse.page_proof,
+    document_id: secondResponse.document_id,
+    document_sequence: 2,
+    artifact_load_token: secondResponse.artifact_load_token,
+    artifact_revision: secondResponse.artifact_revision,
+  });
+  const snapshot = await snapshotPromise;
+  assert.equal(snapshot.type, "lavish:snapshot");
+  assert.equal(snapshot.document_sequence, 2);
+  assert.equal(snapshot.snapshot_request_id, "after-bfcache");
+  first.port1.close();
+  second.port1.close();
+});
 
 test("a requested layout diagnostic publishes even when the result is unchanged", async () => {
   const sdk = bootSdk({ runAnimationFrames: true });

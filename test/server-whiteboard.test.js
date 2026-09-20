@@ -61,9 +61,19 @@ async function startWhiteboardServer() {
   };
 }
 
+async function pageContext(ctx, page) {
+  const document = await fetch(`${ctx.base}/artifact/${ctx.key}/${page}`).then((res) => res.text());
+  const script = document.match(/<script src="([^"]*\/sdk\.js\?[^"]+)"><\/script>/)?.[1];
+  assert.ok(script, `expected injected SDK for ${page}`);
+  const params = new URL(script, ctx.base).searchParams;
+  return { page: params.get("page"), page_proof: params.get("page_proof") };
+}
+
 test("isWhiteboardWriteApiPath matches only whiteboard write routes", () => {
   assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/0"), true);
   assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/12/feedback-files"), true);
+  assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/12?page=page.html"), true);
+  assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/12/feedback-files?page=page.html"), true);
   assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/prompts"), false);
   assert.equal(isWhiteboardWriteApiPath("/api/0123456789abcdef/whiteboard/9999"), false);
   assert.equal(isWhiteboardWriteApiPath("/api/BAD/whiteboard/0"), false);
@@ -119,6 +129,151 @@ test("GET /api/:key/mermaid-sources preserves label breaks and returns ordered s
     assert.equal(data.sources[1].source, "sequenceDiagram\n  CLI->>Server: poll");
   } finally {
     await ctx.close();
+  }
+});
+
+test("modern whiteboard content is page-scoped and reads each page fresh", async () => {
+  const ctx = await startWhiteboardServer();
+  try {
+    await mkdir(path.join(ctx.dir, "sub"));
+    await writeFile(
+      path.join(ctx.dir, "sub", "page.html"),
+      "<!doctype html><html><body><pre class=mermaid>flowchart LR\n  S-->T</pre></body></html>",
+    );
+    const entry = await pageContext(ctx, "artifact.html");
+    const sibling = await pageContext(ctx, "sub/page.html");
+    const sameOrigin = { ...ctx.sameOrigin };
+
+    const entrySources = await fetch(
+      `${ctx.base}/api/${ctx.key}/mermaid-sources?page=${encodeURIComponent(entry.page)}&page_proof=${encodeURIComponent(entry.page_proof)}`,
+      { headers: { origin: ctx.base } },
+    );
+    assert.equal(entrySources.status, 200);
+    assert.equal((await entrySources.json()).sources.length, 2);
+
+    const siblingSources = await fetch(
+      `${ctx.base}/api/${ctx.key}/mermaid-sources?page=${encodeURIComponent(sibling.page)}&page_proof=${encodeURIComponent(sibling.page_proof)}`,
+      { headers: { referer: `${ctx.base}/session/${ctx.key}` } },
+    );
+    assert.equal(siblingSources.status, 200);
+    const siblingData = await siblingSources.json();
+    assert.equal(siblingData.sources.length, 1);
+    assert.equal(siblingData.sources[0].source, "flowchart LR\n  S-->T");
+
+    const scene = { elements: [{ id: "sibling", type: "rectangle" }], appState: {}, files: {} };
+    const put = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0`, {
+      method: "PUT",
+      headers: sameOrigin,
+      body: JSON.stringify({
+        page: sibling.page,
+        page_proof: sibling.page_proof,
+        artifact_revision: 999,
+        artifact_load_token: "expired-live-token",
+        document_sequence: 999,
+        source_hash: "sibling-source",
+        scene,
+      }),
+    });
+    assert.equal(put.status, 200);
+
+    const siblingRead = await fetch(
+      `${ctx.base}/api/${ctx.key}/whiteboard/0?page=${encodeURIComponent(sibling.page)}&page_proof=${encodeURIComponent(sibling.page_proof)}`,
+      { headers: { origin: ctx.base } },
+    );
+    assert.equal(siblingRead.status, 200);
+    assert.equal((await siblingRead.json()).whiteboard.source_hash, "sibling-source");
+
+    // A page-aware read never falls back to the legacy entry sidecar, even when the sibling has
+    // no saved scene yet.
+    const entryPut = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/1`, {
+      method: "PUT",
+      headers: sameOrigin,
+      body: JSON.stringify({ source_hash: "entry-only", scene: { elements: [] } }),
+    });
+    assert.equal(entryPut.status, 200);
+    const siblingIndexOne = await fetch(
+      `${ctx.base}/api/${ctx.key}/whiteboard/1?page=${encodeURIComponent(sibling.page)}&page_proof=${encodeURIComponent(sibling.page_proof)}`,
+      { headers: { origin: ctx.base } },
+    );
+    assert.equal(siblingIndexOne.status, 200);
+    assert.equal((await siblingIndexOne.json()).whiteboard, null);
+
+    const feedback = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard/0/feedback-files`, {
+      method: "POST",
+      headers: sameOrigin,
+      body: JSON.stringify({
+        page: sibling.page,
+        page_proof: sibling.page_proof,
+        scene,
+        pngDataUrl: PNG_DATA_URL,
+      }),
+    });
+    assert.equal(feedback.status, 200);
+    const feedbackPaths = await feedback.json();
+    assert.match(feedbackPaths.scene_path, /whiteboards[\\/]\w+[\\/]\w{64}[\\/]0\.excalidraw$/);
+    assert.match(feedbackPaths.preview_path, /whiteboards[\\/]\w+[\\/]\w{64}[\\/]0\.png$/);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("modern whiteboard routes fail closed for proof, page, origin and source races", async () => {
+  const first = await startWhiteboardServer();
+  const second = await startWhiteboardServer();
+  try {
+    await mkdir(path.join(first.dir, "sub"));
+    await writeFile(path.join(first.dir, "sub", "page.html"), ARTIFACT_HTML);
+    const firstPage = await pageContext(first, "sub/page.html");
+    const secondPage = await pageContext(second, "artifact.html");
+
+    const missingProof = await fetch(`${first.base}/api/${first.key}/mermaid-sources?page=sub%2Fpage.html`, {
+      headers: { origin: first.base },
+    });
+    assert.equal(missingProof.status, 400);
+
+    const hostile = await fetch(
+      `${first.base}/api/${first.key}/mermaid-sources?page=${encodeURIComponent(firstPage.page)}&page_proof=${encodeURIComponent(firstPage.page_proof)}`,
+      { headers: { origin: "https://evil.example" } },
+    );
+    assert.equal(hostile.status, 403);
+
+    const opaque = await fetch(
+      `${first.base}/api/${first.key}/whiteboard/0?page=${encodeURIComponent(firstPage.page)}&page_proof=${encodeURIComponent(firstPage.page_proof)}`,
+      { headers: { origin: "null" } },
+    );
+    assert.equal(opaque.status, 403);
+
+    const absent = await fetch(
+      `${first.base}/api/${first.key}/whiteboard/0?page=${encodeURIComponent(firstPage.page)}&page_proof=${encodeURIComponent(firstPage.page_proof)}`,
+    );
+    assert.equal(absent.status, 403);
+
+    const otherSessionProof = await fetch(
+      `${first.base}/api/${first.key}/mermaid-sources?page=${encodeURIComponent(secondPage.page)}&page_proof=${encodeURIComponent(secondPage.page_proof)}`,
+      { headers: { origin: first.base } },
+    );
+    assert.equal(otherSessionProof.status, 403);
+
+    const mismatch = await fetch(
+      `${first.base}/api/${first.key}/mermaid-sources?page=${encodeURIComponent(firstPage.page)}&page_proof=${encodeURIComponent(secondPage.page_proof)}`,
+      { headers: { origin: first.base } },
+    );
+    assert.equal(mismatch.status, 403);
+
+    await rm(path.join(first.dir, "sub", "page.html"));
+    const missingPage = await fetch(
+      `${first.base}/api/${first.key}/mermaid-sources?page=${encodeURIComponent(firstPage.page)}&page_proof=${encodeURIComponent(firstPage.page_proof)}`,
+      { headers: { origin: first.base } },
+    );
+    assert.equal(missingPage.status, 404);
+
+    const malformedIndex = await fetch(`${first.base}/api/${first.key}/whiteboard/not-an-index`, {
+      headers: { origin: first.base },
+    });
+    assert.equal(malformedIndex.status, 400);
+  } finally {
+    await first.close();
+    await second.close();
   }
 });
 
@@ -184,6 +339,26 @@ async function frameChannelToken(base, query = "") {
   return /__lavishWhiteboardChannelToken="([^"]+)"/.exec(frame)?.[1] || "";
 }
 
+async function beginArtifactLoad(ctx) {
+  const handoff = await fetch(`${ctx.base}/api/${ctx.key}/chrome-loads/begin`, {
+    method: "POST",
+    headers: { origin: ctx.base },
+  });
+  assert.equal(handoff.status, 200);
+  const handoffBody = await handoff.json();
+  const load = await fetch(`${ctx.base}/api/${ctx.key}/artifact-loads/begin`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      request_id: "whiteboard-channel-test",
+      request_sequence: 1,
+      chrome_load_token: handoffBody.chrome_load_token,
+    }),
+  });
+  assert.equal(load.status, 200);
+  return load.json();
+}
+
 test("whiteboard channel authentication accepts only the frame-issued token", async () => {
   const ctx = await startWhiteboardServer();
   try {
@@ -234,6 +409,73 @@ test("a whiteboard channel token minted for another session never authenticates 
       body: JSON.stringify({ token: own }),
     });
     assert.equal(accepted.status, 200);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("modern whiteboard channels require the durable page and current live load", async () => {
+  const ctx = await startWhiteboardServer();
+  try {
+    await mkdir(path.join(ctx.dir, "sub"));
+    await writeFile(path.join(ctx.dir, "sub", "page.html"), ARTIFACT_HTML);
+    await beginArtifactLoad(ctx);
+    const page = await pageContext(ctx, "sub/page.html");
+    const token = await frameChannelToken(ctx.base, `?key=${ctx.key}`);
+    const current = {
+      token,
+      page_protocol: 1,
+      page: page.page,
+      page_proof: page.page_proof,
+      artifact_load_token: "",
+      artifact_revision: 0,
+      document_sequence: 1,
+    };
+
+    // The active load values are deliberately read from the injected SDK URL: a valid durable
+    // proof alone cannot establish a new live channel.
+    const document = await fetch(`${ctx.base}/artifact/${ctx.key}/sub/page.html`).then((res) => res.text());
+    const sdkUrl = document.match(/<script src="([^"]*\/sdk\.js\?[^"\s]+)"><\/script>/)?.[1];
+    assert.ok(sdkUrl);
+    const sdkParams = new URL(sdkUrl, ctx.base).searchParams;
+    current.artifact_load_token = sdkParams.get("artifact_load_token");
+    current.artifact_revision = Number(sdkParams.get("artifact_revision"));
+
+    const establish = () =>
+      fetch(`${ctx.base}/api/${ctx.key}/whiteboard-channel`, {
+        method: "POST",
+        headers: ctx.sameOrigin,
+        body: JSON.stringify(current),
+      });
+    assert.equal((await establish()).status, 200);
+
+    const staleRevision = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard-channel`, {
+      method: "POST",
+      headers: ctx.sameOrigin,
+      body: JSON.stringify({ ...current, artifact_revision: current.artifact_revision - 1 }),
+    });
+    assert.equal(staleRevision.status, 409);
+
+    const advanced = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard-channel`, {
+      method: "POST",
+      headers: ctx.sameOrigin,
+      body: JSON.stringify({ ...current, document_sequence: 2 }),
+    });
+    assert.equal(advanced.status, 200);
+
+    const staleSequence = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard-channel`, {
+      method: "POST",
+      headers: ctx.sameOrigin,
+      body: JSON.stringify({ ...current, document_sequence: 1 }),
+    });
+    assert.equal(staleSequence.status, 409);
+
+    const missingContext = await fetch(`${ctx.base}/api/${ctx.key}/whiteboard-channel`, {
+      method: "POST",
+      headers: ctx.sameOrigin,
+      body: JSON.stringify({ token, page_protocol: 1 }),
+    });
+    assert.equal(missingContext.status, 400);
   } finally {
     await ctx.close();
   }
