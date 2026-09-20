@@ -3813,6 +3813,7 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
             : {}),
         }),
       });
+      if (response.ok) retireArtifactBinding();
       const candidate = await response.json().catch(() => ({}));
       if (!response.ok) {
         const status = String(candidate?.status || "");

@@ -6569,6 +6569,73 @@ test("protocol 1 reloads the accepted authored destination for manual and live r
   assert.notEqual(live, manual, "manual and live reloads each get a fresh discriminator");
 });
 
+test("protocol 1 rejects queued prior-generation feedback when the next load begins", async () => {
+  const beginLoadResponses = [];
+  const binding = {
+    page: "page-a.html",
+    proof: "proof-page-a",
+    route: "page-a.html",
+    destination: "/artifact/abc/page-a.html",
+    documentId: "document-a",
+    token: "harness-load-1",
+    revision: 1,
+  };
+  const chrome = await createChromeHarness({
+    artifactSrc: binding.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: binding,
+    beginLoadResponses,
+  });
+  await flushPromises();
+  await flushPromises();
+  const navigationCountBeforeReload = chrome.replacedDestinations.length;
+
+  /** @type {((value: any) => void) | undefined} */
+  let resolveNextLoad;
+  /** @type {((value: any) => void) | undefined} */
+  let resolveNextLoadBody;
+  const nextLoadBody = new Promise((resolve) => {
+    resolveNextLoadBody = resolve;
+  });
+  beginLoadResponses.push(
+    new Promise((resolve) => {
+      resolveNextLoad = resolve;
+    }),
+  );
+  chrome.element("reloadArtifact").click();
+  await flushPromises();
+  resolveNextLoad?.({
+    ok: true,
+    json: async () => nextLoadBody,
+  });
+  await flushPromises();
+  await flushPromises();
+
+  chrome.sendModernMessage(
+    {
+      type: "lavish:queuePrompt",
+      page_protocol: 1,
+      page: binding.page,
+      page_proof: binding.proof,
+      served_route: binding.route,
+      document_id: binding.documentId,
+      document_sequence: 1,
+      artifact_load_token: binding.token,
+      artifact_revision: binding.revision,
+      prompt: { prompt: "stale feedback", selector: "#stale", tag: "comment", text: "stale" },
+    },
+    0,
+  );
+  await flushPromises();
+  await flushPromises();
+  resolveNextLoadBody?.({ artifact_revision: 2, artifact_load_token: "harness-load-2" });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(chrome.replacedDestinations.length, navigationCountBeforeReload + 1);
+  assert.deepEqual(chrome.queued(), []);
+});
+
 test("protocol 1 encodes reserved characters in a served-route fallback", async () => {
   const route = "sub folder/report#draft%.html";
   const expectedPath = "/artifact/abc/sub%20folder/report%23draft%25.html";
