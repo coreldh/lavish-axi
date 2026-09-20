@@ -2756,9 +2756,13 @@ async function submitLayoutDiagnostics(pass) {
       artifact_revision: Number(pass?.artifactRevision) || 0,
       artifact_load_token: String(pass?.artifactLoadToken || artifactLoadToken),
       artifact_pass_sequence: Number(pass?.artifactPassSequence) || 0,
-      document_sequence: Number(pass?.documentSequence) || 0,
-      page: typeof pass?.page === "string" ? pass.page : null,
-      page_proof: String(pass?.pageProof || ""),
+      ...(modernArtifactProtocol
+        ? {
+            document_sequence: Number(pass?.documentSequence) || 0,
+            page: typeof pass?.page === "string" ? pass.page : null,
+            page_proof: String(pass?.pageProof || ""),
+          }
+        : {}),
       viewport_width: Number(pass?.viewportWidth) || 0,
       findings: normalizeLayoutFindings(pass?.findings),
     }),
@@ -2779,9 +2783,13 @@ async function reportArtifactFailures(failures, context = {}) {
       failures,
       artifact_load_token: loadToken,
       artifact_revision: revision,
-      page: binding?.page ?? null,
-      page_proof: binding?.proof || "",
-      document_sequence: Number(binding?.documentSequence) || 0,
+      ...(modernArtifactProtocol
+        ? {
+            page: binding?.page ?? null,
+            page_proof: binding?.proof || "",
+            document_sequence: Number(binding?.documentSequence) || 0,
+          }
+        : {}),
     }),
   });
 }

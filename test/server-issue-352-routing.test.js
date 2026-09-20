@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -103,6 +103,51 @@ test("issue 352 routes the actual entry basename and keeps legacy virtual index 
     }
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 352 artifact reads reject a validated path swapped to an outside symlink", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-artifact-swap-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "lavish-352-artifact-outside-"));
+  const artifact = path.join(root, "entry.html");
+  const secret = "OUTSIDE_ARTIFACT_SENTINEL";
+  let swapped = false;
+  try {
+    await writeFile(artifact, "<!doctype html><body>INSIDE</body>");
+    const canonicalArtifact = await realpath(artifact);
+    const outsideFile = path.join(outside, "secret.html");
+    await writeFile(outsideFile, secret);
+    const server = await serve({
+      port: 0,
+      stateFile: path.join(root, "state.json"),
+      version: "artifact-swap-test",
+      artifactPageStat: async (file, options) => {
+        if (!swapped && file === canonicalArtifact) {
+          swapped = true;
+          await rm(canonicalArtifact);
+          await symlink(outsideFile, canonicalArtifact);
+        }
+        return stat(file, options);
+      },
+    });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const opened = await fetch(`${base}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file: artifact }),
+      }).then((response) => response.json());
+      const response = await fetch(`${base}/artifact/${opened.key}/entry.html`);
+      const body = await response.text();
+      assert.equal(response.status, 403);
+      assert.equal(swapped, true);
+      assert.doesNotMatch(body, new RegExp(secret));
+    } finally {
+      await server.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 

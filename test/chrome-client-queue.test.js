@@ -2866,6 +2866,7 @@ test("chrome client posts a completed diagnostic pass and never queues feedback 
     viewport_width: 720,
     findings: [{ selector: "html", kind: "page-horizontal-overflow", overflowPx: 18, severity: "error" }],
   });
+  chrome.sendFrameMessage({ type: "lavish:artifactAssetFailure", detail: "legacy asset failed" });
   await flushPromises();
 
   const diagnostics = posts.filter((post) => post.url === "/api/abc/layout-diagnostics");
@@ -2875,6 +2876,13 @@ test("chrome client posts a completed diagnostic pass and never queues feedback 
   assert.equal(diagnostics[0].body.target_presence_complete, true);
   assert.equal(diagnostics[0].body.viewport_width, 720);
   assert.equal(diagnostics[0].body.findings.length, 1);
+  assert.equal(Object.hasOwn(diagnostics[0].body, "page"), false);
+  assert.equal(Object.hasOwn(diagnostics[0].body, "page_proof"), false);
+  assert.equal(Object.hasOwn(diagnostics[0].body, "document_sequence"), false);
+  const failure = posts.find((post) => post.url === "/api/abc/artifact-failures");
+  assert.equal(Object.hasOwn(failure.body, "page"), false);
+  assert.equal(Object.hasOwn(failure.body, "page_proof"), false);
+  assert.equal(Object.hasOwn(failure.body, "document_sequence"), false);
   // Detection must never touch the prompt queue.
   assert.equal(
     posts.some((post) => post.url === "/api/abc/prompts"),

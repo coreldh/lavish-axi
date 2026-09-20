@@ -65,6 +65,7 @@ import {
   isArtifactHtmlPage,
   loadPageProofKey,
   normalizePageIdentity,
+  readResolvedArtifactPage,
   resolveArtifactPage,
   signPageProof,
   verifyPageProof,
@@ -322,6 +323,8 @@ export async function serve({
   extraListenHosts = [],
   bindRecoveryDelaysMs = BIND_RECOVERY_DELAYS_MS,
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
+  artifactPageOpen,
+  artifactPageStat,
 } = {}) {
   // Keep the transport dependency off fast metadata paths such as `--version`.
   const { WebSocket, WebSocketServer } = await import("ws");
@@ -879,7 +882,26 @@ export async function serve({
     if (!context.modern) {
       // Legacy callers intentionally remain entry-only. They must never select a sibling by
       // omission, and the old direct sidecar paths stay readable for already queued prompts.
-      return { session, context, file: session.file, page: undefined };
+      if (!source) return { session, context, file: session.file, page: undefined };
+      const entryFile = path.basename(session.file);
+      const resolution = await resolveArtifactPage(path.dirname(session.file), entryFile, {
+        entryFile,
+        ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
+      });
+      if (resolution.reason !== "ok") {
+        rejectWhiteboardRoute(
+          res,
+          new WhiteboardRouteError(
+            resolution.reason === "missing" ? 404 : 403,
+            resolution.reason === "missing" ? "WHITEBOARD_PAGE_NOT_FOUND" : "WHITEBOARD_PAGE_FORBIDDEN",
+            resolution.reason === "missing" ? "whiteboard page not found" : "whiteboard page is not eligible",
+          ),
+        );
+        return null;
+      }
+      const html = await freshWhiteboardSource(resolution, res);
+      if (html === null) return null;
+      return { session, context, file: resolution.file, page: undefined, source: html };
     }
 
     const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
@@ -897,7 +919,10 @@ export async function serve({
     }
     if (source) {
       const entryFile = path.basename(session.file);
-      const resolution = await resolveArtifactPage(path.dirname(session.file), normalized, { entryFile });
+      const resolution = await resolveArtifactPage(path.dirname(session.file), normalized, {
+        entryFile,
+        ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
+      });
       if (resolution.reason === "missing") {
         rejectWhiteboardRoute(
           res,
@@ -912,7 +937,9 @@ export async function serve({
         );
         return null;
       }
-      return { session, context, file: resolution.file, page: normalized };
+      const html = await freshWhiteboardSource(resolution, res);
+      if (html === null) return null;
+      return { session, context, file: resolution.file, page: normalized, source: html };
     }
     // Durable sidecars remain addressable after the source page is deleted. The proof is still
     // session/root/page-bound, but this operation deliberately does not re-read the page.
@@ -931,9 +958,13 @@ export async function serve({
     return Number(raw);
   }
 
-  async function freshWhiteboardSource(file, res) {
+  async function readArtifactPageContent(resolution) {
+    return readResolvedArtifactPage(resolution, artifactPageOpen ? { openFile: artifactPageOpen } : {});
+  }
+
+  async function freshWhiteboardSource(resolution, res) {
     try {
-      return await readFile(file, "utf8");
+      return await readArtifactPageContent(resolution);
     } catch (error) {
       if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
         rejectWhiteboardRoute(
@@ -942,7 +973,12 @@ export async function serve({
         );
         return null;
       }
-      if (error?.code === "EACCES" || error?.code === "EPERM") {
+      if (
+        error?.code === "EACCES" ||
+        error?.code === "EPERM" ||
+        error?.code === "ELOOP" ||
+        error?.code === "ARTIFACT_PAGE_CHANGED"
+      ) {
         rejectWhiteboardRoute(
           res,
           new WhiteboardRouteError(403, "WHITEBOARD_PAGE_FORBIDDEN", "whiteboard page is not readable"),
@@ -1973,7 +2009,37 @@ export async function serve({
       expiredArtifactLoad(res);
       return;
     }
-    const html = await readFile(beforeRead.session.file, "utf8");
+    const root = path.dirname(beforeRead.session.file);
+    const entryFile = path.basename(beforeRead.session.file);
+    const resolution = await resolveArtifactPage(root, entryFile, {
+      entryFile,
+      ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
+    });
+    if (resolution.reason !== "ok") {
+      res
+        .status(resolution.reason === "missing" ? 404 : 403)
+        .send(resolution.reason === "missing" ? "Not found" : "Forbidden");
+      return;
+    }
+    let html;
+    try {
+      html = await readArtifactPageContent(resolution);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        res.status(404).send("Not found");
+        return;
+      }
+      if (
+        error?.code === "EACCES" ||
+        error?.code === "EPERM" ||
+        error?.code === "ELOOP" ||
+        error?.code === "ARTIFACT_PAGE_CHANGED"
+      ) {
+        res.status(403).send("Forbidden");
+        return;
+      }
+      throw error;
+    }
     const verified = await store.verifyArtifactLoad(key, token, revision);
     if (!verified?.valid) {
       expiredArtifactLoad(res);
@@ -1995,7 +2061,10 @@ export async function serve({
     const entryName = path.basename(session.file);
     const documentEligible = isArtifactHtmlPage(assetPath) || assetPath === entryName;
     const pageResolution = documentEligible
-      ? await resolveArtifactPage(root, assetPath, { entryFile: entryName })
+      ? await resolveArtifactPage(root, assetPath, {
+          entryFile: entryName,
+          ...(artifactPageStat ? { statFile: artifactPageStat } : {}),
+        })
       : null;
     if (documentEligible) {
       if (pageResolution.reason !== "ok") {
@@ -2004,12 +2073,29 @@ export async function serve({
           .send(pageResolution.reason === "missing" ? "Not found" : "Forbidden");
         return;
       }
-      const file = pageResolution.file;
       const canonicalRoot = await canonicalArtifactRoot(root);
       const pageProof = signPageProof(pageProofKey, key, canonicalRoot, pageResolution.page);
       const beforeRead = await store.currentArtifactLoad(key);
       const hadActiveGeneration = Boolean(beforeRead?.valid);
-      const html = await readFile(file, "utf8");
+      let html;
+      try {
+        html = await readArtifactPageContent(pageResolution);
+      } catch (error) {
+        if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+          res.status(404).send("Not found");
+          return;
+        }
+        if (
+          error?.code === "EACCES" ||
+          error?.code === "EPERM" ||
+          error?.code === "ELOOP" ||
+          error?.code === "ARTIFACT_PAGE_CHANGED"
+        ) {
+          res.status(403).send("Forbidden");
+          return;
+        }
+        throw error;
+      }
       const afterRead = await store.currentArtifactLoad(key);
       if (
         hadActiveGeneration &&
@@ -2228,9 +2314,7 @@ export async function serve({
     try {
       const authorized = await authorizeWhiteboardRequest(req, res, { source: true });
       if (!authorized) return;
-      const html = await freshWhiteboardSource(authorized.file, res);
-      if (html === null) return;
-      const sources = extractMermaidSources(html).map(({ index, source }) => ({
+      const sources = extractMermaidSources(authorized.source).map(({ index, source }) => ({
         index,
         source,
         hash: mermaidSourceHash(source),

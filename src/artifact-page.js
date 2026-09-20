@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, readFile, unlink, writeFile, link, realpath, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, unlink, writeFile, link, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -9,6 +9,7 @@ const PAGE_PROOF_KEY_BYTES = 32;
 const PAGE_PROOF_MAC_BYTES = 32;
 const PAGE_PROOF_MAX_PAGE_BYTES = 16 * 1024;
 const execFileAsync = promisify(execFile);
+const artifactPageIdentities = new WeakMap();
 const WINDOWS_PAGE_PROOF_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $operation = $args[0]
@@ -258,10 +259,10 @@ export async function loadPageProofKey(
  *
  * @param {string} root
  * @param {string} assetPath URL-decoded, root-relative route path
- * @param {{ entryFile?: string }} [options]
+ * @param {{ entryFile?: string, statFile?: typeof stat }} [options]
  * @returns {Promise<{file: string | null, reason: "ok" | "missing" | "forbidden", page: string | null, servedRoute: string | null}>}
  */
-export async function resolveArtifactPage(root, assetPath, { entryFile = "" } = {}) {
+export async function resolveArtifactPage(root, assetPath, { entryFile = "", statFile = stat } = {}) {
   const result = (file, reason, page = null, servedRoute = null) => ({ file, reason, page, servedRoute });
   const isEntry = typeof entryFile === "string" && entryFile !== "" && assetPath === entryFile;
   if ((!isArtifactHtmlPage(assetPath) && !isEntry) || assetPath.includes("\0") || assetPath.includes("\\")) {
@@ -295,7 +296,7 @@ export async function resolveArtifactPage(root, assetPath, { entryFile = "" } = 
   if (!isEntry && !isArtifactHtmlPage(page)) return result(null, "forbidden");
   let details;
   try {
-    details = await stat(realFile);
+    details = await statFile(realFile, { bigint: true });
   } catch (error) {
     if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
       return result(null, "missing");
@@ -303,7 +304,42 @@ export async function resolveArtifactPage(root, assetPath, { entryFile = "" } = 
     throw error;
   }
   if (!details.isFile()) return result(null, "forbidden");
-  return result(realFile, "ok", page, assetPath.split(path.sep).join("/"));
+  let verifiedRealFile;
+  try {
+    verifiedRealFile = await realpath(realFile);
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      return result(null, "missing");
+    }
+    throw error;
+  }
+  if (verifiedRealFile !== realFile || !asRootRelative(realRoot, verifiedRealFile)) {
+    return result(null, "forbidden");
+  }
+  const resolved = result(realFile, "ok", page, assetPath.split(path.sep).join("/"));
+  artifactPageIdentities.set(resolved, { dev: details.dev, ino: details.ino });
+  return resolved;
+}
+
+/**
+ * @param {{ file: string | null, reason: string }} resolution
+ * @param {{ openFile?: typeof open }} [options]
+ */
+export async function readResolvedArtifactPage(resolution, { openFile = open } = {}) {
+  const expected = artifactPageIdentities.get(resolution);
+  if (!expected || resolution?.reason !== "ok" || !resolution.file) {
+    throw Object.assign(new Error("artifact page resolution is not readable"), { code: "ARTIFACT_PAGE_CHANGED" });
+  }
+  const handle = await openFile(resolution.file, "r");
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.dev !== expected.dev || opened.ino !== expected.ino) {
+      throw Object.assign(new Error("artifact page changed after resolution"), { code: "ARTIFACT_PAGE_CHANGED" });
+    }
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function canonicalArtifactRoot(root) {

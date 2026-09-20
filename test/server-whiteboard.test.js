@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -27,7 +27,7 @@ const ARTIFACT_HTML = `<!doctype html><html><body>
 const PNG_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
-async function startWhiteboardServer() {
+async function startWhiteboardServer({ artifactPageOpen } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-wb-server-"));
   const assetsDir = path.join(dir, "whiteboard-assets");
   await mkdir(path.join(assetsDir, "fonts", "Excalifont"), { recursive: true });
@@ -41,6 +41,7 @@ async function startWhiteboardServer() {
     stateFile: path.join(dir, "state.json"),
     version: "9.9.9-test",
     whiteboardAssetsDir: assetsDir,
+    artifactPageOpen,
   });
   const base = `http://127.0.0.1:${server.port}`;
   const opened = await fetch(`${base}/api/sessions`, {
@@ -129,6 +130,43 @@ test("GET /api/:key/mermaid-sources preserves label breaks and returns ordered s
     assert.equal(data.sources[1].source, "sequenceDiagram\n  CLI->>Server: poll");
   } finally {
     await ctx.close();
+  }
+});
+
+test("mermaid source reads reject a validated path swapped to an outside symlink", async () => {
+  let armed = false;
+  let swapped = false;
+  let artifactFile = "";
+  let outsideFile = "";
+  const ctx = await startWhiteboardServer({
+    artifactPageOpen: async (file, flags) => {
+      if (armed && !swapped && file === artifactFile) {
+        swapped = true;
+        await rm(artifactFile);
+        await symlink(outsideFile, artifactFile);
+      }
+      return open(file, flags);
+    },
+  });
+  const outside = await mkdtemp(path.join(tmpdir(), "lavish-wb-outside-"));
+  const secret = "OUTSIDE_MERMAID_SENTINEL";
+  try {
+    artifactFile = await realpath(path.join(ctx.dir, "artifact.html"));
+    outsideFile = path.join(outside, "secret.html");
+    await writeFile(outsideFile, `<pre class=mermaid>${secret}</pre>`);
+    const page = await pageContext(ctx, "artifact.html");
+    armed = true;
+    const response = await fetch(
+      `${ctx.base}/api/${ctx.key}/mermaid-sources?page=${encodeURIComponent(page.page)}&page_proof=${encodeURIComponent(page.page_proof)}`,
+      { headers: { origin: ctx.base } },
+    );
+    const body = await response.text();
+    assert.equal(response.status, 403);
+    assert.equal(swapped, true);
+    assert.doesNotMatch(body, new RegExp(secret));
+  } finally {
+    await ctx.close();
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
