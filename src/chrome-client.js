@@ -340,7 +340,7 @@ artifactLoadToken = String(sessionData.initialArtifactLoadToken || "");
 let artifactSpokeToken = "";
 let artifactMessageSequence = 0;
 let layoutDiagnosticSequence = 0;
-/** @type {{ port: MessagePort, page: string|null, proof: string, route: string, destination: string, documentId: string, documentSequence: number, token: string, revision: number, version: number, window: WindowProxy } | null} */
+/** @type {{ port: MessagePort, page: string|null, proof: string, route: string, destination: string, historicalDestinationReceipt: string, destinationReceiptSequence: number, documentId: string, documentSequence: number, token: string, revision: number, version: number, window: WindowProxy } | null} */
 let currentArtifactBinding = null;
 /** @type {{ documentId: string, port: MessagePort, timeout: ReturnType<typeof setTimeout> } | null} */
 let artifactChallengeAttempt = null;
@@ -1921,6 +1921,7 @@ function bindingTuple(binding = currentArtifactBinding) {
     page: binding.page,
     page_proof: binding.proof,
     served_route: binding.route,
+    historical_destination_receipt: binding.historicalDestinationReceipt,
     document_id: binding.documentId,
     document_sequence: binding.documentSequence,
     artifact_load_token: binding.token,
@@ -3757,7 +3758,7 @@ function cancelArtifactLoadRecovery() {
 // backoff is exhausted so the caller can surface the terminal failure. A `superseded` or
 // `out-of-order` outcome never lands here: another reviewer or a newer request in this same
 // chrome owns the artifact, and retrying would fight it.
-function scheduleArtifactLoadRecovery(historicalPage = null) {
+function scheduleArtifactLoadRecovery(historicalDestination = null) {
   if (ended) return false;
   const delay = ARTIFACT_LOAD_RECOVERY_DELAYS_MS[artifactLoadRecoveryAttempt];
   if (delay === undefined) return false;
@@ -3767,7 +3768,7 @@ function scheduleArtifactLoadRecovery(historicalPage = null) {
   artifactLoadRecoveryTimer = setTimeout(() => {
     artifactLoadRecoveryTimer = undefined;
     if (ended || sequence !== artifactLoadRequestSequence) return;
-    replaceArtifactFrame({ recoveryRetry: true, historicalPage }).catch(() => {});
+    replaceArtifactFrame({ recoveryRetry: true, historicalDestination }).catch(() => {});
   }, delay);
   artifactLoadRecoveryTimer?.unref?.();
   return true;
@@ -3777,12 +3778,12 @@ function scheduleArtifactLoadRecovery(historicalPage = null) {
 // asking for a fresh load - a live reload, Reload artifact, a takeover - gets the whole budget
 // again, and only the recovery timer's own retries spend it down. A page that carried an
 // exhausted counter forward would have no retries left at all for the next outage.
-async function replaceArtifactFrame({ recoveryRetry = false, historicalPage = null } = {}) {
+async function replaceArtifactFrame({ recoveryRetry = false, historicalDestination = null } = {}) {
   cancelArtifactLoadRecovery();
   if (!recoveryRetry) artifactLoadRecoveryAttempt = 0;
   clearTimeout(artifactSilenceTimer);
   pendingArtifactFailureBinding = null;
-  const destinationCandidate = historicalPage ? null : currentDestinationCandidate();
+  const destinationCandidate = historicalDestination ? null : currentDestinationCandidate();
   const requestedDestination = destinationPayload(destinationCandidate);
   // The iframe is sandboxed, so reload by resetting the iframe URL from chrome.
   if (!artifactSrc) {
@@ -3817,7 +3818,7 @@ async function replaceArtifactFrame({ recoveryRetry = false, historicalPage = nu
   const recoverLater = () => {
     preservePreviousLoad();
     if (requestSequence !== artifactLoadRequestSequence || ended) return false;
-    if (scheduleArtifactLoadRecovery(historicalPage)) return false;
+    if (scheduleArtifactLoadRecovery(historicalDestination)) return false;
     // Out of retries. Only say so when there is nothing on screen to say it over: a chrome that
     // already shows an artifact keeps showing it rather than losing a usable review.
     if (!artifactLoadToken) {
@@ -3849,11 +3850,11 @@ async function replaceArtifactFrame({ recoveryRetry = false, historicalPage = nu
           ...(modernArtifactProtocol && requestedDestination
             ? { destination: requestedDestination, reload_reason: recoveryRetry ? "recovery" : "reload" }
             : {}),
-          ...(modernArtifactProtocol && historicalPage
+          ...(modernArtifactProtocol && historicalDestination
             ? {
-                historical_page: {
-                  page: String(historicalPage.page || ""),
-                  page_proof: String(historicalPage.page_proof || ""),
+                historical_destination: {
+                  receipt: String(historicalDestination.receipt || ""),
+                  document_id: String(historicalDestination.document_id || ""),
                 },
               }
             : {}),
@@ -3941,11 +3942,11 @@ async function replaceArtifactFrame({ recoveryRetry = false, historicalPage = nu
   setHandoffSuperseded(false);
   startLayoutGateCycle();
   const responseDestination = String(load?.artifact_url || "");
-  const responseRoute = historicalPage ? String(load?.served_route || "") : destinationCandidate?.route || "";
+  const responseRoute = historicalDestination ? String(load?.served_route || "") : destinationCandidate?.route || "";
   const validatedResponseDestination = responseDestination
     ? normalizeArtifactDestination(responseDestination, responseRoute)
     : "";
-  const candidateDestination = historicalPage
+  const candidateDestination = historicalDestination
     ? ""
     : String(destinationCandidate?.destination || destinationCandidate?.route || artifactSrc);
   const validatedCandidateDestination = normalizeArtifactDestination(
@@ -4882,11 +4883,9 @@ function handleArtifactMessage(event, binding = null) {
   const messageSequence = ++artifactMessageSequence;
   artifactSpokeToken = messageToken;
   clearTimeout(artifactSilenceTimer);
-  if (binding && typeof msg.destination === "string") {
-    const destination = normalizeArtifactDestination(msg.destination, binding.route);
-    binding.destination = destination || msg.destination;
-    artifactLoadDestination = binding.destination;
-    persistDestinationRecord(destinationRecord(binding));
+  if (binding && msg.type === "lavish:documentDestination" && typeof msg.destination === "string") {
+    refreshHistoricalDestinationReceipt(binding, msg.destination).catch(() => {});
+    return;
   }
   if (msg.type === "lavish:documentDeparting") {
     // A child navigation may land on a non-reviewable page (or nowhere at all).
@@ -4991,6 +4990,59 @@ function handleArtifactMessage(event, binding = null) {
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
 }
 
+async function refreshHistoricalDestinationReceipt(binding, rawDestination) {
+  if (!binding || currentArtifactBinding !== binding) return false;
+  const destination = normalizeArtifactDestination(rawDestination, binding.route);
+  if (!destination) return false;
+  if (destination === binding.destination && binding.historicalDestinationReceipt) return true;
+  const sequence = ++binding.destinationReceiptSequence;
+  let response;
+  try {
+    response = await fetch("/api/" + key + "/artifact-bindings/validate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        page: binding.page,
+        page_proof: binding.proof,
+        served_route: binding.route,
+        document_id: binding.documentId,
+        artifact_load_token: binding.token,
+        artifact_revision: binding.revision,
+        destination: destinationPayload({
+          destination,
+          route: binding.route,
+          page: binding.page,
+          proof: binding.proof,
+        }),
+      }),
+    });
+  } catch {
+    return false;
+  }
+  const result = await response.json().catch(() => ({}));
+  const receipt = String(result?.historical_destination_receipt || "");
+  if (
+    !response.ok ||
+    !receipt ||
+    currentArtifactBinding !== binding ||
+    sequence !== binding.destinationReceiptSequence ||
+    ended
+  )
+    return false;
+  const acceptedDestination = normalizeArtifactDestination(result?.destination, binding.route);
+  if (!acceptedDestination || acceptedDestination !== destination) return false;
+  binding.destination = acceptedDestination;
+  binding.historicalDestinationReceipt = receipt;
+  artifactLoadDestination = acceptedDestination;
+  persistDestinationRecord(destinationRecord(binding));
+  postToBindingFrame(binding, {
+    type: "lavish:historicalDestinationReceipt",
+    historical_destination_receipt: receipt,
+    destination: acceptedDestination,
+  });
+  return true;
+}
+
 function challengeArtifactDocument(expectedDocumentId = "") {
   if (!modernArtifactProtocol || !frame.contentWindow) return;
   if (
@@ -5033,6 +5085,8 @@ function challengeArtifactDocument(expectedDocumentId = "") {
       typeof message.page_proof !== "string"
     )
       return;
+    const route = String(message.served_route || "");
+    const challengedDestination = normalizeArtifactDestination(String(message.destination || ""), route);
     let validation;
     try {
       validation = await fetch("/api/" + key + "/artifact-bindings/validate", {
@@ -5041,22 +5095,34 @@ function challengeArtifactDocument(expectedDocumentId = "") {
         body: JSON.stringify({
           page: message.page,
           page_proof: message.page_proof,
-          served_route: String(message.served_route || ""),
+          served_route: route,
+          document_id: message.document_id,
           artifact_load_token: String(message.artifact_load_token || ""),
           artifact_revision: Number(message.artifact_revision),
+          destination: challengedDestination
+            ? destinationPayload({
+                destination: challengedDestination,
+                route,
+                page: message.page,
+                proof: message.page_proof,
+              })
+            : null,
         }),
       });
     } catch {
       return;
     }
+    const validationResult = await validation.json().catch(() => ({}));
     if (!validation.ok) {
-      const rejected = await validation.json().catch(() => ({}));
+      const rejected = validationResult;
       if (
         rejected?.status === "stale" &&
         !answered &&
         !expired &&
         artifactChallengeAttempt === attempt &&
         (!latestReadyDocumentId || message.document_id === latestReadyDocumentId) &&
+        typeof message.historical_destination_receipt === "string" &&
+        message.historical_destination_receipt &&
         !ended
       ) {
         answered = true;
@@ -5064,12 +5130,17 @@ function challengeArtifactDocument(expectedDocumentId = "") {
         clearTimeout(timeout);
         channel.port1.close();
         replaceArtifactFrame({
-          historicalPage: { page: message.page, page_proof: message.page_proof },
+          historicalDestination: {
+            receipt: message.historical_destination_receipt,
+            document_id: message.document_id,
+          },
         }).catch(() => {});
       }
       return;
     }
-    if (answered || expired) return;
+    const historicalDestinationReceipt = String(validationResult?.historical_destination_receipt || "");
+    const acceptedDestination = normalizeArtifactDestination(validationResult?.destination, route);
+    if (answered || expired || !historicalDestinationReceipt || !acceptedDestination) return;
     if (
       artifactChallengeAttempt !== attempt ||
       String(message.artifact_load_token || "") !== String(artifactLoadToken || "") ||
@@ -5089,11 +5160,13 @@ function challengeArtifactDocument(expectedDocumentId = "") {
       port: channel.port1,
       page: message.page,
       proof: message.page_proof,
-      route: String(message.served_route || ""),
+      route,
       // Newer SDKs may echo the authored URL they observed. Older protocol-1
       // documents only expose the accepted served route; in that case the
       // helper falls back to the route without inventing a query or fragment.
-      destination: String(message.destination || message.authored_destination || message.url || ""),
+      destination: acceptedDestination,
+      historicalDestinationReceipt,
+      destinationReceiptSequence: 0,
       documentId: String(message.document_id),
       documentSequence: ++nextDocumentSequence,
       token: String(message.artifact_load_token || ""),
@@ -5112,7 +5185,7 @@ function challengeArtifactDocument(expectedDocumentId = "") {
     persistDestinationRecord(destinationRecord(binding));
     channel.port1.addEventListener("message", (boundEvent) => handleArtifactMessage(boundEvent, binding));
     channel.port1.start?.();
-    channel.port1.postMessage({ type: "lavish:activate", ...bindingTuple(binding) });
+    channel.port1.postMessage({ type: "lavish:activate", ...bindingTuple(binding), destination: binding.destination });
     artifactSpokeToken = binding.token;
     clearTimeout(artifactSilenceTimer);
     // The initial load handler may have run before the SDK announced readiness.

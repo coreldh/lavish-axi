@@ -307,17 +307,18 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
     await writeFile(artifact, "<!doctype html><body><a href='sub/page.html'>Sibling</a></body>");
     await mkdir(path.join(root, "sub"));
     await writeFile(path.join(root, "sub", "page.html"), "<!doctype html><body>SIBLING</body>");
+    await symlink("sub/page.html", path.join(root, "alias.html"));
     const server = await serve({ port: 0, stateFile: path.join(root, "state.json"), version: "reload-test" });
     try {
       const base = `http://127.0.0.1:${server.port}`;
       const { session, handoff, load } = await openAndLoad(base, artifact);
-      const siblingHtml = await fetch(`${base}/artifact/${session.key}/sub/page.html`).then((response) =>
+      const siblingHtml = await fetch(`${base}/artifact/${session.key}/alias.html`).then((response) =>
         response.text(),
       );
       const context = injectedPageContext(base, siblingHtml);
       const destination = {
         ...context,
-        url: `/artifact/${session.key}/sub/page.html?view=full&view=print#section-2`,
+        url: `/artifact/${session.key}/alias.html?view=full&view=print#section-2`,
         query: "view=full&view=print",
         fragment: "section-2",
       };
@@ -336,11 +337,39 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       const acceptedResponse = await begin("reload-sibling", 2, destination);
       assert.equal(acceptedResponse.status, 200);
       const accepted = await acceptedResponse.json();
-      assert.equal(accepted.artifact_url, `/artifact/${session.key}/sub/page.html?view=full&view=print#section-2`);
+      assert.equal(accepted.artifact_url, `/artifact/${session.key}/alias.html?view=full&view=print#section-2`);
       assert.equal(accepted.artifact_revision, load.artifact_revision + 1);
       assert.equal(accepted.page, "sub/page.html");
       assert.equal(accepted.page_proof, context.page_proof);
-      assert.equal(accepted.served_route, "sub/page.html");
+      assert.equal(accepted.served_route, "alias.html");
+
+      const mintReceipt = async (documentId, candidate = destination) => {
+        const response = await fetch(`${base}/api/${session.key}/artifact-bindings/validate`, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: base },
+          body: JSON.stringify({
+            page: accepted.page,
+            page_proof: accepted.page_proof,
+            served_route: accepted.served_route,
+            document_id: documentId,
+            artifact_load_token: accepted.artifact_load_token,
+            artifact_revision: accepted.artifact_revision,
+            destination: candidate,
+          }),
+        });
+        assert.equal(response.status, 200);
+        return response.json();
+      };
+      const firstReceipt = await mintReceipt("history-document-a");
+      assert.equal(firstReceipt.destination, destination.url);
+      const secondDestination = {
+        ...destination,
+        url: `/artifact/${session.key}/alias.html?view=compact#other`,
+        query: "view=compact",
+        fragment: "other",
+      };
+      const secondReceipt = await mintReceipt("history-document-a", secondDestination);
+      assert.notEqual(firstReceipt.historical_destination_receipt, secondReceipt.historical_destination_receipt);
 
       const recoveredResponse = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
         method: "POST",
@@ -349,14 +378,17 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
           request_id: "recover-history",
           request_sequence: 3,
           chrome_load_token: handoff.chrome_load_token,
-          historical_page: { page: context.page, page_proof: context.page_proof },
+          historical_destination: {
+            receipt: firstReceipt.historical_destination_receipt,
+            document_id: "history-document-a",
+          },
         }),
       });
       assert.equal(recoveredResponse.status, 200);
       const recovered = await recoveredResponse.json();
-      assert.equal(recovered.artifact_url, `/artifact/${session.key}/sub/page.html`);
+      assert.equal(recovered.artifact_url, destination.url);
       assert.equal(recovered.page, "sub/page.html");
-      assert.equal(recovered.served_route, "sub/page.html");
+      assert.equal(recovered.served_route, "alias.html");
       assert.equal(recovered.artifact_revision, accepted.artifact_revision + 1);
 
       const forgedRecovery = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
@@ -366,20 +398,38 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
           request_id: "forged-history",
           request_sequence: 4,
           chrome_load_token: handoff.chrome_load_token,
-          historical_page: { page: context.page, page_proof: "x".repeat(43) },
+          historical_destination: {
+            receipt: firstReceipt.historical_destination_receipt.slice(0, -1) + "x",
+            document_id: "history-document-a",
+          },
         }),
       });
       assert.equal(forgedRecovery.status, 400);
       assert.deepEqual(await forgedRecovery.json(), { status: "invalid-destination" });
 
-      const tampered = await begin("tampered-proof", 5, { ...destination, page_proof: "x".repeat(43) });
+      const crossDocument = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          request_id: "cross-document-history",
+          request_sequence: 5,
+          chrome_load_token: handoff.chrome_load_token,
+          historical_destination: {
+            receipt: firstReceipt.historical_destination_receipt,
+            document_id: "history-document-b",
+          },
+        }),
+      });
+      assert.equal(crossDocument.status, 400);
+
+      const tampered = await begin("tampered-proof", 6, { ...destination, page_proof: "x".repeat(43) });
       assert.equal(tampered.status, 400);
       assert.deepEqual(await tampered.json(), { status: "invalid-destination" });
 
-      const external = await begin("external-url", 6, { ...destination, url: "https://example.com/page.html" });
+      const external = await begin("external-url", 7, { ...destination, url: "https://example.com/page.html" });
       assert.equal(external.status, 400);
 
-      const reserved = await begin("reserved-query", 7, {
+      const reserved = await begin("reserved-query", 8, {
         ...destination,
         url: `/artifact/${session.key}/sub/page.html?__lavish_reload=authored#section-2`,
         query: "__lavish_reload=authored",
@@ -390,7 +440,7 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       assert.equal(revision.revision, recovered.artifact_revision, "rejected destinations never advance the load");
 
       await rm(path.join(root, "sub", "page.html"));
-      const deleted = await begin("deleted-page", 8, destination);
+      const deleted = await begin("deleted-page", 9, destination);
       assert.equal(deleted.status, 400, "a historical proof is not fresh file-read authorization");
       assert.deepEqual(await deleted.json(), { status: "invalid-destination" });
 
@@ -399,15 +449,35 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           request_id: "deleted-history",
-          request_sequence: 9,
+          request_sequence: 10,
           chrome_load_token: handoff.chrome_load_token,
-          historical_page: { page: context.page, page_proof: context.page_proof },
+          historical_destination: {
+            receipt: secondReceipt.historical_destination_receipt,
+            document_id: "history-document-a",
+          },
         }),
       });
       assert.equal(deletedRecovery.status, 400);
 
       await writeFile(path.join(root, "sub", "page.html"), "<!doctype html><body>REPLACED</body>");
-      const retargeted = await begin("retargeted-page", 10, {
+      await rm(path.join(root, "alias.html"));
+      await symlink("entry.html", path.join(root, "alias.html"));
+      const retargetedReceipt = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          request_id: "retargeted-history",
+          request_sequence: 11,
+          chrome_load_token: handoff.chrome_load_token,
+          historical_destination: {
+            receipt: firstReceipt.historical_destination_receipt,
+            document_id: "history-document-a",
+          },
+        }),
+      });
+      assert.equal(retargetedReceipt.status, 400);
+
+      const retargeted = await begin("retargeted-page", 12, {
         ...destination,
         route: "entry.html",
         url: `/artifact/${session.key}/entry.html?view=full&view=print#section-2`,
@@ -419,6 +489,92 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       await server.close();
     }
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 352 historical destination receipts survive a server restart", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-history-restart-"));
+  const artifact = path.join(root, "entry.html");
+  const stateFile = path.join(root, "state.json");
+  let firstServer;
+  let secondServer;
+  try {
+    await writeFile(artifact, "<!doctype html><body>ENTRY</body>");
+    await writeFile(path.join(root, "page.html"), "<!doctype html><body>PAGE</body>");
+    firstServer = await serve({ port: 0, stateFile, version: "history-restart-test" });
+    const firstBase = `http://127.0.0.1:${firstServer.port}`;
+    const { session, handoff } = await openAndLoad(firstBase, artifact);
+    const context = injectedPageContext(
+      firstBase,
+      await fetch(`${firstBase}/artifact/${session.key}/page.html`).then((response) => response.text()),
+    );
+    const destination = {
+      ...context,
+      url: `/artifact/${session.key}/page.html?tab=2#form`,
+      query: "tab=2",
+      fragment: "form",
+    };
+    const loaded = await fetch(`${firstBase}/api/${session.key}/artifact-loads/begin`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        request_id: "before-restart",
+        request_sequence: 2,
+        chrome_load_token: handoff.chrome_load_token,
+        destination,
+      }),
+    }).then((response) => response.json());
+    const receipt = await fetch(`${firstBase}/api/${session.key}/artifact-bindings/validate`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: firstBase },
+      body: JSON.stringify({
+        page: loaded.page,
+        page_proof: loaded.page_proof,
+        served_route: loaded.served_route,
+        document_id: "restart-document",
+        artifact_load_token: loaded.artifact_load_token,
+        artifact_revision: loaded.artifact_revision,
+        destination,
+      }),
+    }).then((response) => response.json());
+    await firstServer.close();
+    firstServer = null;
+
+    secondServer = await serve({ port: 0, stateFile, version: "history-restart-test" });
+    const secondBase = `http://127.0.0.1:${secondServer.port}`;
+    const refreshedHandoff = await fetch(`${secondBase}/api/${session.key}/chrome-loads/begin`, {
+      method: "POST",
+      headers: { origin: secondBase },
+    }).then((response) => response.json());
+    const current = await fetch(`${secondBase}/api/${session.key}/artifact-loads/begin`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        request_id: "restart-current",
+        request_sequence: 1,
+        chrome_load_token: refreshedHandoff.chrome_load_token,
+      }),
+    });
+    assert.equal(current.status, 200);
+    const recovered = await fetch(`${secondBase}/api/${session.key}/artifact-loads/begin`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        request_id: "restart-history",
+        request_sequence: 2,
+        chrome_load_token: refreshedHandoff.chrome_load_token,
+        historical_destination: {
+          receipt: receipt.historical_destination_receipt,
+          document_id: "restart-document",
+        },
+      }),
+    });
+    assert.equal(recovered.status, 200);
+    assert.equal((await recovered.json()).artifact_url, `/artifact/${session.key}/page.html?tab=2#form`);
+  } finally {
+    await firstServer?.close();
+    await secondServer?.close();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -522,11 +678,20 @@ test("issue 352 authenticates a live page binding before chrome activation", asy
         page: entryContext.page,
         page_proof: entryContext.page_proof,
         served_route: entryContext.route,
+        document_id: "binding-document",
         artifact_load_token: load.artifact_load_token,
         artifact_revision: load.artifact_revision,
+        destination: {
+          ...entryContext,
+          url: `/artifact/${session.key}/entry.html?tab=2#form`,
+          query: "tab=2",
+          fragment: "form",
+        },
       };
 
-      assert.equal((await validate(binding)).status, 204);
+      const accepted = await validate(binding);
+      assert.equal(accepted.status, 200);
+      assert.match((await accepted.json()).historical_destination_receipt, /\./);
       assert.equal((await validate({ ...binding, page_proof: otherContext.page_proof })).status, 403);
       assert.equal((await validate({ ...binding, served_route: "other.html" })).status, 403);
       assert.equal((await validate({ ...binding, artifact_load_token: "stale" })).status, 409);

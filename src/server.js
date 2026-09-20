@@ -71,7 +71,9 @@ import {
   readResolvedArtifactPage,
   resolveArtifactEntry,
   resolveArtifactPage,
+  signHistoricalDestinationReceipt,
   signPageProof,
+  verifyHistoricalDestinationReceipt,
   verifyPageProof,
 } from "./artifact-page.js";
 import {
@@ -1104,29 +1106,51 @@ export async function serve({
     }
   }
 
-  async function validateHistoricalPage(session, historicalPage) {
+  async function validateHistoricalDestination(session, historicalDestination) {
     const invalid = () => /** @type {{ ok: false }} */ ({ ok: false });
-    if (!historicalPage || typeof historicalPage !== "object" || Array.isArray(historicalPage)) return invalid();
-    const page = historicalPage.page;
-    const proof = historicalPage.page_proof;
-    if (typeof page !== "string" || !page || typeof proof !== "string" || !proof) return invalid();
+    if (
+      !historicalDestination ||
+      typeof historicalDestination !== "object" ||
+      Array.isArray(historicalDestination)
+    )
+      return invalid();
+    const receipt = historicalDestination.receipt;
+    const documentId = historicalDestination.document_id;
     const entryRoute = path.basename(session.file);
     const root = path.dirname(session.file);
     const canonicalRoot = await canonicalArtifactRoot(root);
-    const claim = validatePageClaim(session, canonicalRoot, page, proof, { allowMissing: false });
-    if (!claim.ok || claim.page === null) return invalid();
-    const entryPage = normalizeReviewPageIdentity(entryRoute, session.file);
-    const route = claim.page === entryPage ? entryRoute : claim.page;
-    const resolution = await resolveArtifactPage(root, route, { entryFile: entryRoute });
-    if (resolution.reason !== "ok" || resolution.page !== claim.page) return invalid();
-    const servedRoute = resolution.servedRoute || route;
-    return {
-      ok: true,
-      artifactUrl: artifactDocumentUrl(session.key, servedRoute),
-      page: claim.page,
-      pageProof: claim.proof,
-      servedRoute,
-    };
+    const proven = verifyHistoricalDestinationReceipt(
+      pageProofKey,
+      session.key,
+      canonicalRoot,
+      receipt,
+      documentId,
+      session.file,
+    );
+    if (!proven) return invalid();
+    let parsed;
+    try {
+      parsed = new URL(proven.url, "http://lavish.invalid");
+    } catch {
+      return invalid();
+    }
+    const proof = signPageProof(pageProofKey, session.key, canonicalRoot, proven.page, session.file);
+    const validated = await validateReloadDestination(session, {
+      route: proven.route,
+      page: proven.page,
+      page_proof: proof,
+      url: proven.url,
+      query: parsed.search.slice(1),
+      fragment: parsed.hash.slice(1),
+    });
+    if (
+      !validated.ok ||
+      validated.page !== proven.page ||
+      validated.servedRoute !== proven.route ||
+      validated.artifactUrl !== proven.url
+    )
+      return invalid();
+    return validated;
   }
 
   async function validatePromptContext(session, prompts, payload) {
@@ -1988,10 +2012,10 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      const hasHistoricalPage = req.body?.historical_page !== undefined;
-      const destination = hasHistoricalPage
+      const hasHistoricalDestination = req.body?.historical_destination !== undefined;
+      const destination = hasHistoricalDestination
         ? req.body?.destination === undefined
-          ? await validateHistoricalPage(session, req.body.historical_page)
+          ? await validateHistoricalDestination(session, req.body.historical_destination)
           : { ok: false }
         : await validateReloadDestination(session, req.body?.destination);
       if (!destination.ok) {
@@ -2050,7 +2074,15 @@ export async function serve({
         allowMissing: false,
       });
       const route = req.body?.served_route;
-      if (!claim.ok || claim.page === null || typeof route !== "string" || !route) {
+      const documentId = req.body?.document_id;
+      if (
+        !claim.ok ||
+        claim.page === null ||
+        typeof route !== "string" ||
+        !route ||
+        typeof documentId !== "string" ||
+        !documentId
+      ) {
         res.status(403).json({ status: "invalid-page-binding" });
         return;
       }
@@ -2060,7 +2092,38 @@ export async function serve({
         res.status(403).json({ status: "invalid-page-binding" });
         return;
       }
-      res.status(204).end();
+      const destination = await validateReloadDestination(session, req.body?.destination);
+      if (
+        !destination.ok ||
+        destination.page !== claim.page ||
+        destination.pageProof !== claim.proof ||
+        destination.servedRoute !== route
+      ) {
+        res.status(403).json({ status: "invalid-page-binding" });
+        return;
+      }
+      let historicalDestinationReceipt;
+      try {
+        historicalDestinationReceipt = signHistoricalDestinationReceipt(
+          pageProofKey,
+          session.key,
+          canonicalRoot,
+          {
+            page: claim.page,
+            route,
+            url: destination.artifactUrl,
+            documentId,
+          },
+          session.file,
+        );
+      } catch {
+        res.status(403).json({ status: "invalid-page-binding" });
+        return;
+      }
+      res.json({
+        historical_destination_receipt: historicalDestinationReceipt,
+        destination: destination.artifactUrl,
+      });
     } catch (error) {
       next(error);
     }

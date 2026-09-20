@@ -7,9 +7,13 @@ import { promisify } from "node:util";
 import { sameFileIdentity } from "./verified-local-file.js";
 
 const PAGE_PROOF_DOMAIN = "page-v1";
+const HISTORICAL_DESTINATION_DOMAIN = "historical-destination-v1";
 const PAGE_PROOF_KEY_BYTES = 32;
 const PAGE_PROOF_MAC_BYTES = 32;
 const PAGE_PROOF_MAX_PAGE_BYTES = 16 * 1024;
+const HISTORICAL_DESTINATION_MAX_URL_BYTES = 64 * 1024;
+const HISTORICAL_DESTINATION_MAX_DOCUMENT_BYTES = 512;
+const HISTORICAL_DESTINATION_MAX_RECEIPT_BYTES = 128 * 1024;
 const execFileAsync = promisify(execFile);
 const artifactPageIdentities = new WeakMap();
 const pageProofKeyIdentities = new WeakMap();
@@ -187,7 +191,108 @@ export function verifyPageProof(key, sessionKey, canonicalRoot, page, proof, ent
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
-export { PAGE_PROOF_DOMAIN, PAGE_PROOF_KEY_BYTES, PAGE_PROOF_MAX_PAGE_BYTES };
+function historicalDestinationPayload(sessionKey, canonicalRoot, page, route, url, documentId, entryFile) {
+  const normalizedPage = normalizeReviewPageIdentity(page, entryFile);
+  if (
+    !normalizedPage ||
+    normalizedPage !== page ||
+    typeof route !== "string" ||
+    !route ||
+    Buffer.byteLength(route, "utf8") > PAGE_PROOF_MAX_PAGE_BYTES ||
+    typeof url !== "string" ||
+    !url ||
+    Buffer.byteLength(url, "utf8") > HISTORICAL_DESTINATION_MAX_URL_BYTES ||
+    typeof documentId !== "string" ||
+    !documentId ||
+    Buffer.byteLength(documentId, "utf8") > HISTORICAL_DESTINATION_MAX_DOCUMENT_BYTES
+  )
+    return null;
+  return [
+    HISTORICAL_DESTINATION_DOMAIN,
+    String(sessionKey),
+    rootDigest(canonicalRoot),
+    normalizedPage,
+    route,
+    url,
+    documentId,
+  ];
+}
+
+export function signHistoricalDestinationReceipt(
+  key,
+  sessionKey,
+  canonicalRoot,
+  { page, route, url, documentId },
+  entryFile = "",
+) {
+  if (!Buffer.isBuffer(key) || key.length !== PAGE_PROOF_KEY_BYTES) {
+    throw new TypeError("page proof key must be exactly 32 bytes");
+  }
+  const payload = historicalDestinationPayload(sessionKey, canonicalRoot, page, route, url, documentId, entryFile);
+  if (!payload) throw new TypeError("invalid historical destination");
+  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const mac = crypto.createHmac("sha256", key).update(encoded, "utf8").digest("base64url");
+  return `${encoded}.${mac}`;
+}
+
+export function verifyHistoricalDestinationReceipt(
+  key,
+  sessionKey,
+  canonicalRoot,
+  receipt,
+  documentId,
+  entryFile = "",
+) {
+  if (
+    !Buffer.isBuffer(key) ||
+    key.length !== PAGE_PROOF_KEY_BYTES ||
+    typeof receipt !== "string" ||
+    Buffer.byteLength(receipt, "utf8") > HISTORICAL_DESTINATION_MAX_RECEIPT_BYTES
+  )
+    return null;
+  const parts = receipt.split(".");
+  if (parts.length !== 2 || !/^[A-Za-z0-9_-]+$/.test(parts[0])) return null;
+  const actual = decodeProof(parts[1]);
+  if (!actual) return null;
+  const expected = crypto.createHmac("sha256", key).update(parts[0], "utf8").digest();
+  if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) return null;
+  let parsed;
+  try {
+    const decoded = Buffer.from(parts[0], "base64url");
+    if (decoded.toString("base64url") !== parts[0]) return null;
+    parsed = JSON.parse(decoded.toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 7) return null;
+  const [domain, receiptSession, receiptRoot, page, route, url, receiptDocument] = parsed;
+  const canonical = historicalDestinationPayload(
+    sessionKey,
+    canonicalRoot,
+    page,
+    route,
+    url,
+    receiptDocument,
+    entryFile,
+  );
+  if (
+    !canonical ||
+    domain !== HISTORICAL_DESTINATION_DOMAIN ||
+    receiptSession !== String(sessionKey) ||
+    receiptRoot !== rootDigest(canonicalRoot) ||
+    receiptDocument !== documentId ||
+    JSON.stringify(canonical) !== JSON.stringify(parsed)
+  )
+    return null;
+  return { page, route, url, documentId: receiptDocument };
+}
+
+export {
+  HISTORICAL_DESTINATION_DOMAIN,
+  PAGE_PROOF_DOMAIN,
+  PAGE_PROOF_KEY_BYTES,
+  PAGE_PROOF_MAX_PAGE_BYTES,
+};
 
 function pageProofKeyError(file, detail) {
   return new Error(
