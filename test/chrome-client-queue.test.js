@@ -6561,6 +6561,8 @@ test("protocol 1 reloads the accepted authored destination for manual and live r
   await flushPromises();
   await flushPromises();
   const manual = chrome.replacedDestinations.at(-1);
+  const manualRequest = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body);
+  assert.doesNotMatch(manualRequest.destination.url, /__lavish_reload/);
   assert.match(manual, /^\/artifact\/abc\/sub\/page\.html\?/);
   assert.match(manual, /view=full&view=print/);
   assert.match(manual, /#section-2$/);
@@ -6820,6 +6822,40 @@ test("protocol 1 whole-chrome reload retains the bound destination but not an un
   assert.match(restored, /mode=review/);
   assert.match(restored, /#notes$/);
   assert.match(restored, /__lavish_reload=/);
+});
+
+test("protocol 1 submits invalid retained destinations instead of falling back to entry", async () => {
+  for (const destination of [
+    "/artifact/abc/sub/page.html?__lavish_reload=authored#notes",
+    "https://example.com/sub/page.html",
+    "/artifact/abc/sub\\page.html",
+  ]) {
+    const storage = new Map([
+      [
+        "lavish-axi:destination:abc",
+        JSON.stringify({
+          available: true,
+          destination,
+          route: "sub/page.html",
+          page: "sub/page.html",
+          page_proof: "proof-sub-page",
+        }),
+      ],
+    ]);
+    const chrome = await createChromeHarness({
+      artifactSrc: "/artifact/abc/start.html",
+      sessionData: { ...defaultSessionData, pageProtocol: 1 },
+      storage,
+      beginLoadResponses: [{ ok: false, json: async () => ({ status: "invalid-destination" }) }],
+    });
+    await flushPromises();
+    await flushPromises();
+
+    const request = JSON.parse(chrome.artifactBeginRequests[0].init.body);
+    assert.equal(request.destination.url, destination);
+    assert.equal(chrome.replacedDestinations.length, 0);
+    assert.equal(chrome.element("layoutGateTitle").textContent, "Lavish could not reload this page.");
+  }
 });
 
 test("protocol 1 upload results stay on the accepting document across replacement", async () => {

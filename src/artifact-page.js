@@ -4,12 +4,15 @@ import { chmod, lstat, mkdir, open, readFile, unlink, writeFile, link, realpath,
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { sameFileIdentity } from "./verified-local-file.js";
+
 const PAGE_PROOF_DOMAIN = "page-v1";
 const PAGE_PROOF_KEY_BYTES = 32;
 const PAGE_PROOF_MAC_BYTES = 32;
 const PAGE_PROOF_MAX_PAGE_BYTES = 16 * 1024;
 const execFileAsync = promisify(execFile);
 const artifactPageIdentities = new WeakMap();
+const pageProofKeyIdentities = new WeakMap();
 const WINDOWS_PAGE_PROOF_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $operation = $args[0]
@@ -73,6 +76,10 @@ Write-Output 'PAGE_PROOF_ACL_OK'
 
 export function pageProofKeyPath(stateDir) {
   return path.join(path.resolve(String(stateDir)), "page-proof.key");
+}
+
+export function pageProofKeyIdentity(key) {
+  return pageProofKeyIdentities.get(key) || null;
 }
 
 /**
@@ -202,7 +209,7 @@ async function windowsPageProofAcl(file, operation) {
 async function readExistingPageProofKey(file, { platform, windowsAcl }) {
   let details;
   try {
-    details = await lstat(file);
+    details = await lstat(file, { bigint: true });
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw pageProofKeyError(file, error?.message || String(error));
@@ -214,14 +221,23 @@ async function readExistingPageProofKey(file, { platform, windowsAcl }) {
     } catch (error) {
       throw pageProofKeyError(file, error?.message || String(error));
     }
-  } else if ((details.mode & 0o077) !== 0) {
+  } else if ((details.mode & 0o077n) !== 0n) {
     throw pageProofKeyError(file, "the file is not owner-only (expected mode 0600)");
   }
+  let handle;
   let value;
   try {
-    value = await readFile(file);
+    handle = await open(file, "r");
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || !sameFileIdentity(details, opened)) {
+      throw new Error("the file changed while it was opened");
+    }
+    value = await handle.readFile();
+    pageProofKeyIdentities.set(value, { dev: opened.dev, ino: opened.ino });
   } catch (error) {
     throw pageProofKeyError(file, error?.message || String(error));
+  } finally {
+    await handle?.close();
   }
   if (value.length !== PAGE_PROOF_KEY_BYTES) {
     throw pageProofKeyError(file, `the file must contain exactly ${PAGE_PROOF_KEY_BYTES} bytes`);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -1011,9 +1011,11 @@ test("export and share never inline the durable page-proof key", async () => {
   const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-proof-export-`);
   const artifact = path.join(dir, "report.html");
   const proofKey = path.join(dir, "page-proof.key");
+  const proofAlias = path.join(dir, "proof-alias.png");
   const marker = "PAGE-PROOF-SECRET-MARKER";
   await writeFile(proofKey, marker, "utf8");
-  await writeFile(artifact, '<!doctype html><html><body><img src="page-proof.key"></body></html>', "utf8");
+  await link(proofKey, proofAlias);
+  await writeFile(artifact, '<!doctype html><html><body><img src="proof-alias.png"></body></html>', "utf8");
   const requests = [];
   const htmlApp = await startFakeHtmlApp(requests);
   const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
@@ -1032,17 +1034,19 @@ test("export and share never inline the durable page-proof key", async () => {
     );
     assert.equal(result.status, 0, result.stderr);
     const exported = await readFile(path.join(dir, "report.export.html"), "utf8");
-    assert.match(exported, /src="page-proof\.key"/);
+    assert.match(exported, /src="proof-alias\.png"/);
     assert.doesNotMatch(exported, new RegExp(Buffer.from(marker).toString("base64")));
 
     await shareCommand([artifact]);
     assert.equal(requests.length, 1);
-    assert.match(requests[0].body.html_content, /src="page-proof\.key"/);
+    assert.match(requests[0].body.html_content, /src="proof-alias\.png"/);
     assert.doesNotMatch(requests[0].body.html_content, new RegExp(Buffer.from(marker).toString("base64")));
   } finally {
     await htmlApp.close();
-    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
-    restoreEnv("LAVISH_AXI_STATE_DIR", previousStateDir);
+    if (previousApiUrl === undefined) delete process.env.LAVISH_AXI_HTML_APP_API_URL;
+    else process.env.LAVISH_AXI_HTML_APP_API_URL = previousApiUrl;
+    if (previousStateDir === undefined) delete process.env.LAVISH_AXI_STATE_DIR;
+    else process.env.LAVISH_AXI_STATE_DIR = previousStateDir;
     await rm(dir, { force: true, recursive: true });
   }
 });

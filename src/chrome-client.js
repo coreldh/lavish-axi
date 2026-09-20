@@ -365,6 +365,7 @@ let artifactLoadDestination = "";
 /** @type {{ page: string, proof: string, route: string, destination: string, documentSequence: number, token: string, revision: number } | null} */
 let pendingArtifactFailureBinding = null;
 let topLevelTeardown = false;
+let controlledReloadDiscriminator = "";
 
 function decodeNavigationPart(value) {
   try {
@@ -374,7 +375,7 @@ function decodeNavigationPart(value) {
   }
 }
 
-function stripReservedReloadParameters(destination) {
+function stripControlledReloadParameter(destination) {
   const raw = String(destination || "");
   const hashIndex = raw.indexOf("#");
   const beforeHash = hashIndex === -1 ? raw : raw.slice(0, hashIndex);
@@ -383,30 +384,37 @@ function stripReservedReloadParameters(destination) {
   if (queryIndex === -1) return beforeHash + hash;
   const pathname = beforeHash.slice(0, queryIndex);
   const query = beforeHash.slice(queryIndex + 1);
-  const kept = query
-    .split("&")
-    .filter((part) => {
-      // Empty pairs are authored navigation state too. Keep them so a controlled
-      // reload does not silently rewrite the query string (the fresh discriminator
-      // is appended as one additional pair below).
-      if (!part) return true;
-      const equals = part.indexOf("=");
-      const name = equals === -1 ? part : part.slice(0, equals);
-      return decodeNavigationPart(name) !== "__lavish_reload";
-    })
-    .join("&");
-  return pathname + (kept ? "?" + kept : "") + hash;
+  let removed = false;
+  const kept = [];
+  for (const part of query.split("&")) {
+    if (!part) {
+      kept.push(part);
+      continue;
+    }
+    const equals = part.indexOf("=");
+    const name = equals === -1 ? part : part.slice(0, equals);
+    if (decodeNavigationPart(name) !== "__lavish_reload") {
+      kept.push(part);
+      continue;
+    }
+    const value = equals === -1 ? "" : decodeNavigationPart(part.slice(equals + 1));
+    if (!controlledReloadDiscriminator || removed || value !== controlledReloadDiscriminator) return null;
+    removed = true;
+  }
+  return pathname + (kept.length ? "?" + kept.join("&") : "") + hash;
 }
 
 function freshReloadDestination(destination) {
-  const clean = stripReservedReloadParameters(destination || artifactSrc);
+  const clean = String(destination || artifactSrc);
+  if (!clean) return "";
   const hashIndex = clean.indexOf("#");
   const beforeHash = hashIndex === -1 ? clean : clean.slice(0, hashIndex);
   const hash = hashIndex === -1 ? "" : clean.slice(hashIndex);
   const queryIndex = beforeHash.indexOf("?");
   const hasQuery = queryIndex !== -1 && queryIndex < beforeHash.length - 1;
   const separator = hasQuery ? "&" : "?";
-  return beforeHash + separator + "__lavish_reload=" + encodeURIComponent(randomBindingChallenge()) + hash;
+  controlledReloadDiscriminator = randomBindingChallenge();
+  return beforeHash + separator + "__lavish_reload=" + encodeURIComponent(controlledReloadDiscriminator) + hash;
 }
 
 function navigationPath(destination) {
@@ -454,7 +462,7 @@ function normalizeArtifactDestination(value, servedRoute = "") {
   const candidate = String(value || "");
   const fallback = destinationForServedRoute(servedRoute);
   if (!candidate) return fallback;
-  if (candidate.includes("\0") || candidate.includes("\\")) return fallback;
+  if (candidate.includes("\0") || candidate.includes("\\")) return "";
   try {
     const parsed =
       typeof URL === "function"
@@ -475,13 +483,13 @@ function normalizeArtifactDestination(value, servedRoute = "") {
               hash,
             };
           })();
-    if (!parsed || (typeof URL === "function" && parsed.origin !== location.origin)) return fallback;
+    if (!parsed || (typeof URL === "function" && parsed.origin !== location.origin)) return "";
     const pathName = parsed.pathname;
-    if (!pathName.startsWith(artifactPathPrefix())) return fallback;
-    if (fallback && pathName !== navigationPath(fallback)) return fallback;
-    return stripReservedReloadParameters(pathName + parsed.search + parsed.hash);
+    if (!pathName.startsWith(artifactPathPrefix())) return "";
+    if (fallback && pathName !== navigationPath(fallback)) return "";
+    return stripControlledReloadParameter(pathName + parsed.search + parsed.hash) || "";
   } catch {
-    return fallback;
+    return "";
   }
 }
 
@@ -489,7 +497,7 @@ function bindingDestination(binding) {
   if (!binding) return "";
   const routeDestination = destinationForServedRoute(binding.route);
   const observed = binding.destination || binding.authoredDestination || frameLocationDestination() || routeDestination;
-  return normalizeArtifactDestination(observed, binding.route) || routeDestination;
+  return normalizeArtifactDestination(observed, binding.route) || String(observed || "");
 }
 
 function destinationRecord(bindingOrDestination) {
@@ -523,10 +531,8 @@ function readRetainedDestination() {
   if (!modernArtifactProtocol) return null;
   const record = loadJsonState(destinationStorageKey, null);
   if (!record || record.available !== true) return null;
-  const destination = normalizeArtifactDestination(record.destination, record.route);
-  if (!destination) return null;
   return {
-    destination,
+    destination: String(record.destination || ""),
     route: String(record.route || ""),
     page: record.page === null ? null : String(record.page || ""),
     proof: String(record.page_proof || ""),
@@ -541,15 +547,6 @@ function currentDestinationCandidate(explicit = null) {
 
 function destinationPayload(candidate) {
   if (!candidate) return null;
-  if (
-    typeof candidate.route !== "string" ||
-    !candidate.route ||
-    typeof candidate.page !== "string" ||
-    !candidate.page ||
-    typeof (candidate.proof || candidate.page_proof) !== "string" ||
-    !(candidate.proof || candidate.page_proof)
-  )
-    return null;
   const destination = String(candidate.destination || candidate.url || candidate.route || "");
   if (!destination) return null;
   const hashIndex = destination.indexOf("#");
@@ -557,7 +554,7 @@ function destinationPayload(candidate) {
   const queryIndex = beforeHash.indexOf("?");
   return {
     url: destination,
-    route: candidate.route || navigationPath(destination),
+    route: typeof candidate.route === "string" ? candidate.route : "",
     page: candidate.page === undefined ? null : candidate.page,
     page_proof: String(candidate.proof || candidate.page_proof || ""),
     query: queryIndex === -1 ? "" : beforeHash.slice(queryIndex + 1),
@@ -597,9 +594,7 @@ function artifactFrameSrcForLoad(load = {}) {
       candidate?.destination || candidate?.url || candidate?.route || artifactSrc,
       candidate?.route || "",
     );
-    // A malformed or no-longer-current route is never allowed to turn a reload
-    // into an arbitrary URL. Fall back to the chrome's canonical entry path.
-    return freshReloadDestination(destination || artifactSrc);
+    return destination ? freshReloadDestination(destination) : "";
   }
   const separator = artifactSrc.includes("?") ? "&" : "?";
   return (
@@ -3933,14 +3928,20 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   const validatedResponseDestination = responseDestination
     ? normalizeArtifactDestination(responseDestination, destinationCandidate?.route || "")
     : "";
-  const selectedDestination =
-    validatedResponseDestination ||
-    normalizeArtifactDestination(
-      destinationCandidate?.destination || destinationCandidate?.route || artifactSrc,
-      destinationCandidate?.route || "",
-    ) ||
-    artifactSrc;
-  artifactLoadDestination = stripReservedReloadParameters(selectedDestination);
+  const candidateDestination = String(destinationCandidate?.destination || destinationCandidate?.route || artifactSrc);
+  const validatedCandidateDestination = normalizeArtifactDestination(
+    candidateDestination,
+    destinationCandidate?.route || "",
+  );
+  if (
+    (responseDestination && !validatedResponseDestination) ||
+    (!responseDestination && candidateDestination && !validatedCandidateDestination)
+  ) {
+    return recoverLater();
+  }
+  const selectedDestination = responseDestination ? validatedResponseDestination : validatedCandidateDestination;
+  if (!selectedDestination) return recoverLater();
+  artifactLoadDestination = selectedDestination;
   if (modernArtifactProtocol && load?.page && load?.page_proof && load?.served_route) {
     pendingArtifactFailureBinding = {
       page: load.page,
@@ -4864,11 +4865,9 @@ function handleArtifactMessage(event, binding = null) {
   clearTimeout(artifactSilenceTimer);
   if (binding && typeof msg.destination === "string") {
     const destination = normalizeArtifactDestination(msg.destination, binding.route);
-    if (destination) {
-      binding.destination = destination;
-      artifactLoadDestination = destination;
-      persistDestinationRecord(destinationRecord(binding));
-    }
+    binding.destination = destination || msg.destination;
+    artifactLoadDestination = binding.destination;
+    persistDestinationRecord(destinationRecord(binding));
   }
   if (msg.type === "lavish:documentDeparting") {
     // A child navigation may land on a non-reviewable page (or nowhere at all).

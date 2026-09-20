@@ -7,6 +7,7 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pipeline } from "node:stream/promises";
 
 import chokidar from "chokidar";
 import express from "express";
@@ -65,6 +66,7 @@ import {
   isArtifactHtmlPage,
   loadPageProofKey,
   normalizeReviewPageIdentity,
+  pageProofKeyIdentity,
   pageProofKeyPath,
   readResolvedArtifactPage,
   resolveArtifactEntry,
@@ -99,6 +101,7 @@ import {
   sweepAttachments,
   writeAttachment,
 } from "./attachment-store.js";
+import { openVerifiedLocalFile } from "./verified-local-file.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
 const chromeCssUrl = new URL("./chrome.css", import.meta.url);
@@ -340,6 +343,7 @@ export async function serve({
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
   artifactPageOpen,
   artifactPageStat,
+  artifactAssetOpen,
 } = {}) {
   // Keep the transport dependency off fast metadata paths such as `--version`.
   const { WebSocket, WebSocketServer } = await import("ws");
@@ -378,6 +382,7 @@ export async function serve({
   const stateDirectory = path.dirname(path.resolve(stateFile));
   const pageProofKeyFile = pageProofKeyPath(stateDirectory);
   const pageProofKey = await loadPageProofKey(stateDirectory);
+  const protectedPageProofKeyIdentity = pageProofKeyIdentity(pageProofKey);
   const canonicalPageProofKeyFile = await realpath(pageProofKeyFile);
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
@@ -2169,11 +2174,41 @@ export async function serve({
       res.status(403).send("Forbidden");
       return;
     }
-    if (file === canonicalPageProofKeyFile) {
+    let opened;
+    try {
+      opened = await openVerifiedLocalFile(file, {
+        confineDir: root,
+        forbiddenFileIdentities: [protectedPageProofKeyIdentity],
+        ...(artifactAssetOpen ? { openFile: artifactAssetOpen } : {}),
+      });
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        res.status(404).send("Not found");
+        return;
+      }
+      if (
+        error?.code === "EACCES" ||
+        error?.code === "EPERM" ||
+        error?.code === "ELOOP" ||
+        error?.code === "OUTSIDE_ROOT" ||
+        error?.code === "FILE_CHANGED"
+      ) {
+        res.status(403).send("Forbidden");
+        return;
+      }
+      throw error;
+    }
+    if (!opened) {
       res.status(403).send("Forbidden");
       return;
     }
-    res.sendFile(file, { dotfiles: "allow" });
+    res.type(opened.file);
+    res.setHeader("content-length", String(opened.stats.size));
+    try {
+      await pipeline(opened.handle.createReadStream({ autoClose: false }), res);
+    } finally {
+      await opened.handle.close();
+    }
   }
 
   // The historical virtual index is recognized only when both old generation fields are present.

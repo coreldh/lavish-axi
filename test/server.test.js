@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { on, once } from "node:events";
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, open, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect } from "node:net";
 import { homedir, networkInterfaces, tmpdir } from "node:os";
@@ -542,6 +542,49 @@ test("artifact asset resolution fails closed when realpath errors", async () => 
 
     await assert.rejects(resolveArtifactAsset(dir, "loop-a"), { code: "ELOOP" });
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact assets reject protected-file hard links and symlink swaps", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-protected-"));
+  const artifact = path.join(dir, "artifact.html");
+  const hardAlias = path.join(dir, "hard.png");
+  const swapAlias = path.join(dir, "swap.png");
+  const benign = path.join(dir, "benign.png");
+  await writeFile(artifact, "<!doctype html><body>protected assets</body>");
+  await writeFile(benign, "benign");
+  await symlink(benign, swapAlias);
+  let swapped = false;
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(dir, "state.json"),
+    version: "9.9.9-test",
+    artifactAssetOpen: async (file, flags) => {
+      if (!swapped && path.basename(file) === path.basename(benign)) {
+        swapped = true;
+        await unlink(file);
+        await symlink(path.join(dir, "page-proof.key"), file);
+      }
+      return open(file, flags);
+    },
+  });
+  try {
+    await link(path.join(dir, "page-proof.key"), hardAlias);
+    const base = `http://127.0.0.1:${server.port}`;
+    const session = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+
+    const hard = await fetch(`${base}/artifact/${session.key}/hard.png`);
+    const swap = await fetch(`${base}/artifact/${session.key}/swap.png`);
+    assert.equal(hard.status, 403);
+    assert.equal(swap.status, 403);
+    assert.equal(swapped, true);
+  } finally {
+    await server.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -3513,7 +3556,7 @@ test("GET /api/:key/export inlines local assets and leaves remote references int
 test("browser export and share never inline the durable page-proof key", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-proof-export-"));
   const artifact = path.join(dir, "artifact.html");
-  await writeFile(artifact, '<!doctype html><html><body><img src="page-proof.key"></body></html>');
+  await writeFile(artifact, '<!doctype html><html><body><img src="proof-alias.png"></body></html>');
   const requests = [];
   const htmlApp = await startFakeHtmlApp(requests);
   const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
@@ -3521,6 +3564,7 @@ test("browser export and share never inline the durable page-proof key", async (
   const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
   try {
     const proofKey = await readFile(path.join(dir, "page-proof.key"));
+    await link(path.join(dir, "page-proof.key"), path.join(dir, "proof-alias.png"));
     const encodedProofKey = proofKey.toString("base64");
     const base = `http://127.0.0.1:${server.port}`;
     const session = await fetch(`${base}/api/sessions`, {
@@ -3530,7 +3574,7 @@ test("browser export and share never inline the durable page-proof key", async (
     }).then((response) => response.json());
 
     const exported = await fetch(`${base}/api/${session.key}/export`).then((response) => response.text());
-    assert.match(exported, /src="page-proof\.key"/);
+    assert.match(exported, /src="proof-alias\.png"/);
     assert.doesNotMatch(exported, new RegExp(encodedProofKey));
 
     const shareResponse = await fetch(`${base}/api/${session.key}/share`, {
@@ -3540,7 +3584,7 @@ test("browser export and share never inline the durable page-proof key", async (
     });
     assert.equal(shareResponse.status, 200);
     assert.equal(requests.length, 1);
-    assert.match(requests[0].body.html_content, /src="page-proof\.key"/);
+    assert.match(requests[0].body.html_content, /src="proof-alias\.png"/);
     assert.doesNotMatch(requests[0].body.html_content, new RegExp(encodedProofKey));
   } finally {
     await server.close();

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, open, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -3306,6 +3306,48 @@ test("default reader rejects oversized assets before attempting to read them", a
     assert.match(warnings[0].reason || "", /per-asset cap/);
   } finally {
     await chmod(big, 0o600).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("default reader rejects protected-file hard links and symlink swaps", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "lavish-export-protected-"));
+  const key = path.join(root, "page-proof.key");
+  const hardAlias = path.join(root, "hard.png");
+  const swapAlias = path.join(root, "swap.png");
+  const benign = path.join(root, "benign.png");
+  try {
+    await writeFile(key, Buffer.alloc(32, 73));
+    await writeFile(benign, Buffer.from("benign"));
+    await link(key, hardAlias);
+    await symlink(benign, swapAlias);
+    let swapped = false;
+    const { html: out, warnings } = await buildSelfContainedHtml(
+      '<!doctype html><body><img src="hard.png"><img src="swap.png"></body>',
+      {
+        baseDir: root,
+        confineDir: root,
+        forbiddenLocalFiles: [key],
+        openLocalFile: async (file, flags) => {
+          if (!swapped && file === swapAlias) {
+            swapped = true;
+            await unlink(swapAlias);
+            await symlink(key, swapAlias);
+          }
+          return open(file, flags);
+        },
+      },
+    );
+
+    assert.equal(swapped, true);
+    assert.match(out, /src="hard\.png"/);
+    assert.match(out, /src="swap\.png"/);
+    assert.doesNotMatch(out, new RegExp(Buffer.alloc(32, 73).toString("base64")));
+    assert.deepEqual(
+      warnings.map((warning) => warning.kind),
+      ["outside-root", "outside-root"],
+    );
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
