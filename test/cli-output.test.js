@@ -1007,6 +1007,46 @@ test("export command writes a portable HTML file next to the artifact", async ()
   }
 });
 
+test("export and share never inline the durable page-proof key", async () => {
+  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-proof-export-`);
+  const artifact = path.join(dir, "report.html");
+  const proofKey = path.join(dir, "page-proof.key");
+  const marker = "PAGE-PROOF-SECRET-MARKER";
+  await writeFile(proofKey, marker, "utf8");
+  await writeFile(artifact, '<!doctype html><html><body><img src="page-proof.key"></body></html>', "utf8");
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  const previousStateDir = process.env.LAVISH_AXI_STATE_DIR;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+  process.env.LAVISH_AXI_STATE_DIR = dir;
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "export", artifact],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: { ...process.env, LAVISH_AXI_TELEMETRY: "0" },
+        encoding: "utf8",
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const exported = await readFile(path.join(dir, "report.export.html"), "utf8");
+    assert.match(exported, /src="page-proof\.key"/);
+    assert.doesNotMatch(exported, new RegExp(Buffer.from(marker).toString("base64")));
+
+    await shareCommand([artifact]);
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].body.html_content, /src="page-proof\.key"/);
+    assert.doesNotMatch(requests[0].body.html_content, new RegExp(Buffer.from(marker).toString("base64")));
+  } finally {
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
+    restoreEnv("LAVISH_AXI_STATE_DIR", previousStateDir);
+    await rm(dir, { force: true, recursive: true });
+  }
+});
+
 test("export command treats --out value as an option operand, not the source file", async () => {
   const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-export-test-`);
   const artifact = `${dir}/report.html`;

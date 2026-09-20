@@ -3510,6 +3510,46 @@ test("GET /api/:key/export inlines local assets and leaves remote references int
   }
 });
 
+test("browser export and share never inline the durable page-proof key", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-proof-export-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, '<!doctype html><html><body><img src="page-proof.key"></body></html>');
+  const requests = [];
+  const htmlApp = await startFakeHtmlApp(requests);
+  const previousApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
+  process.env.LAVISH_AXI_HTML_APP_API_URL = `http://127.0.0.1:${htmlApp.port}`;
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const proofKey = await readFile(path.join(dir, "page-proof.key"));
+    const encodedProofKey = proofKey.toString("base64");
+    const base = `http://127.0.0.1:${server.port}`;
+    const session = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    }).then((response) => response.json());
+
+    const exported = await fetch(`${base}/api/${session.key}/export`).then((response) => response.text());
+    assert.match(exported, /src="page-proof\.key"/);
+    assert.doesNotMatch(exported, new RegExp(encodedProofKey));
+
+    const shareResponse = await fetch(`${base}/api/${session.key}/share`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: "{}",
+    });
+    assert.equal(shareResponse.status, 200);
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].body.html_content, /src="page-proof\.key"/);
+    assert.doesNotMatch(requests[0].body.html_content, new RegExp(encodedProofKey));
+  } finally {
+    await server.close();
+    await htmlApp.close();
+    restoreEnv("LAVISH_AXI_HTML_APP_API_URL", previousApiUrl);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("GET /api/:key/export sends a safe download filename header", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "résumé draft.html");

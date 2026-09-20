@@ -118,6 +118,7 @@ const UNRESOLVED_LOCAL_ASSET_WARNING_KINDS = new Set([
  * @param {(absPath: string, readOptions?: { allowOutsideRoot?: boolean, maxAssetBytes?: number, maxBundleBytes?: number, maxBundleRemaining?: number }) => Promise<Uint8Array>} [options.readLocalFile] Read a local file (default applies the real-path confinement guard).
  * @param {(refPath: string) => (string|null)} [options.resolveAbsolute] Map a root-absolute ref (e.g. /design/x.css) to a local path.
  * @param {string} [options.confineDir] Reject local refs that resolve (lexically or via symlink) outside this directory.
+ * @param {string[]} [options.forbiddenLocalFiles] Canonical local files that must never be bundled.
  * @param {number} [options.maxAssetBytes] Per-asset inline cap; larger local files are left as references with a warning.
  * @param {number} [options.maxBundleBytes] Per-bundle inline cap across all inlined local assets.
  * @param {number} [options.maxDepth] Local stylesheet-import recursion guard.
@@ -125,13 +126,37 @@ const UNRESOLVED_LOCAL_ASSET_WARNING_KINDS = new Set([
  */
 export async function buildSelfContainedHtml(html, options = {}) {
   const confineDir = options.confineDir ? path.resolve(options.confineDir) : null;
+  const forbiddenLocalFiles = new Set(
+    await Promise.all(
+      (Array.isArray(options.forbiddenLocalFiles) ? options.forbiddenLocalFiles : []).map(async (file) => {
+        const absolute = path.resolve(String(file));
+        try {
+          return await realpath(absolute);
+        } catch {
+          return absolute;
+        }
+      }),
+    ),
+  );
+  const readLocalFile =
+    options.readLocalFile ||
+    ((absPath, readOptions = {}) =>
+      guardedRead(absPath, readOptions.allowOutsideRoot ? null : confineDir, readOptions));
   const ctx = {
     baseDir: options.baseDir || process.cwd(),
     confineDir,
-    readLocalFile:
-      options.readLocalFile ||
-      ((absPath, readOptions = {}) =>
-        guardedRead(absPath, readOptions.allowOutsideRoot ? null : confineDir, readOptions)),
+    readLocalFile: async (absPath, readOptions = {}) => {
+      let canonical = path.resolve(absPath);
+      try {
+        canonical = await realpath(canonical);
+      } catch {}
+      if (forbiddenLocalFiles.has(canonical)) {
+        throw Object.assign(new Error(`refusing to read protected local file ${absPath}`), {
+          code: "OUTSIDE_ROOT",
+        });
+      }
+      return readLocalFile(absPath, readOptions);
+    },
     resolveAbsolute: typeof options.resolveAbsolute === "function" ? options.resolveAbsolute : () => null,
     maxAssetBytes: resolveBytes(
       options.maxAssetBytes,

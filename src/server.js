@@ -65,6 +65,7 @@ import {
   isArtifactHtmlPage,
   loadPageProofKey,
   normalizeReviewPageIdentity,
+  pageProofKeyPath,
   readResolvedArtifactPage,
   resolveArtifactEntry,
   resolveArtifactPage,
@@ -375,7 +376,7 @@ export async function serve({
   let bindRecoveryTimer = null;
   const app = express();
   const stateDirectory = path.dirname(path.resolve(stateFile));
-  const pageProofKeyFile = path.join(stateDirectory, "page-proof.key");
+  const pageProofKeyFile = pageProofKeyPath(stateDirectory);
   const pageProofKey = await loadPageProofKey(stateDirectory);
   const canonicalPageProofKeyFile = await realpath(pageProofKeyFile);
   const store = new SessionStore(stateFile);
@@ -1761,6 +1762,7 @@ export async function serve({
       const { html, warnings } = await buildSelfContainedHtml(source, {
         baseDir: root,
         confineDir: root,
+        forbiddenLocalFiles: [canonicalPageProofKeyFile],
         resolveAbsolute: resolveDesignAssetPath,
       });
       const { unresolved, notices } = splitExportWarnings(warnings);
@@ -1806,6 +1808,7 @@ export async function serve({
       const { html, warnings } = await buildSelfContainedHtml(source, {
         baseDir: root,
         confineDir: root,
+        forbiddenLocalFiles: [canonicalPageProofKeyFile],
         resolveAbsolute: resolveDesignAssetPath,
       });
       let site;
@@ -3754,6 +3757,7 @@ export function createChromeHtml(
     // collapse the one signal that tells the rounds apart.
     revisionPalette: artifactRevisions.revisionPalette(),
     pageProtocol: 1,
+    entryPage: normalizeReviewPageIdentity(path.basename(session.file), session.file),
   });
   const { head: pathHead, tail: pathTail } = displayPathParts(session.file);
   const entryArtifactPath = artifactEntryUrl(session);

@@ -71,6 +71,10 @@ if (-not $acl.AreAccessRulesProtected -or $ownerSid -ne $sid.Value -or
 Write-Output 'PAGE_PROOF_ACL_OK'
 `;
 
+export function pageProofKeyPath(stateDir) {
+  return path.join(path.resolve(String(stateDir)), "page-proof.key");
+}
+
 /**
  * A document reached through authored navigation is eligible for review only when it is a local
  * HTML document. The saved entry is handled separately because an entry may be extensionless
@@ -235,7 +239,7 @@ export async function loadPageProofKey(
   { platform = process.platform, windowsAcl = windowsPageProofAcl } = {},
 ) {
   const directory = path.resolve(String(stateDir));
-  const file = path.join(directory, "page-proof.key");
+  const file = pageProofKeyPath(directory);
   await mkdir(directory, { recursive: true });
   const existing = await readExistingPageProofKey(file, { platform, windowsAcl });
   if (existing) return existing;

@@ -4,6 +4,7 @@ const sessionDataElement = document.getElementById("lavish-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const filePath = String(sessionData.file || "");
+const entryPage = typeof sessionData.entryPage === "string" ? sessionData.entryPage : "";
 const queueStorageKey = "lavish-axi:queued:" + key;
 const terminalStorageKey = "lavish-axi:terminal:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
@@ -205,6 +206,7 @@ const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-arti
 // acquire the legacy revision/token query pair: that pair intentionally selects
 // the historical virtual entry route on the server.
 const modernArtifactProtocol = sessionData.pageProtocol === 1;
+const legacyQueuedPageField = "_lavishLegacyQueuedPage";
 
 const queued = loadQueuedPrompts();
 let annotation = true;
@@ -806,12 +808,10 @@ function loadQueuedPrompts() {
       .map((item) => adoptQueuedPrompt(item, true))
       .filter(Boolean)
       .map((prompt) => {
-        // Pre-page-protocol tabs persisted no attribution fields. Preserve the
-        // user's writing and make its unavailable context explicit so the
-        // protocol-1 server can accept it instead of wedging every retry.
+        // Pre-page-protocol tabs persisted no attribution fields. Keep that
+        // provenance distinct until the server authenticates the saved entry.
         if (modernArtifactProtocol && !Object.hasOwn(prompt, "page")) {
-          prompt.page = null;
-          prompt.page_proof = "";
+          prompt[legacyQueuedPageField] = true;
         }
         return prompt;
       });
@@ -1823,6 +1823,7 @@ function promptQueueKey(prompt) {
 
 function stampPromptBinding(prompt, binding = currentArtifactBinding) {
   if (!modernArtifactProtocol || !prompt || typeof prompt !== "object") return prompt;
+  delete prompt[legacyQueuedPageField];
   // A layout-warning batch is intentionally heterogeneous: each authoritative
   // warning record carries its own page.  Stamping the batch with whichever
   // page happens to be visible would mislabel warnings selected across pages.
@@ -1888,7 +1889,21 @@ function stripInternalPromptFields(prompt) {
   if (!prompt || typeof prompt !== "object") return prompt;
   const clean = { ...prompt };
   delete clean[internalQueueKeyField];
+  delete clean[legacyQueuedPageField];
   return clean;
+}
+
+function stampLegacyQueuedPrompts(binding) {
+  if (!modernArtifactProtocol || !entryPage || binding?.page !== entryPage) return;
+  let changed = false;
+  for (const prompt of queued) {
+    if (prompt?.[legacyQueuedPageField] !== true) continue;
+    stampPromptBinding(prompt, binding);
+    changed = true;
+  }
+  if (!changed) return;
+  persistQueuedPrompts();
+  render();
 }
 
 function randomBindingChallenge() {
@@ -5053,6 +5068,7 @@ function challengeArtifactDocument(expectedDocumentId = "") {
     retireArtifactBinding();
     pendingArtifactFailureBinding = null;
     currentArtifactBinding = binding;
+    stampLegacyQueuedPrompts(binding);
     activatePageReviewState(binding.page);
     const destination = bindingDestination(binding);
     binding.destination = destination;

@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 
 import { AxiError, installSessionStartHooks, RESERVED_COMMANDS, runAxiCli } from "axi-sdk-js";
 
+import { pageProofKeyPath } from "./artifact-page.js";
 import { createDesignOutput, DESIGN_PRIORITY_RULE, DESIGN_SYSTEM_HINT } from "./design-reference.js";
 import {
   buildSelfContainedHtml,
@@ -681,6 +682,7 @@ async function exportCommand(args) {
   const { html, warnings } = await buildSelfContainedHtml(source, {
     baseDir: root,
     confineDir: root,
+    forbiddenLocalFiles: [pageProofKeyPath(path.dirname(stateFile()))],
     resolveAbsolute: resolveDesignAssetPath,
   });
   await writeFile(output, html);
@@ -747,6 +749,7 @@ export async function shareCommand(args) {
   const { html, warnings } = await buildSelfContainedHtml(source, {
     baseDir: root,
     confineDir: root,
+    forbiddenLocalFiles: [pageProofKeyPath(path.dirname(stateFile()))],
     resolveAbsolute: resolveDesignAssetPath,
   });
   const selfPaintWarning = analyzeSelfPaint(source).painted ? undefined : SELF_PAINT_WARNING;

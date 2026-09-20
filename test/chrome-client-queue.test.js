@@ -17,7 +17,7 @@ const servedChromeIds = new Set(
   ),
 );
 
-/** @typedef {{ key: string, file: string, pageProtocol?: number, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
+/** @typedef {{ key: string, file: string, pageProtocol?: number, entryPage?: string, layoutGateEnabled?: boolean, layoutGateMaxHoldMs?: number, modeToggleHotkeyKey?: string, initialChat?: any[], initialChatAckIds?: string[], initialChatRevision?: number, initialLayoutWarnings?: any[], chromeLoadToken?: string, initialArtifactRevision?: number, initialArtifactLoadToken?: string, initialArtifactLoadSequence?: number, attachmentMaxBytes?: number, attachmentMaxCount?: number, attachmentAcceptedMime?: string[], initialEnded?: boolean, initialEndedBy?: string | null, revisionPalette?: { hex: string, borderStyle: string, pattern: string }[] }} HarnessSessionData */
 /** @type {HarnessSessionData} */
 const defaultSessionData = {
   key: "abc",
@@ -31,6 +31,7 @@ const PROMPT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 function publicQueuedPrompt(prompt) {
   const rest = { ...prompt };
   delete rest.prompt_id;
+  delete rest._lavishLegacyQueuedPage;
   return rest;
 }
 
@@ -9165,9 +9166,63 @@ test("a queued note settles from a compact ack after its transcript entry is evi
   assert.match(bubbles[0].innerHTML, /Kept note/);
 });
 
-test("protocol 1 preserves pre-feature queued writing with explicit unavailable page context", async () => {
+test("protocol 1 stamps pre-feature queued writing after authenticating the saved entry", async () => {
   let postedBody;
-  const legacy = { uid: "", prompt: "Keep my old note", selector: "h1", tag: "element", text: "Heading" };
+  const entryBinding = {
+    page: "entry.html",
+    proof: "proof-entry",
+    route: "entry.html",
+    destination: "/artifact/abc/entry.html",
+    documentId: "entry-document",
+    token: "harness-load-1",
+    revision: 0,
+  };
+  const chrome = await createChromeHarness({
+    artifactSrc: entryBinding.destination,
+    storedQueue: [{ uid: "", prompt: "Keep my old note", selector: "h1", tag: "element", text: "Heading" }],
+    sessionData: {
+      ...defaultSessionData,
+      pageProtocol: 1,
+      entryPage: "entry.html",
+      initialArtifactLoadToken: "harness-load-1",
+    },
+    modernBinding: entryBinding,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        postedBody = JSON.parse(init.body);
+        return { ok: true, json: async () => ({ status: "queued", chat: [] }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+
+  assert.equal(chrome.queued()[0]._lavishLegacyQueuedPage, true);
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.queued()[0]._lavishLegacyQueuedPage, undefined);
+  assert.equal(chrome.queued()[0].page, "entry.html");
+  assert.equal(chrome.queued()[0].page_proof, "proof-entry");
+
+  chrome.element("send").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+
+  assert.equal(postedBody.prompts[0].page, "entry.html");
+  assert.equal(postedBody.prompts[0].page_proof, "proof-entry");
+  assert.equal(Object.hasOwn(postedBody.prompts[0], "_lavishLegacyQueuedPage"), false);
+});
+
+test("protocol 1 preserves explicit unavailable and attributed queued contexts", async () => {
+  let postedBody;
+  const unavailable = {
+    uid: "",
+    prompt: "Keep my unattributed note",
+    selector: "h1",
+    tag: "element",
+    text: "Heading",
+    page: null,
+    page_proof: "",
+  };
   const featureAware = {
     uid: "",
     prompt: "Keep the known page",
@@ -9178,7 +9233,7 @@ test("protocol 1 preserves pre-feature queued writing with explicit unavailable 
     page_proof: "proof-from-the-version-that-saved-it",
   };
   const chrome = await createChromeHarness({
-    storedQueue: [legacy, featureAware],
+    storedQueue: [unavailable, featureAware],
     sessionData: { ...defaultSessionData, pageProtocol: 1 },
     fetchImpl: async (url, init) => {
       if (String(url).endsWith("/prompts")) {
@@ -9194,7 +9249,7 @@ test("protocol 1 preserves pre-feature queued writing with explicit unavailable 
   await flushPromises();
 
   const restored = publicPostedBody(postedBody).prompts;
-  assert.equal(restored[0].prompt, "Keep my old note");
+  assert.equal(restored[0].prompt, "Keep my unattributed note");
   assert.equal(restored[0].page, null);
   assert.equal(restored[0].page_proof, "");
   assert.equal(restored[1].page, "sub/page.html");
