@@ -342,14 +342,44 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       assert.equal(accepted.page_proof, context.page_proof);
       assert.equal(accepted.served_route, "sub/page.html");
 
-      const tampered = await begin("tampered-proof", 3, { ...destination, page_proof: "x".repeat(43) });
+      const recoveredResponse = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          request_id: "recover-history",
+          request_sequence: 3,
+          chrome_load_token: handoff.chrome_load_token,
+          historical_page: { page: context.page, page_proof: context.page_proof },
+        }),
+      });
+      assert.equal(recoveredResponse.status, 200);
+      const recovered = await recoveredResponse.json();
+      assert.equal(recovered.artifact_url, `/artifact/${session.key}/sub/page.html`);
+      assert.equal(recovered.page, "sub/page.html");
+      assert.equal(recovered.served_route, "sub/page.html");
+      assert.equal(recovered.artifact_revision, accepted.artifact_revision + 1);
+
+      const forgedRecovery = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          request_id: "forged-history",
+          request_sequence: 4,
+          chrome_load_token: handoff.chrome_load_token,
+          historical_page: { page: context.page, page_proof: "x".repeat(43) },
+        }),
+      });
+      assert.equal(forgedRecovery.status, 400);
+      assert.deepEqual(await forgedRecovery.json(), { status: "invalid-destination" });
+
+      const tampered = await begin("tampered-proof", 5, { ...destination, page_proof: "x".repeat(43) });
       assert.equal(tampered.status, 400);
       assert.deepEqual(await tampered.json(), { status: "invalid-destination" });
 
-      const external = await begin("external-url", 4, { ...destination, url: "https://example.com/page.html" });
+      const external = await begin("external-url", 6, { ...destination, url: "https://example.com/page.html" });
       assert.equal(external.status, 400);
 
-      const reserved = await begin("reserved-query", 5, {
+      const reserved = await begin("reserved-query", 7, {
         ...destination,
         url: `/artifact/${session.key}/sub/page.html?__lavish_reload=authored#section-2`,
         query: "__lavish_reload=authored",
@@ -357,15 +387,27 @@ test("issue 352 begin-load freshly validates and returns the proven current dest
       assert.equal(reserved.status, 400);
 
       const revision = await fetch(`${base}/api/${session.key}/layout-warnings`).then((response) => response.json());
-      assert.equal(revision.revision, accepted.artifact_revision, "rejected destinations never advance the load");
+      assert.equal(revision.revision, recovered.artifact_revision, "rejected destinations never advance the load");
 
       await rm(path.join(root, "sub", "page.html"));
-      const deleted = await begin("deleted-page", 6, destination);
+      const deleted = await begin("deleted-page", 8, destination);
       assert.equal(deleted.status, 400, "a historical proof is not fresh file-read authorization");
       assert.deepEqual(await deleted.json(), { status: "invalid-destination" });
 
+      const deletedRecovery = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          request_id: "deleted-history",
+          request_sequence: 9,
+          chrome_load_token: handoff.chrome_load_token,
+          historical_page: { page: context.page, page_proof: context.page_proof },
+        }),
+      });
+      assert.equal(deletedRecovery.status, 400);
+
       await writeFile(path.join(root, "sub", "page.html"), "<!doctype html><body>REPLACED</body>");
-      const retargeted = await begin("retargeted-page", 7, {
+      const retargeted = await begin("retargeted-page", 10, {
         ...destination,
         route: "entry.html",
         url: `/artifact/${session.key}/entry.html?view=full&view=print#section-2`,

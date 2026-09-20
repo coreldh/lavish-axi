@@ -6580,6 +6580,101 @@ test("protocol 1 reloads the accepted authored destination for manual and live r
   assert.notEqual(live, manual, "manual and live reloads each get a fresh discriminator");
 });
 
+test("protocol 1 recognizes older chrome reload discriminators retained in history", async () => {
+  const binding = {
+    page: "page-a.html",
+    proof: "proof-a",
+    route: "page-a.html",
+    destination: "/artifact/abc/page-a.html?view=review#target",
+  };
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/page-a.html",
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: binding,
+  });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("reloadArtifact").click();
+  await flushPromises();
+  await flushPromises();
+  const historicalDestination = chrome.replacedDestinations.at(-1);
+  assert.match(historicalDestination, /__lavish_reload=/);
+  assert.match(historicalDestination, /view=review/);
+
+  chrome.element("reloadArtifact").click();
+  await flushPromises();
+  await flushPromises();
+  const newerDestination = chrome.replacedDestinations.at(-1);
+  assert.notEqual(newerDestination, historicalDestination);
+
+  chrome.updateModernBinding({
+    ...binding,
+    destination: historicalDestination,
+    documentId: "history-page-a",
+  });
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: "history-page-a" });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("reloadArtifact").click();
+  await flushPromises();
+  await flushPromises();
+
+  const request = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body);
+  assert.equal(request.destination.url, "/artifact/abc/page-a.html?view=review#target");
+});
+
+test("protocol 1 recovers a stale BFCache page only through its proven page identity", async () => {
+  const staleBinding = {
+    page: "page-a.html",
+    proof: "proof-a",
+    route: "untrusted-alias.html",
+    destination: "/artifact/abc/untrusted-alias.html?forged=1",
+    documentId: "stale-page-a",
+    token: "stale-load",
+    revision: 1,
+  };
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/page-a.html",
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: staleBinding,
+    beginLoadResponses: [
+      {
+        ok: true,
+        json: async () => ({
+          artifact_revision: 2,
+          artifact_load_token: "current-load",
+          artifact_url: "/artifact/abc/page-a.html",
+          page: "page-a.html",
+          page_proof: "proof-a",
+          served_route: "page-a.html",
+        }),
+      },
+      {
+        ok: true,
+        json: async () => ({
+          artifact_revision: 3,
+          artifact_load_token: "recovered-load",
+          artifact_url: "/artifact/abc/page-a.html",
+          page: "page-a.html",
+          page_proof: "proof-a",
+          served_route: "page-a.html",
+        }),
+      },
+    ],
+    bindingValidationResponses: [{ ok: false, status: 409, json: async () => ({ status: "stale" }) }],
+  });
+  await flushPromises();
+  await flushPromises();
+  await flushPromises();
+
+  const recovery = JSON.parse(chrome.artifactBeginRequests.at(-1).init.body);
+  assert.deepEqual(recovery.historical_page, { page: "page-a.html", page_proof: "proof-a" });
+  assert.equal(Object.hasOwn(recovery, "destination"), false);
+  assert.doesNotMatch(JSON.stringify(recovery), /untrusted-alias|forged=1|stale-load/);
+  assert.match(chrome.replacedDestinations.at(-1), /^\/artifact\/abc\/page-a\.html\?/);
+  assert.match(chrome.replacedDestinations.at(-1), /__lavish_reload=/);
+});
+
 test("protocol 1 rejects queued prior-generation feedback when the next load begins", async () => {
   const beginLoadResponses = [];
   const binding = {

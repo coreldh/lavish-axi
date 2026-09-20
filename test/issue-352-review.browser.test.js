@@ -285,17 +285,37 @@ test("352-B01", { skip: !runBrowserE2e, timeout: 240_000 }, async (t) => {
       "sibling question was not queued",
     );
 
+    click(/button "More"/);
+    click(/button "Reload artifact"/);
+    await eventually(
+      async () => snapshot(),
+      (tree) => tree.includes("Sibling review target") && !tree.includes("Checking layout."),
+      "reloaded sibling did not become reviewable",
+    );
+
     run("chrome-devtools-axi", ["back"], chromeEnv);
     const backView = await eventually(
       async () => snapshot(),
       (tree) => /RootWebArea url="[^"]*\/artifact\/[^/]+\/start\.html(?:[?#][^"]*)?"/.test(tree),
       "browser Back did not restore the entry document",
     );
+    click(/Entry review target/);
+    await eventually(
+      async () => snapshot(),
+      (tree) => /button "Queue"/.test(tree),
+      "BFCache-restored entry did not regain review controls",
+    );
     run("chrome-devtools-axi", ["eval", "() => { history.forward(); return true; }"], chromeEnv);
     const forwardView = await eventually(
       async () => snapshot(),
       (tree) => /RootWebArea url="[^"]*\/artifact\/[^/]+\/sub\/index\.html(?:[?#][^"]*)?"/.test(tree),
       "browser Forward did not restore the sibling document",
+    );
+    click(/Sibling review target/);
+    await eventually(
+      async () => snapshot(),
+      (tree) => /button "Queue"/.test(tree),
+      "Forward-restored sibling did not regain review controls",
     );
 
     click(/button "Send to Agent"/);

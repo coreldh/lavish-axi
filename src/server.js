@@ -1104,6 +1104,31 @@ export async function serve({
     }
   }
 
+  async function validateHistoricalPage(session, historicalPage) {
+    const invalid = () => /** @type {{ ok: false }} */ ({ ok: false });
+    if (!historicalPage || typeof historicalPage !== "object" || Array.isArray(historicalPage)) return invalid();
+    const page = historicalPage.page;
+    const proof = historicalPage.page_proof;
+    if (typeof page !== "string" || !page || typeof proof !== "string" || !proof) return invalid();
+    const entryRoute = path.basename(session.file);
+    const root = path.dirname(session.file);
+    const canonicalRoot = await canonicalArtifactRoot(root);
+    const claim = validatePageClaim(session, canonicalRoot, page, proof, { allowMissing: false });
+    if (!claim.ok || claim.page === null) return invalid();
+    const entryPage = normalizeReviewPageIdentity(entryRoute, session.file);
+    const route = claim.page === entryPage ? entryRoute : claim.page;
+    const resolution = await resolveArtifactPage(root, route, { entryFile: entryRoute });
+    if (resolution.reason !== "ok" || resolution.page !== claim.page) return invalid();
+    const servedRoute = resolution.servedRoute || route;
+    return {
+      ok: true,
+      artifactUrl: artifactDocumentUrl(session.key, servedRoute),
+      page: claim.page,
+      pageProof: claim.proof,
+      servedRoute,
+    };
+  }
+
   async function validatePromptContext(session, prompts, payload) {
     const modern = Number(payload?.page_protocol) === 1;
     const canonicalRoot = await canonicalArtifactRoot(path.dirname(session.file));
@@ -1963,7 +1988,12 @@ export async function serve({
         res.status(404).json({ error: "session not found" });
         return;
       }
-      const destination = await validateReloadDestination(session, req.body?.destination);
+      const hasHistoricalPage = req.body?.historical_page !== undefined;
+      const destination = hasHistoricalPage
+        ? req.body?.destination === undefined
+          ? await validateHistoricalPage(session, req.body.historical_page)
+          : { ok: false }
+        : await validateReloadDestination(session, req.body?.destination);
       if (!destination.ok) {
         res.status(400).json({ status: "invalid-destination" });
         return;

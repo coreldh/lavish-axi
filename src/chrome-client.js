@@ -365,7 +365,8 @@ let artifactLoadDestination = "";
 /** @type {{ page: string, proof: string, route: string, destination: string, documentSequence: number, token: string, revision: number } | null} */
 let pendingArtifactFailureBinding = null;
 let topLevelTeardown = false;
-let controlledReloadDiscriminator = "";
+const MAX_CONTROLLED_RELOAD_DISCRIMINATORS = 32;
+const controlledReloadDiscriminators = [];
 
 function decodeNavigationPart(value) {
   try {
@@ -398,7 +399,7 @@ function stripControlledReloadParameter(destination) {
       continue;
     }
     const value = equals === -1 ? "" : decodeNavigationPart(part.slice(equals + 1));
-    if (!controlledReloadDiscriminator || removed || value !== controlledReloadDiscriminator) return null;
+    if (removed || !controlledReloadDiscriminators.includes(value)) return null;
     removed = true;
   }
   return pathname + (kept.length ? "?" + kept.join("&") : "") + hash;
@@ -413,8 +414,15 @@ function freshReloadDestination(destination) {
   const queryIndex = beforeHash.indexOf("?");
   const hasQuery = queryIndex !== -1 && queryIndex < beforeHash.length - 1;
   const separator = hasQuery ? "&" : "?";
-  controlledReloadDiscriminator = randomBindingChallenge();
-  return beforeHash + separator + "__lavish_reload=" + encodeURIComponent(controlledReloadDiscriminator) + hash;
+  const discriminator = randomBindingChallenge();
+  controlledReloadDiscriminators.push(discriminator);
+  if (controlledReloadDiscriminators.length > MAX_CONTROLLED_RELOAD_DISCRIMINATORS) {
+    controlledReloadDiscriminators.splice(
+      0,
+      controlledReloadDiscriminators.length - MAX_CONTROLLED_RELOAD_DISCRIMINATORS,
+    );
+  }
+  return beforeHash + separator + "__lavish_reload=" + encodeURIComponent(discriminator) + hash;
 }
 
 function navigationPath(destination) {
@@ -3749,7 +3757,7 @@ function cancelArtifactLoadRecovery() {
 // backoff is exhausted so the caller can surface the terminal failure. A `superseded` or
 // `out-of-order` outcome never lands here: another reviewer or a newer request in this same
 // chrome owns the artifact, and retrying would fight it.
-function scheduleArtifactLoadRecovery() {
+function scheduleArtifactLoadRecovery(historicalPage = null) {
   if (ended) return false;
   const delay = ARTIFACT_LOAD_RECOVERY_DELAYS_MS[artifactLoadRecoveryAttempt];
   if (delay === undefined) return false;
@@ -3759,7 +3767,7 @@ function scheduleArtifactLoadRecovery() {
   artifactLoadRecoveryTimer = setTimeout(() => {
     artifactLoadRecoveryTimer = undefined;
     if (ended || sequence !== artifactLoadRequestSequence) return;
-    replaceArtifactFrame({ recoveryRetry: true }).catch(() => {});
+    replaceArtifactFrame({ recoveryRetry: true, historicalPage }).catch(() => {});
   }, delay);
   artifactLoadRecoveryTimer?.unref?.();
   return true;
@@ -3769,12 +3777,12 @@ function scheduleArtifactLoadRecovery() {
 // asking for a fresh load - a live reload, Reload artifact, a takeover - gets the whole budget
 // again, and only the recovery timer's own retries spend it down. A page that carried an
 // exhausted counter forward would have no retries left at all for the next outage.
-async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
+async function replaceArtifactFrame({ recoveryRetry = false, historicalPage = null } = {}) {
   cancelArtifactLoadRecovery();
   if (!recoveryRetry) artifactLoadRecoveryAttempt = 0;
   clearTimeout(artifactSilenceTimer);
   pendingArtifactFailureBinding = null;
-  const destinationCandidate = currentDestinationCandidate();
+  const destinationCandidate = historicalPage ? null : currentDestinationCandidate();
   const requestedDestination = destinationPayload(destinationCandidate);
   // The iframe is sandboxed, so reload by resetting the iframe URL from chrome.
   if (!artifactSrc) {
@@ -3809,7 +3817,7 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   const recoverLater = () => {
     preservePreviousLoad();
     if (requestSequence !== artifactLoadRequestSequence || ended) return false;
-    if (scheduleArtifactLoadRecovery()) return false;
+    if (scheduleArtifactLoadRecovery(historicalPage)) return false;
     // Out of retries. Only say so when there is nothing on screen to say it over: a chrome that
     // already shows an artifact keeps showing it rather than losing a usable review.
     if (!artifactLoadToken) {
@@ -3840,6 +3848,14 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
           chrome_load_token: chromeLoadToken,
           ...(modernArtifactProtocol && requestedDestination
             ? { destination: requestedDestination, reload_reason: recoveryRetry ? "recovery" : "reload" }
+            : {}),
+          ...(modernArtifactProtocol && historicalPage
+            ? {
+                historical_page: {
+                  page: String(historicalPage.page || ""),
+                  page_proof: String(historicalPage.page_proof || ""),
+                },
+              }
             : {}),
         }),
       });
@@ -3925,13 +3941,16 @@ async function replaceArtifactFrame({ recoveryRetry = false } = {}) {
   setHandoffSuperseded(false);
   startLayoutGateCycle();
   const responseDestination = String(load?.artifact_url || "");
+  const responseRoute = historicalPage ? String(load?.served_route || "") : destinationCandidate?.route || "";
   const validatedResponseDestination = responseDestination
-    ? normalizeArtifactDestination(responseDestination, destinationCandidate?.route || "")
+    ? normalizeArtifactDestination(responseDestination, responseRoute)
     : "";
-  const candidateDestination = String(destinationCandidate?.destination || destinationCandidate?.route || artifactSrc);
+  const candidateDestination = historicalPage
+    ? ""
+    : String(destinationCandidate?.destination || destinationCandidate?.route || artifactSrc);
   const validatedCandidateDestination = normalizeArtifactDestination(
     candidateDestination,
-    destinationCandidate?.route || "",
+    responseRoute,
   );
   if (
     (responseDestination && !validatedResponseDestination) ||
@@ -5009,8 +5028,6 @@ function challengeArtifactDocument(expectedDocumentId = "") {
       (expectedDocumentId && message.document_id !== String(expectedDocumentId)) ||
       typeof message.document_id !== "string" ||
       !message.document_id ||
-      Number(message.artifact_revision) !== Number(artifactLoadRevision) ||
-      String(message.artifact_load_token || "") !== String(artifactLoadToken || "") ||
       message.page_protocol !== 1 ||
       typeof message.page !== "string" ||
       typeof message.page_proof !== "string"
@@ -5032,7 +5049,27 @@ function challengeArtifactDocument(expectedDocumentId = "") {
     } catch {
       return;
     }
-    if (!validation.ok || answered || expired) return;
+    if (!validation.ok) {
+      const rejected = await validation.json().catch(() => ({}));
+      if (
+        rejected?.status === "stale" &&
+        !answered &&
+        !expired &&
+        artifactChallengeAttempt === attempt &&
+        (!latestReadyDocumentId || message.document_id === latestReadyDocumentId) &&
+        !ended
+      ) {
+        answered = true;
+        artifactChallengeAttempt = null;
+        clearTimeout(timeout);
+        channel.port1.close();
+        replaceArtifactFrame({
+          historicalPage: { page: message.page, page_proof: message.page_proof },
+        }).catch(() => {});
+      }
+      return;
+    }
+    if (answered || expired) return;
     if (
       artifactChallengeAttempt !== attempt ||
       String(message.artifact_load_token || "") !== String(artifactLoadToken || "") ||
