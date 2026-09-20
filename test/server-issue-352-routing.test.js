@@ -151,7 +151,7 @@ test("issue 352 artifact reads reject a validated path swapped to an outside sym
   }
 });
 
-test("issue 352 sdk route rejects a tampered proof and serves an inert no-generation bootstrap", async () => {
+test("issue 352 sdk route rejects tampered proofs and tokenless page-aware loads", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-352-sdk-"));
   const artifact = path.join(root, "entry.html");
   try {
@@ -180,8 +180,8 @@ test("issue 352 sdk route rejects a tampered proof and serves an inert no-genera
       recoveryUrl.searchParams.delete("artifact_revision");
       recoveryUrl.searchParams.delete("artifact_load_token");
       const recovery = await fetch(recoveryUrl);
-      assert.equal(recovery.status, 200);
-      assert.match(await recovery.text(), /const inert=true/);
+      assert.equal(recovery.status, 409);
+      assert.deepEqual(await recovery.json(), { status: "stale" });
     } finally {
       await server.close();
     }

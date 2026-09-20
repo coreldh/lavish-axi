@@ -2241,10 +2241,7 @@ export async function serve({
         }
         pageContext = { pageProtocol: 1, page, pageProof: proof, servedRoute };
       }
-      const hasRevision = Object.prototype.hasOwnProperty.call(req.query, "artifact_revision");
-      const hasToken = Object.prototype.hasOwnProperty.call(req.query, "artifact_load_token");
-      const recoveryBootstrap = pageAware && !hasRevision && !hasToken;
-      if (!verified.valid && !recoveryBootstrap) {
+      if (!verified.valid) {
         res.status(409).json({ status: "stale" });
         return;
       }
@@ -2254,7 +2251,6 @@ export async function serve({
           maxAttachmentCount: attachmentConfig.maxPerPrompt,
           maxAttachmentBytes: attachmentConfig.maxBytes,
           ...pageContext,
-          inert: recoveryBootstrap,
         }),
       );
     } catch (error) {
@@ -3797,7 +3793,7 @@ function serializeModuleHelpers(module) {
  * @param {string} key
  * @param {number} [artifactRevision]
  * @param {string} [artifactLoadToken]
- * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[], pageProtocol?: number, page?: string | null, pageProof?: string, servedRoute?: string, inert?: boolean }} [options]
+ * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[], pageProtocol?: number, page?: string | null, pageProof?: string, servedRoute?: string }} [options]
  */
 export function createSdkJs(
   key,
@@ -3811,7 +3807,6 @@ export function createSdkJs(
     page = null,
     pageProof = "",
     servedRoute = "",
-    inert = false,
   } = {},
 ) {
   const mermaidHelperSource = serializeModuleHelpers(mermaidNode);
@@ -3841,8 +3836,6 @@ const pageProtocol=${pageProtocolNumber};
 const page=${JSON.stringify(pageIdentity)};
 const pageProof=${JSON.stringify(pageProofValue)};
 const servedRoute=${JSON.stringify(servedRouteValue)};
-const inert=${inert === true ? "true" : "false"};
-if (inert) return;
 const deriveQueueKey=${deriveLavishQueueKey.toString()};
 const isNativeInteractiveControl=${isNativeInteractiveControl.toString()};
 const MODE_TOGGLE_HOTKEY_KEY=${JSON.stringify(MODE_TOGGLE_HOTKEY_KEY)};

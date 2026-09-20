@@ -894,7 +894,7 @@ export function migrateLegacySession(session, options = {}) {
   if (migrateLegacyWarnings(warnings, entryPage)) changed = true;
   if (migrateLegacyPrompts(session, entryPage, warnings)) changed = true;
   if (migrateLegacyChat(session)) changed = true;
-  if (migrateLegacyFailures(session)) changed = true;
+  if (migrateLegacyFailures(session, entryPage)) changed = true;
   if (migrateLegacySnapshot(session, entryPage)) changed = true;
 
   // Mark completion even when this session had no legacy fields. That makes a second state read
@@ -959,33 +959,10 @@ function migrateLegacyPrompts(session, entryPage, warnings) {
       continue;
     }
     if (Object.hasOwn(prompt, "page") && prompt.page !== "") continue;
-    prompt.page = isLegacyPageOriginatedPrompt(prompt) ? entryPage : null;
+    prompt.page = entryPage;
     changed = true;
   }
   return changed;
-}
-
-function isLegacyPageOriginatedPrompt(prompt) {
-  const tag = String(prompt?.tag || "")
-    .trim()
-    .toLowerCase();
-  const kind = String(prompt?.kind || "")
-    .trim()
-    .toLowerCase();
-  if (tag === "message" || tag === "layout-warnings" || kind === "message" || kind === "layout-warnings") {
-    return false;
-  }
-  if (tag === "whiteboard" || kind === "whiteboard") return true;
-  // The historical question transports were typed by their tag even when a caller did not
-  // include a selector/uid.  Keep those bounded kinds entry-attributed; an unknown tag without
-  // a target remains null below rather than inheriting the entry by blanket fallback.
-  if (["annotation", "question", "choice", "tracked-batch"].includes(tag || kind)) return true;
-  const targetType = String(prompt?.target?.type || "");
-  if (["text-range", "table-cell", "mermaid-node", EXCALIDRAW_SCENE_TARGET_TYPE].includes(targetType)) return true;
-  // Artifact-originated questions use their own tag (choice/tracked-batch/etc.) and retain the
-  // originating element selector or uid. Composer messages are the only old transport kind with
-  // tag=message, so this remains typed provenance rather than a blanket page fallback.
-  return Boolean(String(prompt?.selector || "").trim() || String(prompt?.uid || "").trim());
 }
 
 function migrateLegacyChat(session) {
@@ -1001,12 +978,18 @@ function migrateLegacyChat(session) {
   return changed;
 }
 
-function migrateLegacyFailures(session) {
+function migrateLegacyFailures(session, entryPage) {
   if (!Array.isArray(session.artifact_failures)) return false;
   let changed = false;
   for (const failure of session.artifact_failures) {
-    if (!failure || typeof failure !== "object" || Array.isArray(failure) || Object.hasOwn(failure, "page")) continue;
-    failure.page = null;
+    if (
+      !failure ||
+      typeof failure !== "object" ||
+      Array.isArray(failure) ||
+      (Object.hasOwn(failure, "page") && failure.page !== "")
+    )
+      continue;
+    failure.page = entryPage;
     changed = true;
   }
   return changed;

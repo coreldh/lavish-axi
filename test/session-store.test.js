@@ -2821,7 +2821,7 @@ test("legacy server state migrates by typed provenance once and preserves durabl
     assert.equal(migrated.prompts[0].page, entryPage, "annotation provenance maps to the entry");
     assert.equal(migrated.prompts[1].page, entryPage, "typed question provenance maps to the entry");
     assert.equal(migrated.prompts[2].page, entryPage, "whiteboard provenance maps to the entry");
-    assert.equal(migrated.prompts[3].page, null, "composer/chat prompts remain unavailable");
+    assert.equal(migrated.prompts[3].page, entryPage, "legacy composer prompts retain the entry target");
     assert.equal(migrated.prompts[4].target.warnings[0].page, entryPage, "warning batches resolve per record");
     assert.deepEqual(migrated.prompts[0].attachments, [attachment]);
     assert.deepEqual(migrated.prompts[2].attachments, [attachment]);
@@ -2833,7 +2833,7 @@ test("legacy server state migrates by typed provenance once and preserves durabl
       migrated.chat.every((entry) => entry.page === null),
       "legacy chat is explicitly unavailable",
     );
-    assert.equal(migrated.artifact_failures[0].page, null);
+    assert.equal(migrated.artifact_failures[0].page, entryPage);
     assert.equal(migrated.snapshot_page, entryPage);
     assert.equal(migrated.snapshot_page_proof, undefined, "migration never mints a page proof");
     assert.equal(migrated.layout_warnings[0].id, warningId, "legacy warning selection identity is retained");
@@ -2857,6 +2857,10 @@ test("legacy server state migrates by typed provenance once and preserves durabl
     assert.equal(twice, once, "the second state read is byte-stable and creates no feedback");
     assert.equal(migratedAgain.prompts.length, 5);
     assert.deepEqual(migratedAgain.chat_ack_ids, [ackId]);
+
+    const feedback = await store.takeFeedback(session.key);
+    assert.equal(feedback.prompts[3].page, entryPage);
+    assert.equal(feedback.artifact_failures[0].page, entryPage);
   });
 });
 
@@ -2868,6 +2872,7 @@ test("legacy state waits for entry context and preserves explicit null attributi
     legacy.prompts = [
       { uid: "modern-null", prompt: "Unavailable", selector: "", tag: "message", text: "", page: null },
     ];
+    legacy.artifact_failures = [{ kind: "artifact-unavailable", detail: "Unavailable", page: null }];
     legacy.dom_snapshot = "old snapshot";
     legacy.snapshot_page = null;
     legacy.layout_warnings = [
@@ -2904,6 +2909,7 @@ test("legacy state waits for entry context and preserves explicit null attributi
     const first = await store.findByKey(session.key);
     assert.equal(first.page_schema, 1);
     assert.equal(first.prompts[0].page, null);
+    assert.equal(first.artifact_failures[0].page, null);
     assert.equal(first.snapshot_page, null, "explicit modern null never becomes entry attribution");
     assert.equal(first.layout_warnings[0].page, null);
     const once = await readFile(stateFile, "utf8");
