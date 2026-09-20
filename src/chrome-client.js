@@ -340,7 +340,9 @@ let artifactMessageSequence = 0;
 let layoutDiagnosticSequence = 0;
 /** @type {{ port: MessagePort, page: string|null, proof: string, route: string, destination: string, documentId: string, documentSequence: number, token: string, revision: number, version: number, window: WindowProxy } | null} */
 let currentArtifactBinding = null;
-let artifactChallengeInFlight = false;
+/** @type {{ documentId: string, port: MessagePort, timeout: ReturnType<typeof setTimeout> } | null} */
+let artifactChallengeAttempt = null;
+let latestReadyDocumentId = "";
 let nextDocumentSequence = 0;
 let nextBindingVersion = 0;
 let artifactLoadRecoveryAttempt = 0;
@@ -4922,28 +4924,33 @@ function handleArtifactMessage(event, binding = null) {
 }
 
 function challengeArtifactDocument(expectedDocumentId = "") {
-  if (!modernArtifactProtocol || !frame.contentWindow || artifactChallengeInFlight) return;
+  if (!modernArtifactProtocol || !frame.contentWindow) return;
   if (
     currentArtifactBinding &&
     (!expectedDocumentId || currentArtifactBinding.documentId === String(expectedDocumentId))
   )
     return;
+  const documentId = String(expectedDocumentId || "");
+  if (artifactChallengeAttempt) {
+    if (!documentId || artifactChallengeAttempt.documentId === documentId) return;
+    clearTimeout(artifactChallengeAttempt.timeout);
+    artifactChallengeAttempt.port.close();
+    artifactChallengeAttempt = null;
+  }
   const source = frame.contentWindow;
   const channel = new MessageChannel();
   const challenge = randomBindingChallenge();
   let answered = false;
   let expired = false;
-  artifactChallengeInFlight = true;
-  const finishChallenge = () => {
-    artifactChallengeInFlight = false;
-  };
   const timeout = setTimeout(() => {
     if (!answered) {
       expired = true;
-      finishChallenge();
+      if (artifactChallengeAttempt === attempt) artifactChallengeAttempt = null;
       channel.port1.close();
     }
   }, 5000);
+  const attempt = { documentId, port: channel.port1, timeout };
+  artifactChallengeAttempt = attempt;
   channel.port1.addEventListener("message", async (event) => {
     if (answered || (event.target !== channel.port1 && event.currentTarget !== channel.port1)) return;
     const message = event.data || {};
@@ -4977,8 +4984,20 @@ function challengeArtifactDocument(expectedDocumentId = "") {
       return;
     }
     if (!validation.ok || answered || expired) return;
+    if (
+      artifactChallengeAttempt !== attempt ||
+      String(message.artifact_load_token || "") !== String(artifactLoadToken || "") ||
+      Number(message.artifact_revision) !== Number(artifactLoadRevision) ||
+      (latestReadyDocumentId && message.document_id !== latestReadyDocumentId) ||
+      ended
+    ) {
+      if (artifactChallengeAttempt === attempt) artifactChallengeAttempt = null;
+      clearTimeout(timeout);
+      channel.port1.close();
+      return;
+    }
     answered = true;
-    finishChallenge();
+    artifactChallengeAttempt = null;
     clearTimeout(timeout);
     const binding = {
       port: channel.port1,
@@ -5030,7 +5049,8 @@ if (modernArtifactProtocol) {
     if (event.source !== frame.contentWindow) return;
     const message = event.data || {};
     if (message.type !== "lavish:ready" || message.page_protocol !== 1) return;
-    challengeArtifactDocument(String(message.document_id || ""));
+    latestReadyDocumentId = String(message.document_id || "");
+    challengeArtifactDocument(latestReadyDocumentId);
   });
 } else {
   window.addEventListener("message", (event) => handleArtifactMessage(event));
@@ -5357,7 +5377,15 @@ document.addEventListener(
   true,
 );
 frame.addEventListener("load", () => {
-  if (modernArtifactProtocol && !currentArtifactBinding) challengeArtifactDocument();
+  if (modernArtifactProtocol && !currentArtifactBinding) {
+    latestReadyDocumentId = "";
+    if (artifactChallengeAttempt) {
+      clearTimeout(artifactChallengeAttempt.timeout);
+      artifactChallengeAttempt.port.close();
+      artifactChallengeAttempt = null;
+    }
+    challengeArtifactDocument();
+  }
   if (artifactSpokeToken !== artifactLoadToken) armArtifactAvailabilityProbe(artifactLoadToken);
   postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
   // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.

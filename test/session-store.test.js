@@ -321,6 +321,41 @@ test("a retried begin request reuses the same load epoch", async () => {
   }
 });
 
+test("whiteboard channel authentication cannot mutate a replacement load", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(path.join(dir, "state.json"));
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const first = await beginArtifactLoad(store, session.key);
+    assert.equal(
+      (await store.authenticateWhiteboardChannel(session.key, first.artifact_load_token, first.artifact_revision, 8))
+        .status,
+      "authenticated",
+    );
+
+    const second = await beginArtifactLoad(store, session.key);
+    assert.equal(
+      (await store.authenticateWhiteboardChannel(session.key, first.artifact_load_token, first.artifact_revision, 99))
+        .status,
+      "stale",
+    );
+    assert.equal(
+      (await store.authenticateWhiteboardChannel(session.key, second.artifact_load_token, second.artifact_revision, 1))
+        .status,
+      "authenticated",
+    );
+    assert.equal(
+      (await store.authenticateWhiteboardChannel(session.key, second.artifact_load_token, second.artifact_revision, 0))
+        .status,
+      "stale-sequence",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("reopening a session preserves the live reviewer handoff and artifact load", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {

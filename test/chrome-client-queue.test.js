@@ -6659,6 +6659,53 @@ test("protocol 1 does not activate page state before the server accepts the bind
   );
 });
 
+test("protocol 1 discards a validated binding after its document is replaced", async () => {
+  /** @type {((value: any) => void) | undefined} */
+  let resolveFirstValidation;
+  const firstValidation = new Promise((resolve) => {
+    resolveFirstValidation = resolve;
+  });
+  const bindingA = {
+    page: "page-a.html",
+    proof: "proof-a",
+    route: "page-a.html",
+    destination: "/artifact/abc/page-a.html",
+    documentId: "document-a",
+    token: "harness-load-1",
+    revision: 1,
+  };
+  const chrome = await createChromeHarness({
+    artifactSrc: bindingA.destination,
+    sessionData: {
+      ...defaultSessionData,
+      pageProtocol: 1,
+      initialArtifactLoadToken: "harness-load-1",
+      initialArtifactRevision: 1,
+    },
+    modernBinding: bindingA,
+    bindingValidationResponses: [firstValidation],
+  });
+  await flushPromises();
+  const bindingB = { ...bindingA, page: "page-b.html", route: "page-b.html", documentId: "document-b" };
+  chrome.updateModernBinding(bindingB);
+  chrome.dispatchWindowEvent("message", {
+    source: chrome.frame.contentWindow,
+    data: { type: "lavish:ready", page_protocol: 1, document_id: "document-b" },
+  });
+  resolveFirstValidation?.({ ok: true, status: 204, json: async () => ({}) });
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(
+    chrome.modernPostedToFrame.some((message) => message.type === "lavish:activate" && message.page === "page-a.html"),
+    false,
+  );
+  assert.equal(
+    chrome.modernPostedToFrame.some((message) => message.type === "lavish:activate" && message.page === "page-b.html"),
+    true,
+  );
+});
+
 test("protocol 1 whole-chrome reload retains the bound destination but not an unavailable one", async () => {
   const destination = "/artifact/abc/sub/page.html?mode=review#notes";
   const storage = new Map();

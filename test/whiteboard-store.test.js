@@ -174,6 +174,23 @@ test("same diagram index on two canonical pages has separate working and feedbac
   });
 });
 
+test("canonical pages with reserved filename characters retain whiteboard identity", async () => {
+  await withTempDir(async (dir) => {
+    const page = "sub folder/report#draft?.html";
+    const scene = { elements: [{ id: "reserved" }] };
+    assert.equal(isValidWhiteboardPage(page), true);
+    await saveWhiteboardForPage(dir, KEY, page, 3, { sourceHash: "reserved-hash", scene });
+    const loaded = await loadWhiteboardForPage(dir, KEY, page, 3);
+    assert.equal(loaded.page, page);
+    assert.deepEqual(loaded.scene, scene);
+    const feedback = await writeWhiteboardFeedbackFilesForPage(dir, KEY, page, 3, {
+      scene,
+      pngDataUrl: PNG_DATA_URL,
+    });
+    assert.deepEqual(JSON.parse(await readFile(feedback.scenePath, "utf8")).elements, scene.elements);
+  });
+});
+
 test("page digest uses the complete canonical page and is collision-resistant for shared prefixes", () => {
   const prefix = `nested/${"x".repeat(300)}`;
   const pageA = `${prefix}-a.html`;

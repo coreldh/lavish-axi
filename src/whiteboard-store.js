@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { normalizePageIdentity } from "./artifact-page.js";
 import { sanitizeWhiteboardScene } from "./whiteboard-core.js";
 
 // Sidecar persistence for whiteboard scenes, kept out of `state.json` on
@@ -20,7 +21,6 @@ import { sanitizeWhiteboardScene } from "./whiteboard-core.js";
 
 const KEY_RE = /^[0-9a-f]{16}$/;
 const INDEX_RE = /^\d{1,3}$/;
-const PAGE_MAX_LENGTH = 4096;
 
 const writeTails = new Map();
 let temporaryFileId = 0;
@@ -76,15 +76,7 @@ function normalizedDiagramIndex(index) {
  * two callers claim different identities for the same on-disk record.
  */
 export function isValidWhiteboardPage(page) {
-  if (typeof page !== "string" || page.length === 0 || page.length > PAGE_MAX_LENGTH) return false;
-  if (page.includes("\0") || page.includes("\\") || page.startsWith("/") || page.startsWith("#")) return false;
-  if (page.includes("?") || page.includes("#")) return false;
-  for (const character of page) {
-    const code = character.codePointAt(0);
-    if (code !== undefined && (code < 0x20 || code === 0x7f)) return false;
-  }
-  const segments = page.split("/");
-  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+  return typeof page === "string" && normalizePageIdentity(page) === page;
 }
 
 function normalizedPage(page) {

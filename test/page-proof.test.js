@@ -28,20 +28,44 @@ test("page proofs bind the session, canonical root, and normalized page", () => 
   assert.equal(normalizePageIdentity("C:\\outside.html"), null);
 });
 
-test("page proof key is durable, owner-only, and concurrent initialization is race-safe", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-"));
-  try {
-    const keys = await Promise.all(Array.from({ length: 16 }, () => loadPageProofKey(root)));
-    const first = await readFile(path.join(root, "page-proof.key"));
-    assert.equal(first.length, 32);
-    for (const key of keys) assert.deepEqual(key, first);
-    assert.equal((await stat(path.join(root, "page-proof.key"))).mode & 0o777, 0o600);
-    assert.equal(await loadPageProofKey(root).then((key) => key.equals(first)), true);
-    assert.equal(await stat(path.join(root, "state.json")).catch(() => null), null);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
+test(
+  "production POSIX page proof key creation is durable, owner-only, and atomic",
+  { skip: process.platform === "win32" },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-"));
+    try {
+      const keys = await Promise.all(Array.from({ length: 16 }, () => loadPageProofKey(root)));
+      const first = await readFile(path.join(root, "page-proof.key"));
+      assert.equal(first.length, 32);
+      for (const key of keys) assert.deepEqual(key, first);
+      assert.equal((await stat(path.join(root, "page-proof.key"))).mode & 0o777, 0o600);
+      assert.equal(await loadPageProofKey(root).then((key) => key.equals(first)), true);
+      assert.deepEqual(await readdir(root), ["page-proof.key"]);
+      assert.equal(await stat(path.join(root, "state.json")).catch(() => null), null);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "production Windows page proof key creation is owner-only and atomic",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-windows-production-"));
+    try {
+      const keys = await Promise.all(Array.from({ length: 16 }, () => loadPageProofKey(root)));
+      const keyFile = path.join(root, "page-proof.key");
+      const first = await readFile(keyFile);
+      assert.equal(first.length, 32);
+      for (const key of keys) assert.deepEqual(key, first);
+      assert.deepEqual(await loadPageProofKey(root), first);
+      assert.deepEqual(await readdir(root), ["page-proof.key"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("an existing corrupt page proof key fails without silent rotation", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-corrupt-"));

@@ -2327,24 +2327,21 @@ export async function serve({
           );
           return;
         }
-        const live = await store.verifyArtifactLoad(req.params.key, artifactLoadToken, revision);
-        if (!live?.valid) {
+        const channel = await store.authenticateWhiteboardChannel(
+          req.params.key,
+          artifactLoadToken,
+          revision,
+          documentSequence,
+        );
+        if (channel?.status !== "authenticated" && channel?.status !== "stale-sequence") {
           res
             .status(409)
             .json({ error: "whiteboard channel artifact context is stale", code: "WHITEBOARD_CHANNEL_STALE" });
           return;
         }
-        // SessionStore owns the same per-load sequence slot used by diagnostics. It is an
-        // intentionally existing live binding, not a second durable proof registry. A channel
-        // sequence can advance that slot (and reset pass ordering) but never move backwards.
-        const activeLoad = store.artifactLoads?.get(req.params.key);
-        if (activeLoad && documentSequence < Number(activeLoad.lastDocumentSequence || 0)) {
+        if (channel.status === "stale-sequence") {
           res.status(409).json({ error: "whiteboard channel document is stale", code: "WHITEBOARD_CHANNEL_SEQUENCE" });
           return;
-        }
-        if (activeLoad && documentSequence > Number(activeLoad.lastDocumentSequence || 0)) {
-          activeLoad.lastDocumentSequence = documentSequence;
-          activeLoad.lastPassSequence = 0;
         }
       }
       res.json({ status: "authenticated" });

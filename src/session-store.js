@@ -451,6 +451,32 @@ export class SessionStore {
     });
   }
 
+  async authenticateWhiteboardChannel(key, artifactLoadToken, artifactRevision, documentSequence) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+      const load = this.artifactLoads.get(key);
+      const revision = parseRevisionValue(artifactRevision);
+      if (
+        !load ||
+        !String(artifactLoadToken || "") ||
+        String(artifactLoadToken) !== load.artifactLoadToken ||
+        revision !== load.artifactRevision
+      ) {
+        return { session, status: "stale" };
+      }
+      if (documentSequence < Number(load.lastDocumentSequence || 0)) {
+        return { session, status: "stale-sequence" };
+      }
+      if (documentSequence > Number(load.lastDocumentSequence || 0)) {
+        load.lastDocumentSequence = documentSequence;
+        load.lastPassSequence = 0;
+      }
+      return { session, status: "authenticated" };
+    });
+  }
+
   // Native navigation inside the artifact does not carry the query string that the chrome adds
   // to the initial iframe URL.  Page routes use this read-only snapshot to stamp the same active
   // generation onto an eligible sibling without minting a second load or weakening the existing
