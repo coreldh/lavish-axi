@@ -2265,7 +2265,7 @@ test("/artifact serves files copied under the artifact directory", async () => {
     const css = await fetch(`${base}/artifact/${session.key}/assets/style.css`);
     const svg = await fetch(`${base}/artifact/${session.key}/assets/icon.svg`);
     const expectedSandbox =
-      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads";
+      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads; frame-ancestors 'self'";
 
     assert.equal(documentResponse.status, 200);
     assert.equal(documentResponse.headers.get("content-security-policy"), expectedSandbox);
@@ -3493,7 +3493,7 @@ test("GET /api/:key/export inlines local assets and leaves remote references int
     assert.equal(exportRes.status, 200);
     assert.equal(
       exportRes.headers.get("content-security-policy"),
-      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads",
+      "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads; frame-ancestors 'self'",
     );
     assert.match(exportRes.headers.get("content-disposition") || "", /attachment; filename="artifact\.export\.html"/);
     const body = await exportRes.text();
@@ -5560,7 +5560,7 @@ test("a disconnect during event-driven feedback take requeues the batch without 
       const feedback = await next.json();
       assert.equal(feedback.status, "feedback");
       assert.equal(feedback.dom_snapshot, queued.domSnapshot);
-      assert.deepEqual(feedback.prompts, [queued.prompts[0]]);
+      assert.deepEqual(feedback.prompts, [{ ...queued.prompts[0], page: path.basename(artifact) }]);
       assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).sessions[key].chat, beforeState.chat);
     } finally {
       await presence.close();
@@ -6426,6 +6426,7 @@ test("the prompts route returns the transcript and syncs it live at send time", 
         role: "user",
         kind: "annotation",
         text: "Rename this",
+        page: path.basename(artifact),
         prompt_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
         anchor: { kind: "element", label: "<h2>", excerpt: "Phase 1: Inventory", selector: "h2#phase-1" },
       },
@@ -6534,7 +6535,7 @@ test("the live transcript carries rendered html for agent replies and never for 
       chat.map(({ at: _at, ...entry }) => entry),
       [
         { role: "agent", text: "Done.\n\n- one\n- two", html: "<p>Done.</p><ul><li>one</li><li>two</li></ul>" },
-        { role: "user", kind: "message", text: "<b>keep</b>" },
+        { role: "user", kind: "message", text: "<b>keep</b>", page: path.basename(artifact) },
       ],
     );
 
