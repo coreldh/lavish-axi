@@ -3190,7 +3190,6 @@ function createWarningRow(warning) {
   meta.appendChild(createWarningChip("Severe", "severity"));
   meta.appendChild(createWarningChip(statusLabel, "status-" + warning.status));
   meta.appendChild(createWarningChip(warning.viewport_label + " · " + warning.viewport_width + "px"));
-  if (warning.page) meta.appendChild(createWarningChip("Page " + warning.page, "page"));
   const seen = warningRelativeTime(warning.last_seen_at);
   if (seen) meta.appendChild(createWarningChip("Seen " + seen));
   body.appendChild(meta);

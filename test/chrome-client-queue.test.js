@@ -2956,7 +2956,7 @@ test("protocol 1 diagnostic and fatal reports carry the accepted page binding", 
   assert.equal(failure.body.document_sequence, 1);
 });
 
-test("protocol 1 warning rows disclose their page and reveal only on the current page", async () => {
+test("protocol 1 warning rows omit page indicators and reveal only on the current page", async () => {
   const binding = {
     page: "page-b.html",
     proof: "proof-b",
@@ -2980,10 +2980,21 @@ test("protocol 1 warning rows disclose their page and reveal only on the current
   assert.equal(chrome.warningRows().length, 0, "another page's warnings stay hidden");
 
   chrome.eventSource().listeners.get("layout-warnings")({
-    data: JSON.stringify({ warnings: [warningPayload({ page: "page-b.html" })] }),
+    data: JSON.stringify({
+      warnings: [warningPayload({ id: "wa", page: "page-a.html" }), warningPayload({ id: "wb", page: "page-b.html" })],
+    }),
   });
   const row = chrome.warningRows()[0];
   const body = row.children[1];
+  const chips = body.children.find((child) => child.className === "warning-meta").children;
+  assert.equal(
+    chips.some((chip) => chip.className.split(" ").includes("page")),
+    false,
+  );
+  assert.equal(
+    chips.some((chip) => /page-[ab]\.html/.test(chip.textContent)),
+    false,
+  );
   const actions = body.children.at(-1);
   assert.equal(actions.children[0].textContent, "Reveal");
   actions.children[0].click();
@@ -2991,6 +3002,49 @@ test("protocol 1 warning rows disclose their page and reveal only on the current
   const reveal = chrome.modernPostedToFrame.at(-1);
   assert.equal(reveal.type, "lavish:revealElement");
   assert.equal(reveal.page, "page-b.html");
+
+  const a = {
+    ...binding,
+    page: "page-a.html",
+    proof: "proof-a",
+    route: "page-a.html",
+    destination: "/artifact/abc/page-a.html",
+    documentId: "document-a",
+  };
+  chrome.updateModernBinding(a);
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: a.documentId });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.warningRows().length, 1);
+  const aRow = chrome.warningRows()[0];
+  assert.equal(aRow.dataset.warningId, "wa");
+  const aChips = aRow.children[1].children.find((child) => child.className === "warning-meta").children;
+  assert.equal(
+    aChips.some((chip) => /page-[ab]\.html/.test(chip.textContent)),
+    false,
+  );
+  aRow.children[1].children.at(-1).children[0].click();
+  await flushPromises();
+  assert.equal(chrome.modernPostedToFrame.at(-1).page, "page-a.html");
+});
+
+test("legacy warning rows keep severity status and viewport metadata without a page chip", async () => {
+  const chrome = await createChromeHarness();
+  const warning = warningPayload({ page: "legacy-entry.html" });
+  chrome.eventSource().listeners.get("layout-warnings")({ data: JSON.stringify({ warnings: [warning] }) });
+  const body = chrome.warningRows()[0].children[1];
+  const chips = body.children.find((child) => child.className === "warning-meta").children;
+  assert.deepEqual(
+    chips.slice(0, 3).map((chip) => chip.textContent),
+    ["Severe", warning.status_label, warning.viewport_label + " · " + warning.viewport_width + "px"],
+  );
+  assert.equal(
+    chips.some((chip) => chip.textContent.includes("legacy-entry.html")),
+    false,
+  );
+  assert.equal(body.children.at(-1).children[0].textContent, "Reveal");
+  const source = await readFile(sourceUrl, "utf8");
+  assert.doesNotMatch(source, /createWarningChip\("Page "\s*\+\s*warning\.page/);
 });
 
 test("protocol 1 rejects a heterogeneous warning preparation response", async () => {
