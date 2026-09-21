@@ -46,6 +46,31 @@ test("artifact page resolution accepts same-root html files and rejects traversa
   }
 });
 
+test("dot-prefixed in-root names are not parent traversal, including the exact saved entry", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-dot-prefix-"));
+  try {
+    await mkdir(path.join(root, "..pages"));
+    for (const page of ["..report.html", "..pages/page.html"]) {
+      await writeFile(path.join(root, page), "<!doctype html><p>inside</p>");
+      assert.equal((await resolveArtifactPage(root, page)).reason, "ok");
+    }
+    assert.equal(
+      (await resolveArtifactPage(root, "..report.html", { entryFile: "..report.html" })).page,
+      "..report.html",
+    );
+    for (const page of [
+      "../outside.html",
+      "..\\outside.html",
+      "..pages/../../outside.html",
+      "..pages\\..\\..\\outside.html",
+    ]) {
+      assert.equal((await resolveArtifactPage(root, page)).reason, "forbidden");
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("artifact page resolution accepts internal aliases and rejects escaping links", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-artifact-page-"));
   const outside = await mkdtemp(path.join(tmpdir(), "lavish-artifact-page-outside-"));

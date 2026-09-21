@@ -361,7 +361,7 @@ export async function resolveArtifactPage(root, assetPath, { entryFile = "", sta
   const lexicalRoot = path.resolve(root);
   const lexicalFile = path.resolve(lexicalRoot, assetPath);
   const lexicalRelative = path.relative(lexicalRoot, lexicalFile);
-  if (lexicalRelative.startsWith("..") || path.isAbsolute(lexicalRelative)) {
+  if (lexicalRelative === ".." || lexicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(lexicalRelative)) {
     return result(null, "forbidden");
   }
 

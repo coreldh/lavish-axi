@@ -583,6 +583,7 @@ export async function serve({
       });
     }
     delete publicResult.snapshot_page_proof;
+    delete publicResult.feedback_batch;
     return publicResult;
   }
 
@@ -610,6 +611,7 @@ export async function serve({
           snapshot_page: result.snapshot_page ?? null,
           snapshot_page_proof: result.snapshot_page_proof || "",
           prompts,
+          ...(result.feedback_batch ? { feedback_batch: result.feedback_batch } : {}),
           ...(Array.isArray(result.artifact_failures) ? { artifact_failures: result.artifact_failures } : {}),
         },
         {
@@ -3515,7 +3517,7 @@ function optionalBodyString(value) {
 export async function resolveArtifactAsset(root, assetPath) {
   const file = path.resolve(root, assetPath);
   const relative = path.relative(root, file);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     return null;
   }
   let real;

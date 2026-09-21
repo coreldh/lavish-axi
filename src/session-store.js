@@ -130,6 +130,7 @@ export class SessionStore {
       status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
       pending_prompts: existing.pending_prompts || 0,
       prompts: existingPrompts,
+      ...(Array.isArray(existing.feedback_batches) ? { feedback_batches: existing.feedback_batches } : {}),
       // The warning inbox is durable review state, not deliverable feedback: reopening a session
       // must never silently drop unresolved warnings the user has not triaged yet.
       layout_warnings: normalizeStoredWarnings(existing.layout_warnings),
@@ -154,6 +155,7 @@ export class SessionStore {
       chat_ack_ids: Array.isArray(existing.chat_ack_ids) ? existing.chat_ack_ids : [],
       updated_at: new Date().toISOString(),
     };
+    if (Array.isArray(session.feedback_batches)) syncFeedbackBatches(session);
     state.sessions[key] = session;
     await this.writeState(state);
     return session;
@@ -221,6 +223,17 @@ export class SessionStore {
       ? await options.validatePromptContext(normalizedPrompts, payload, session)
       : { ok: true };
     if (!contextValidation?.ok) return contextValidation?.result || { invalid_page_context: true };
+    const modernBatch = Number(payload?.page_protocol) === 1 || (restoring && payload?.feedback_batch?.modern === true);
+    if (!restoring && modernBatch && normalizedPrompts.length) {
+      const page = normalizeStoredPage(normalizedPrompts[0]?.page);
+      if (
+        page === null ||
+        normalizedPrompts.some((prompt) => normalizeStoredPage(prompt.page) !== page) ||
+        (String(payload.domSnapshot || payload.dom_snapshot || "") &&
+          normalizeStoredPage(payload.snapshot_page) !== page)
+      )
+        return { invalid_page_context: true };
+    }
     if (!restoring) {
       const warningContextValidation = validateLayoutWarningClaims(
         session.layout_warnings,
@@ -312,11 +325,39 @@ export class SessionStore {
     // prevents a legacy state file (or a future restore caller) from reintroducing page proofs
     // into the next poll response.
     const storedPrompts = acceptedPrompts.map(agentFacingPrompt);
-    session.prompts = restoring ? [...storedPrompts, ...existingPrompts] : [...existingPrompts, ...storedPrompts];
+    const batched = modernBatch || Array.isArray(session.feedback_batches);
+    if (batched) {
+      const failures = restoring ? normalizeArtifactFailures(payload.artifact_failures) : [];
+      if (storedPrompts.length || failures.length) {
+        const page = normalizeStoredPage(
+          (restoring ? payload?.feedback_batch?.page : undefined) ?? storedPrompts[0]?.page ?? failures[0]?.page,
+        );
+        appendFeedbackBatch(
+          session,
+          {
+            id: restoring ? String(payload?.feedback_batch?.id || crypto.randomUUID()) : crypto.randomUUID(),
+            modern: modernBatch,
+            page,
+            prompts: storedPrompts,
+            artifact_failures: failures,
+            dom_snapshot: String(payload.domSnapshot || payload.dom_snapshot || ""),
+            snapshot_page: normalizeStoredPage(payload.snapshot_page),
+            snapshot_page_proof: String(payload.snapshot_page_proof || ""),
+            snapshot_updated:
+              restoring && typeof payload?.feedback_batch?.snapshot_updated === "boolean"
+                ? payload.feedback_batch.snapshot_updated
+                : storedPrompts.length > 0 || Boolean(payload.domSnapshot || payload.dom_snapshot),
+          },
+          { restore: restoring },
+        );
+      }
+    } else {
+      session.prompts = restoring ? [...storedPrompts, ...existingPrompts] : [...existingPrompts, ...storedPrompts];
+    }
     session.chat = [...(session.chat || []), ...userMessages];
     applyTranscriptBound(session);
     if (userMessages.length > 0) session.chat_revision = normalizeRevision(session.chat_revision) + 1;
-    if (restoring) {
+    if (restoring && !batched) {
       const restoredFailures = normalizeArtifactFailures(payload.artifact_failures);
       const existingFailures = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
       session.artifact_failures = mergeArtifactFailures(restoredFailures, existingFailures).failures;
@@ -325,7 +366,7 @@ export class SessionStore {
     const restoredSnapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
     const restoredSnapshotPage = normalizeStoredPage(payload.snapshot_page);
     const restoredSnapshotProof = String(payload.snapshot_page_proof || "");
-    if (!restoring || (existingPrompts.length === 0 && !session.dom_snapshot)) {
+    if (!batched && (!restoring || (existingPrompts.length === 0 && !session.dom_snapshot))) {
       session.dom_snapshot = restoredSnapshot;
       session.snapshot_page = restoredSnapshot ? restoredSnapshotPage : null;
       session.snapshot_page_proof = restoredSnapshot ? restoredSnapshotProof : "";
@@ -334,7 +375,7 @@ export class SessionStore {
       shouldEndSession || alreadyEnded
         ? "ended"
         : session.prompts.length > 0 ||
-            (restoring && Array.isArray(session.artifact_failures) && session.artifact_failures.length > 0)
+            ((restoring || batched) && Array.isArray(session.artifact_failures) && session.artifact_failures.length > 0)
           ? "feedback"
           : "open";
     if (shouldEndSession) session.ended_by = "user";
@@ -673,7 +714,41 @@ export class SessionStore {
         load.lastDocumentSequence = documentSequence.value;
         load.lastPassSequence = 0;
       }
+      const modernBatch = Number(payload?.page_protocol) === 1;
+      if (modernBatch && pageContext.page === null)
+        return { session, changed: false, stale: true, invalid_page_context: true };
       const normalized = normalizeArtifactFailures(payload?.failures, pageContext.page);
+      if (modernBatch || Array.isArray(session.feedback_batches)) {
+        ensureFeedbackBatches(session);
+        // Repeated diagnostics must not resurrect the same pending observation in
+        // a later batch merely because navigation moved away and returned.
+        const fresh = normalized.filter(
+          (failure) =>
+            !session.artifact_failures.some(
+              (old) => old.page === failure.page && old.kind === failure.kind && old.detail === failure.detail,
+            ),
+        );
+        if (!fresh.length) return { session, changed: false, failures: session.artifact_failures };
+        appendFeedbackBatch(
+          session,
+          {
+            id: crypto.randomUUID(),
+            modern: modernBatch,
+            page: pageContext.page,
+            prompts: [],
+            artifact_failures: fresh,
+            dom_snapshot: "",
+            snapshot_page: null,
+            snapshot_page_proof: "",
+            snapshot_updated: false,
+          },
+          { keepSnapshot: true },
+        );
+        if (session.status !== "ended") session.status = "feedback";
+        session.updated_at = new Date().toISOString();
+        await this.writeState(state);
+        return { session, changed: true, failures: session.artifact_failures };
+      }
       const previous = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
       const { failures, changed } = mergeArtifactFailures(previous, normalized);
       if (!changed) {
@@ -719,10 +794,15 @@ export class SessionStore {
       }
       // Prompts queued before the session ended (a browser send-and-end) must still reach the
       // agent, so deliver them before reporting the ended state; the next poll then sees ended.
-      const prompts = session.prompts || [];
+      const batch = Array.isArray(session.feedback_batches) ? session.feedback_batches[0] : null;
+      const prompts = batch ? batch.prompts : session.prompts || [];
       // Layout warnings stay passive until the user queues them. Only fatal artifact
       // failures can reach the agent without explicit user action.
-      const artifactFailures = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
+      const artifactFailures = batch
+        ? batch.artifact_failures
+        : Array.isArray(session.artifact_failures)
+          ? session.artifact_failures
+          : [];
       const alreadyEnded = session.status === "ended";
       if (prompts.length === 0 && artifactFailures.length === 0) {
         return alreadyEnded ? { status: "ended", ended_by: session.ended_by } : { status: "waiting" };
@@ -734,7 +814,19 @@ export class SessionStore {
         snapshot_page_proof: session.dom_snapshot ? String(session.snapshot_page_proof || "") : "",
         prompts: prompts.map(agentFacingPrompt),
         ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
-        ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
+        ...(batch
+          ? {
+              feedback_batch: {
+                id: batch.id,
+                page: batch.page,
+                modern: batch.modern,
+                snapshot_updated: batch.snapshot_updated,
+              },
+            }
+          : {}),
+        ...(alreadyEnded && (!batch || session.feedback_batches.length === 1)
+          ? { session_ended: true, ended_by: session.ended_by }
+          : {}),
       };
       // Delivery clears pending prompts, so retain the attachment ids for a bounded
       // grace window while the polling agent opens the absolute paths it received.
@@ -758,14 +850,19 @@ export class SessionStore {
       const current = [...deliveredIds].map((id) => ({ id, at: deliveredNow }));
       const historyRoom = Math.max(0, MAX_DELIVERED_ATTACHMENTS - current.length);
       session.delivered_attachments = [...carried.slice(-historyRoom), ...current];
-      session.prompts = [];
-      session.artifact_failures = [];
-      session.pending_prompts = 0;
-      session.dom_snapshot = "";
-      session.snapshot_page = null;
-      session.snapshot_page_proof = "";
+      if (batch) {
+        session.feedback_batches.shift();
+        syncFeedbackBatches(session);
+      } else {
+        session.prompts = [];
+        session.artifact_failures = [];
+        session.pending_prompts = 0;
+        session.dom_snapshot = "";
+        session.snapshot_page = null;
+        session.snapshot_page_proof = "";
+      }
       if (!alreadyEnded) {
-        session.status = "open";
+        session.status = session.prompts.length || session.artifact_failures.length ? "feedback" : "open";
       }
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
@@ -856,6 +953,18 @@ export class SessionStore {
       for (const session of Object.values(state.sessions)) {
         if (!session || typeof session !== "object" || Array.isArray(session)) continue;
         const migrated = migrateLegacySession(session);
+        // Upgrade old aggregate multi-page queues before their first poll, even
+        // if no new browser submission arrives after this server restarts.
+        const pages = new Set(
+          [...(session.prompts || []), ...(session.artifact_failures || [])]
+            .map((item) => normalizeStoredPage(item.page))
+            .filter((page) => page !== null),
+        );
+        if (!Array.isArray(session.feedback_batches) && pages.size > 1) {
+          ensureFeedbackBatches(session);
+          changed = true;
+        }
+        if (Array.isArray(session.feedback_batches)) syncFeedbackBatches(session);
         const bounded = applyTranscriptBound(session);
         if (migrated || bounded) {
           if (bounded) session.chat_revision = normalizeRevision(session.chat_revision) + 1;
@@ -884,6 +993,99 @@ export async function canonicalFile(file) {
 
 export function sessionKey(file) {
   return crypto.createHash("sha256").update(file).digest("hex").slice(0, 16);
+}
+
+// Once present, feedback_batches owns delivery. Flat fields are compatibility
+// projections for status, attachment retention and the existing restore audit;
+// they are never drained independently of the FIFO.
+function syncFeedbackBatches(session) {
+  const batches = session.feedback_batches;
+  session.prompts = batches.flatMap((batch) => batch.prompts);
+  session.artifact_failures = batches.flatMap((batch) => batch.artifact_failures);
+  session.pending_prompts = session.prompts.length;
+  const first = batches[0];
+  session.dom_snapshot = first?.dom_snapshot || "";
+  session.snapshot_page = session.dom_snapshot ? normalizeStoredPage(first.snapshot_page) : null;
+  session.snapshot_page_proof = session.dom_snapshot ? String(first.snapshot_page_proof || "") : "";
+  if (session.status !== "ended") session.status = batches.length ? "feedback" : "open";
+}
+
+function ensureFeedbackBatches(session) {
+  if (Array.isArray(session.feedback_batches)) return;
+  const batches = [];
+  const makeBatch = (page) => ({
+    id: crypto.randomUUID(),
+    modern: false,
+    page,
+    prompts: [],
+    artifact_failures: [],
+    dom_snapshot: "",
+    snapshot_page: null,
+    snapshot_page_proof: "",
+    snapshot_updated: false,
+  });
+  // Legacy aggregate state did not record cross-channel arrival order. Preserve
+  // prompt order, attach each failure to its last matching page batch, and keep
+  // the one recoverable snapshot only on its recorded page; invent no context.
+  for (const prompt of session.prompts || []) {
+    const page = normalizeStoredPage(prompt.page);
+    if (!batches.length || batches.at(-1).page !== page) batches.push(makeBatch(page));
+    batches.at(-1).prompts.push(prompt);
+  }
+  for (const failure of session.artifact_failures || []) {
+    const page = normalizeStoredPage(failure.page);
+    let batch = batches.findLast((candidate) => candidate.page === page);
+    if (!batch) {
+      batch = makeBatch(page);
+      batches.push(batch);
+    }
+    batch.artifact_failures.push(failure);
+  }
+  const snapshotBatch = batches.findLast((batch) => batch.page === normalizeStoredPage(session.snapshot_page));
+  if (snapshotBatch && session.dom_snapshot) {
+    snapshotBatch.dom_snapshot = session.dom_snapshot;
+    snapshotBatch.snapshot_page = session.snapshot_page;
+    snapshotBatch.snapshot_page_proof = session.snapshot_page_proof || "";
+    snapshotBatch.snapshot_updated = true;
+  }
+  session.feedback_batches = batches;
+  syncFeedbackBatches(session);
+}
+
+function appendFeedbackBatch(session, incoming, { restore = false, keepSnapshot = false } = {}) {
+  ensureFeedbackBatches(session);
+  const batches = session.feedback_batches;
+  if (restore && batches.some((batch) => batch.id === incoming.id)) return;
+  const tail = batches.at(-1);
+  // Coalescing only the adjacent tail preserves A -> B -> A arrival order.
+  if (!restore && tail && tail.page === incoming.page && tail.modern === incoming.modern) {
+    tail.prompts.push(...incoming.prompts);
+    tail.artifact_failures = mergeArtifactFailures(tail.artifact_failures, incoming.artifact_failures).failures;
+    if (!keepSnapshot) {
+      tail.dom_snapshot = incoming.dom_snapshot;
+      tail.snapshot_page = incoming.dom_snapshot ? incoming.snapshot_page : null;
+      tail.snapshot_page_proof = incoming.dom_snapshot ? incoming.snapshot_page_proof : "";
+      tail.snapshot_updated = incoming.snapshot_updated;
+    }
+  } else if (restore) {
+    const first = batches[0];
+    if (first && first.page === incoming.page && first.modern === incoming.modern) {
+      // No intervening page: restore earlier writing before the newer same-page
+      // work, while its latest snapshot (including an explicit clear) wins.
+      first.prompts.unshift(...incoming.prompts);
+      first.artifact_failures = mergeArtifactFailures(incoming.artifact_failures, first.artifact_failures).failures;
+      // Diagnostics do not clear snapshots. Distinguish their lack of context
+      // from a newer prompt submission that explicitly cleared its snapshot.
+      if (!first.snapshot_updated && incoming.snapshot_updated) {
+        first.dom_snapshot = incoming.dom_snapshot;
+        first.snapshot_page = incoming.snapshot_page;
+        first.snapshot_page_proof = incoming.snapshot_page_proof;
+        first.snapshot_updated = true;
+      }
+      first.id = incoming.id;
+    } else batches.unshift(incoming);
+  } else batches.push(incoming);
+  syncFeedbackBatches(session);
 }
 
 /**
@@ -1431,7 +1633,7 @@ async function validateLivePageContext(session, payload, options) {
 
 const ARTIFACT_FAILURE_KINDS = new Set(["artifact-unavailable", "artifact-asset-unavailable"]);
 
-// The single merge policy for `session.artifact_failures`, shared by both writers that add to it
+// The single merge policy for legacy failures and each FIFO page batch, shared by both writers
 // (a fresh report and a closed-poll restore), which is why `earlier` is always the chronologically
 // older side. A repeat of a failure already on file is not a second failure, and the list stays
 // bounded because state.json is rewritten wholesale.

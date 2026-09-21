@@ -483,6 +483,9 @@ test("artifact assets resolve within the artifact directory", async () => {
   const root = path.resolve("/tmp/lavish-artifact");
 
   assert.equal(await resolveArtifactAsset(root, "style.css"), path.join(root, "style.css"));
+  assert.equal(await resolveArtifactAsset(root, "..style.css"), path.join(root, "..style.css"));
+  assert.equal(await resolveArtifactAsset(root, "..assets/style.css"), path.join(root, "..assets/style.css"));
+  assert.equal(await resolveArtifactAsset(root, "..assets/../../secret.txt"), null);
   assert.equal(await resolveArtifactAsset(root, "../secret.txt"), null);
 });
 
