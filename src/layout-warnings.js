@@ -143,12 +143,9 @@ export function describeLayoutWarning(warning) {
   const explanation = description
     ? description.explain(normalized)
     : `The browser proved a severe layout failure on this element${normalized.overflowPx ? ` (${pxText(normalized.overflowPx)})` : ""}.`;
-  const page = normalizeWarningPage(warning?.page);
   return {
     title: description?.title || "Layout failure",
-    // Keep the existing title and controls intact while making the existing explanatory text
-    // self-contained when several pages are in the inbox.
-    explanation: `${page ? `Page ${page}` : "Page unavailable"}: ${explanation}`,
+    explanation,
   };
 }
 

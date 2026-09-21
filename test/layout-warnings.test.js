@@ -397,6 +397,21 @@ test("stored records describe their real magnitude, not a zero", () => {
   assert.match(warning.explanation, /bottom edge/);
 });
 
+test("warning descriptions omit page disclosure while serialized and queued attribution remains intact", () => {
+  const [detected] = detect([CLIPPED], { revision: 1, viewportWidth: 390 });
+  for (const page of ["a.html", "sub/b.html", null]) {
+    const record = { ...detected, page };
+    const [warning] = serializeLayoutWarnings([record]);
+    assert.equal(warning.page, page);
+    assert.doesNotMatch(warning.explanation, /Page unavailable|a\.html|sub\/b\.html/);
+    assert.match(warning.explanation, /27px/);
+    assert.match(warning.explanation, /bottom edge/);
+    const queued = layoutWarningPromptPayload([record]);
+    assert.equal(queued.target.warnings[0].page, page);
+    assert.match(queued.prompt, /27px/);
+  }
+});
+
 test("serialized warnings carry everything the drawer renders", () => {
   const detected = detect([CLIPPED], { revision: 1, viewportWidth: 390 });
   const [warning] = serializeLayoutWarnings(detected);

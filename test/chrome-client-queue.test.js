@@ -5,6 +5,7 @@ import vm from "node:vm";
 
 import { chatEntryForPrompt } from "../src/chat-messages.js";
 import { createChromeHtml } from "../src/server.js";
+import { serializeLayoutWarning } from "../src/layout-warnings.js";
 
 const sourceUrl = new URL("../src/chrome-client.js", import.meta.url);
 
@@ -2855,6 +2856,10 @@ function diagnosticsHarness(warningsByCall) {
   };
 }
 
+function renderedWarningText(element) {
+  return [element.textContent || "", ...element.children.map(renderedWarningText)].join(" ");
+}
+
 test("chrome client posts a completed diagnostic pass and never queues feedback from it", async () => {
   const { posts, fetchImpl } = diagnosticsHarness([[warningPayload()]]);
   const chrome = await createChromeHarness({ fetchImpl });
@@ -2975,17 +2980,22 @@ test("protocol 1 warning rows omit page indicators and reveal only on the curren
   await flushPromises();
 
   chrome.eventSource().listeners.get("layout-warnings")({
-    data: JSON.stringify({ warnings: [warningPayload({ page: "page-a.html" })] }),
+    data: JSON.stringify({ warnings: [serializeLayoutWarning(warningPayload({ page: "page-a.html" }))] }),
   });
   assert.equal(chrome.warningRows().length, 0, "another page's warnings stay hidden");
 
   chrome.eventSource().listeners.get("layout-warnings")({
     data: JSON.stringify({
-      warnings: [warningPayload({ id: "wa", page: "page-a.html" }), warningPayload({ id: "wb", page: "page-b.html" })],
+      warnings: [
+        serializeLayoutWarning(warningPayload({ id: "wa", page: "page-a.html" })),
+        serializeLayoutWarning(warningPayload({ id: "wb", page: "page-b.html" })),
+      ],
     }),
   });
   const row = chrome.warningRows()[0];
   const body = row.children[1];
+  assert.doesNotMatch(renderedWarningText(row), /page-[ab]\.html|Page unavailable/);
+  assert.match(renderedWarningText(row), /18px wider than the 720px viewport/);
   const chips = body.children.find((child) => child.className === "warning-meta").children;
   assert.equal(
     chips.some((chip) => chip.className.split(" ").includes("page")),
@@ -3018,6 +3028,8 @@ test("protocol 1 warning rows omit page indicators and reveal only on the curren
   assert.equal(chrome.warningRows().length, 1);
   const aRow = chrome.warningRows()[0];
   assert.equal(aRow.dataset.warningId, "wa");
+  assert.doesNotMatch(renderedWarningText(aRow), /page-[ab]\.html|Page unavailable/);
+  assert.match(renderedWarningText(aRow), /18px wider than the 720px viewport/);
   const aChips = aRow.children[1].children.find((child) => child.className === "warning-meta").children;
   assert.equal(
     aChips.some((chip) => /page-[ab]\.html/.test(chip.textContent)),
@@ -3026,25 +3038,37 @@ test("protocol 1 warning rows omit page indicators and reveal only on the curren
   aRow.children[1].children.at(-1).children[0].click();
   await flushPromises();
   assert.equal(chrome.modernPostedToFrame.at(-1).page, "page-a.html");
+
+  const back = { ...binding, documentId: "document-b-back" };
+  chrome.updateModernBinding(back);
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: back.documentId });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.warningRows().length, 1);
+  assert.equal(chrome.warningRows()[0].dataset.warningId, "wb");
+  assert.doesNotMatch(renderedWarningText(chrome.warningRows()[0]), /page-[ab]\.html|Page unavailable/);
+  assert.match(renderedWarningText(chrome.warningRows()[0]), /18px wider than the 720px viewport/);
 });
 
-test("legacy warning rows keep severity status and viewport metadata without a page chip", async () => {
+test("legacy warning rows keep useful metadata without page paths or unavailable indicators", async () => {
   const chrome = await createChromeHarness();
-  const warning = warningPayload({ page: "legacy-entry.html" });
-  chrome.eventSource().listeners.get("layout-warnings")({ data: JSON.stringify({ warnings: [warning] }) });
-  const body = chrome.warningRows()[0].children[1];
-  const chips = body.children.find((child) => child.className === "warning-meta").children;
-  assert.deepEqual(
-    chips.slice(0, 3).map((chip) => chip.textContent),
-    ["Severe", warning.status_label, warning.viewport_label + " · " + warning.viewport_width + "px"],
-  );
-  assert.equal(
-    chips.some((chip) => chip.textContent.includes("legacy-entry.html")),
-    false,
-  );
-  assert.equal(body.children.at(-1).children[0].textContent, "Reveal");
-  const source = await readFile(sourceUrl, "utf8");
-  assert.doesNotMatch(source, /createWarningChip\("Page "\s*\+\s*warning\.page/);
+  for (const page of ["legacy-entry.html", null]) {
+    const warning = serializeLayoutWarning(warningPayload({ page }));
+    chrome.eventSource().listeners.get("layout-warnings")({ data: JSON.stringify({ warnings: [warning] }) });
+    const body = chrome.warningRows()[0].children[1];
+    assert.doesNotMatch(renderedWarningText(chrome.warningRows()[0]), /legacy-entry\.html|Page unavailable/);
+    assert.match(renderedWarningText(chrome.warningRows()[0]), /18px wider than the 720px viewport/);
+    const chips = body.children.find((child) => child.className === "warning-meta").children;
+    assert.deepEqual(
+      chips.slice(0, 3).map((chip) => chip.textContent),
+      ["Severe", warning.status_label, warning.viewport_label + " · " + warning.viewport_width + "px"],
+    );
+    assert.equal(
+      chips.some((chip) => chip.textContent.includes("legacy-entry.html")),
+      false,
+    );
+    assert.equal(body.children.at(-1).children[0].textContent, "Reveal");
+  }
 });
 
 test("protocol 1 rejects a heterogeneous warning preparation response", async () => {
