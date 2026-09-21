@@ -262,9 +262,10 @@ function bootSdk({
   };
 }
 
-function nextPortMessage(port) {
+function nextPortMessage(port, type = "") {
   return new Promise((resolve) => {
     const handler = (event) => {
+      if (type && event.data?.type !== type) return;
       port.removeEventListener("message", handler);
       resolve(event.data);
     };
@@ -310,17 +311,20 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
     ports: [first.port2],
   });
   const firstResponse = await firstResponsePromise;
+  const firstRevisionsPromise = nextPortMessage(first.port1, "lavish:revisions");
   first.port1.postMessage({
     ...firstResponse,
     type: "lavish:activate",
     document_sequence: 1,
     historical_destination_receipt: "receipt-before-bfcache",
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  const revisions = await firstRevisionsPromise;
+  assert.equal(revisions.page, "sub/page.html");
+  assert.equal(revisions.document_sequence, 1);
   const clickListeners = sdk.documentListenerCount("click");
   assert.ok(clickListeners > 0, "the accepted document installs the full SDK once");
 
-  const departingPromise = nextPortMessage(first.port1);
+  const departingPromise = nextPortMessage(first.port1, "lavish:documentDeparting");
   sdk.dispatchWindowEvent("pagehide");
   const departing = await departingPromise;
   assert.equal(departing.type, "lavish:documentDeparting");
@@ -351,7 +355,7 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sdk.documentListenerCount("click"), clickListeners, "rebind does not duplicate the SDK");
 
-  const snapshotPromise = nextPortMessage(second.port1);
+  const snapshotPromise = nextPortMessage(second.port1, "lavish:snapshot");
   second.port1.postMessage({
     type: "lavish:requestSnapshot",
     snapshot_request_id: "after-bfcache",
@@ -393,15 +397,18 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   });
   const response = await responsePromise;
   assert.equal(response.destination, "/artifact/abc/sub/page.html?view=full#notes");
+  const revisionsPromise = nextPortMessage(channel.port1, "lavish:revisions");
   channel.port1.postMessage({
     ...response,
     type: "lavish:activate",
     document_sequence: 7,
     historical_destination_receipt: "receipt-initial",
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  const revisions = await revisionsPromise;
+  assert.equal(revisions.page, "sub/page.html");
+  assert.equal(revisions.document_sequence, 7);
 
-  const destinationPromise = nextPortMessage(channel.port1);
+  const destinationPromise = nextPortMessage(channel.port1, "lavish:documentDestination");
   sdk.dispatchWindowEvent("hashchange");
   const destination = await destinationPromise;
   assert.deepEqual(
@@ -426,7 +433,7 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   );
 
   sdk.setLocation({ hash: "#other" });
-  const unknownDestinationPromise = nextPortMessage(channel.port1);
+  const unknownDestinationPromise = nextPortMessage(channel.port1, "lavish:documentDestination");
   sdk.dispatchWindowEvent("hashchange");
   const unknownDestination = await unknownDestinationPromise;
   assert.equal(unknownDestination.historical_destination_receipt, undefined);
@@ -440,13 +447,13 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   });
   await new Promise((resolve) => setImmediate(resolve));
   sdk.setLocation({ hash: "#notes" });
-  const restoredDestinationPromise = nextPortMessage(channel.port1);
+  const restoredDestinationPromise = nextPortMessage(channel.port1, "lavish:documentDestination");
   sdk.dispatchWindowEvent("popstate");
   const restoredDestination = await restoredDestinationPromise;
   assert.equal(restoredDestination.historical_destination_receipt, undefined);
   assert.equal(restoredDestination.destination, "/artifact/abc/sub/page.html?view=full#notes");
   sdk.setLocation({ hash: "#other" });
-  const otherDestinationPromise = nextPortMessage(channel.port1);
+  const otherDestinationPromise = nextPortMessage(channel.port1, "lavish:documentDestination");
   sdk.dispatchWindowEvent("popstate");
   const otherDestination = await otherDestinationPromise;
   assert.equal(otherDestination.historical_destination_receipt, undefined);
@@ -467,7 +474,7 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   ];
   const change = input.listeners.find((listener) => listener.type === "change");
   assert.ok(change, "the emitted SDK wires the attachment picker");
-  const uploadPromise = nextPortMessage(channel.port1);
+  const uploadPromise = nextPortMessage(channel.port1, "lavish:uploadAttachment");
   change.handler();
   const upload = await uploadPromise;
   assert.equal(upload.type, "lavish:uploadAttachment");
@@ -491,7 +498,7 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
     id: "stored-image",
   });
   await new Promise((resolve) => setImmediate(resolve));
-  const queuedPromise = nextPortMessage(channel.port1);
+  const queuedPromise = nextPortMessage(channel.port1, "lavish:queuePrompt");
   card.querySelector("textarea").value = "Review scoped upload";
   card.querySelector(".lavish-send").onclick();
   const queued = await queuedPromise;

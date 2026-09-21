@@ -221,6 +221,110 @@ test(
 );
 
 test(
+  "352 real SDK fatal failures on A then B deliver separate flagless page batches",
+  { skip: !runBrowserE2e, timeout: 180_000 },
+  async () => {
+    const temp = await mkdtemp(path.join(tmpdir(), "lavish-352-fatal-fifo-"));
+    const entry = path.join(temp, "a.html");
+    const port = await freePort();
+    const stateDir = path.join(temp, "state");
+    const env = {
+      LAVISH_AXI_PORT: String(port),
+      LAVISH_AXI_STATE_DIR: stateDir,
+      LAVISH_AXI_NO_OPEN: "1",
+      LAVISH_AXI_TELEMETRY: "0",
+      LAVISH_AXI_HOST: "127.0.0.1",
+      LAVISH_AXI_LINK_HOST: "127.0.0.1",
+    };
+    const chromeEnv = {
+      CHROME_DEVTOOLS_AXI_SESSION: `lavish-fatal-fifo-${process.pid}`,
+      CHROME_DEVTOOLS_AXI_USER_DATA_DIR: path.join(temp, "chrome"),
+    };
+    const cli = path.join(repoRoot, "dist", "cli.mjs");
+    const browser = (...args) => run("chrome-devtools-axi", args, chromeEnv);
+    const state = async () => JSON.parse(await readFile(path.join(stateDir, "state.json"), "utf8"));
+    try {
+      for (const page of ["a", "b"])
+        await writeFile(
+          path.join(temp, page + ".html"),
+          `<!doctype html><body><button onclick="const image=document.createElement('img'); image.src='missing-${page}.png'; document.body.append(image)">Fail ${page.toUpperCase()}</button><a href="b.html">Go B</a></body>`,
+        );
+      const opened = run(process.execPath, [cli, entry, "--no-open"], env);
+      const url = opened.match(/url:\s*"([^"]+)"/)?.[1];
+      assert.ok(url, opened);
+      const key = new URL(url).pathname.split("/").at(-1);
+      browser("open", url);
+      await eventually(
+        async () => browser("eval", "() => currentArtifactBinding?.page"),
+        (text) => text.includes("a.html"),
+        "A did not bind",
+      );
+      browser(
+        "eval",
+        `() => {
+        annotation = false; postToFrame({type:'lavish:setAnnotationMode', enabled:false});
+        window.__fatalReports = []; const original = window.fetch;
+        window.fetch = function(url, init) {
+          if (String(url).endsWith('/artifact-failures')) window.__fatalReports.push(JSON.parse(init.body));
+          return original.apply(this, arguments);
+        }; return true;
+      }`,
+      );
+      const click = (label) => {
+        const line = browser("snapshot")
+          .split("\n")
+          .find((line) => line.includes(label));
+        assert.ok(line, label);
+        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+      };
+      click("Fail A");
+      await eventually(
+        state,
+        (value) => value.sessions[key].artifact_failures.some((failure) => failure.page === "a.html"),
+        "A failure did not reach store",
+      );
+      click("Go B");
+      await eventually(
+        async () => browser("eval", "() => currentArtifactBinding?.page"),
+        (text) => text.includes("b.html"),
+        "B did not bind",
+      );
+      click("Fail B");
+      const queued = await eventually(
+        state,
+        (value) => value.sessions[key].artifact_failures.some((failure) => failure.page === "b.html"),
+        "B failure did not reach store",
+      );
+      assert.deepEqual(
+        queued.sessions[key].feedback_batches.map((batch) => [batch.page, batch.modern]),
+        [
+          ["a.html", true],
+          ["b.html", true],
+        ],
+      );
+      assert.match(
+        browser(
+          "eval",
+          "() => window.__fatalReports.length === 2 && window.__fatalReports.every(r => !('page_protocol' in r) && r.page && r.page_proof && r.document_sequence > 0)",
+        ),
+        /result:\s*"true"/,
+      );
+      const first = run(process.execPath, [cli, "poll", entry, "--timeout-ms", "1000"], env);
+      const second = run(process.execPath, [cli, "poll", entry, "--timeout-ms", "1000"], env);
+      assert.match(first, /missing-a\.png/);
+      assert.doesNotMatch(first, /missing-b\.png/);
+      assert.match(second, /missing-b\.png/);
+      assert.doesNotMatch(second, /missing-a\.png/);
+      assert.equal((await state()).sessions[key].artifact_failures.length, 0);
+    } finally {
+      cleanupRun(process.execPath, [cli, "stop", "--port", String(port)], env);
+      cleanupRun("chrome-devtools-axi", ["stop"], chromeEnv);
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "352 exact POSIX entry remains reviewable and foreign framing is blocked",
   { skip: !runBrowserE2e || path.sep !== "/", timeout: 180_000 },
   async () => {

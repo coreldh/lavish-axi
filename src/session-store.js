@@ -697,24 +697,36 @@ export class SessionStore {
       const pageContext = await validateLivePageContext(session, payload, options);
       const documentSequence = parseDocumentSequence(payload);
       const boundDocument = hasDocumentContext(payload) && pageContext.page !== null;
+      const sequenceInput = payload?.document_sequence ?? payload?.documentSequence;
+      const proofInput = payload?.page_proof || payload?.pageProof || "";
+      const invalidPageContext =
+        !pageContext.ok ||
+        (boundDocument &&
+          (!pageContext.proof ||
+            typeof proofInput !== "string" ||
+            !["number", "string"].includes(typeof sequenceInput)));
       if (
         !load ||
         artifactLoadToken !== load.artifactLoadToken ||
         !reportedRevision.present ||
         reportedRevision.value !== load.artifactRevision ||
-        !pageContext.ok ||
+        invalidPageContext ||
         (boundDocument &&
           (documentSequence.value === null ||
             documentSequence.value <= 0 ||
             documentSequence.value < Number(load.lastDocumentSequence || 0)))
       ) {
-        return { session, changed: false, stale: true, ...(pageContext.ok ? {} : { invalid_page_context: true }) };
+        return { session, changed: false, stale: true, ...(invalidPageContext ? { invalid_page_context: true } : {}) };
       }
       if (boundDocument && documentSequence.value > Number(load.lastDocumentSequence || 0)) {
         load.lastDocumentSequence = documentSequence.value;
         load.lastPassSequence = 0;
       }
-      const modernBatch = Number(payload?.page_protocol) === 1;
+      // Fatal browser reports predate the optional page_protocol flag. A complete
+      // page/proof/document tuple has already passed validation and live ordering
+      // above, so it belongs to the same FIFO as modern prompts on that page.
+      // Unbound pre-SDK failures and genuine protocol-0 reports stay legacy.
+      const modernBatch = boundDocument || Number(payload?.page_protocol) === 1;
       if (modernBatch && pageContext.page === null)
         return { session, changed: false, stale: true, invalid_page_context: true };
       const normalized = normalizeArtifactFailures(payload?.failures, pageContext.page);

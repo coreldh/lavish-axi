@@ -36,7 +36,7 @@ function submission(page, id, snapshot = id) {
 
 function failure(load, page, sequence, detail = page) {
   return {
-    page_protocol: 1,
+    // The browser's fatal-report wire shape intentionally has no page_protocol.
     page,
     page_proof: "proof-" + page,
     document_sequence: sequence,
@@ -45,6 +45,110 @@ function failure(load, page, sequence, detail = page) {
     failures: [{ kind: "artifact-asset-unavailable", detail }],
   };
 }
+
+test("authenticated failure-only A then B reports form durable FIFO batches without a protocol flag", async (t) => {
+  const { store, key, load, stateFile } = await fixture(t);
+  const validatePageContext = async ({ page, proof }) => ({ ok: proof === "proof-" + page, page, proof });
+  for (const [index, page] of ["a.html", "b.html", "a.html"].entries()) {
+    const result = await store.recordArtifactFailures(key, failure(load, page, index + 1, "failure-" + index), {
+      validatePageContext,
+    });
+    assert.equal(result.changed, true);
+  }
+  const persisted = JSON.parse(await readFile(stateFile, "utf8")).sessions[key];
+  assert.deepEqual(
+    persisted.feedback_batches?.map((batch) => [batch.page, batch.modern]),
+    [
+      ["a.html", true],
+      ["b.html", true],
+      ["a.html", true],
+    ],
+  );
+  const restarted = new SessionStore(stateFile);
+  for (const page of ["a.html", "b.html", "a.html"]) {
+    const delivered = await restarted.takeFeedback(key);
+    assert.deepEqual(delivered.prompts, []);
+    assert.deepEqual(
+      delivered.artifact_failures.map((item) => item.page),
+      [page],
+    );
+    assert.equal(delivered.dom_snapshot, "");
+    assert.equal(delivered.snapshot_page, null);
+  }
+  assert.equal((await restarted.takeFeedback(key)).status, "waiting");
+});
+
+test("partial and rejected fatal page contexts cannot create modern batches while legacy remains legacy", async (t) => {
+  const { store, key, load, stateFile } = await fixture(t);
+  const valid = failure(load, "a.html", 1);
+  const validatePageContext = async ({ page, proof }) => ({
+    ok: page === "a.html" && proof === "proof-a.html",
+    page,
+    proof,
+  });
+  for (const candidate of [
+    { ...valid, page_proof: "forged" },
+    { ...valid, page: undefined },
+    { ...valid, page_proof: undefined },
+    { ...valid, document_sequence: undefined },
+    { ...valid, document_sequence: 0 },
+    { ...valid, document_sequence: true },
+    { ...valid, document_sequence: [1] },
+    { ...valid, page: "../a.html" },
+  ]) {
+    assert.equal((await store.recordArtifactFailures(key, candidate, { validatePageContext })).stale, true);
+  }
+  // Even trusted in-process callers need a complete page context before inference.
+  assert.equal((await store.recordArtifactFailures(key, { ...valid, page_proof: "" })).stale, true);
+  assert.equal((await store.recordArtifactFailures(key, { ...valid, page_proof: { forged: true } })).stale, true);
+  const legacy = {
+    artifact_load_token: load.artifact_load_token,
+    artifact_revision: load.artifact_revision,
+    failures: [{ kind: "artifact-unavailable", detail: "Legacy entry" }],
+  };
+  assert.equal((await store.recordArtifactFailures(key, legacy)).changed, true);
+  const persisted = JSON.parse(await readFile(stateFile, "utf8")).sessions[key];
+  assert.equal(persisted.feedback_batches, undefined);
+  const delivered = await store.takeFeedback(key);
+  assert.equal(delivered.artifact_failures.length, 1);
+  assert.equal(delivered.artifact_failures[0].detail, "Legacy entry");
+});
+
+test("trusted fatal context aliases infer modern batches while unbound pre-SDK failures stay legacy", async (t) => {
+  const { store, key, load } = await fixture(t);
+  const unbound = {
+    artifact_load_token: load.artifact_load_token,
+    artifact_revision: load.artifact_revision,
+    page: null,
+    page_proof: "",
+    document_sequence: 0,
+    failures: [{ kind: "artifact-unavailable", detail: "Pre-SDK" }],
+  };
+  assert.equal((await store.recordArtifactFailures(key, unbound)).changed, true);
+  const legacy = await store.takeFeedback(key);
+  assert.equal(legacy.feedback_batch, undefined);
+  assert.equal(legacy.artifact_failures[0].detail, "Pre-SDK");
+  for (const [index, page] of ["a.html", "b.html"].entries()) {
+    const report = {
+      page_protocol: 0,
+      page,
+      pageProof: "proof-" + page,
+      documentSequence: String(index + 1),
+      artifactLoadToken: load.artifact_load_token,
+      artifactRevision: load.artifact_revision,
+      failures: [{ kind: "artifact-asset-unavailable", detail: page }],
+    };
+    assert.equal((await store.recordArtifactFailures(key, report)).changed, true);
+  }
+  for (const page of ["a.html", "b.html"]) {
+    const delivered = await store.takeFeedback(key);
+    assert.equal(delivered.feedback_batch.modern, true);
+    assert.deepEqual(
+      delivered.artifact_failures.map((failure) => failure.page),
+      [page],
+    );
+  }
+});
 
 test("durable page FIFO preserves snapshots, failures, ack retries, reopen and terminal ordering", async (t) => {
   const { store, stateFile, file, key, load } = await fixture(t);
@@ -228,7 +332,11 @@ test("page batching keeps all pending attachment references and rejects modern n
     prompts: [...submission("a.html", "x").prompts, ...submission("b.html", "y").prompts],
   });
   assert.equal(mixed.invalid_page_context, true);
-  const failed = await store.recordArtifactFailures(key, { ...failure(load, null, 1), page_proof: "" });
+  const failed = await store.recordArtifactFailures(key, {
+    ...failure(load, null, 1),
+    page_protocol: 1,
+    page_proof: "",
+  });
   assert.equal(failed.invalid_page_context, true);
   const remaining = await store.takeFeedback(key);
   assert.deepEqual(
@@ -236,6 +344,66 @@ test("page batching keeps all pending attachment references and rejects modern n
     ["b.html"],
   );
   assert.equal(remaining.artifact_failures, undefined);
+});
+
+test("HTTP flagless fatal-only reports reject forged context and poll A then B after restart", async (t) => {
+  const { file, stateFile } = await fixture(t);
+  for (const page of ["a.html", "b.html"]) await writeFile(path.join(path.dirname(file), page), "<p>Sibling</p>");
+  let server = await serve({ port: 0, stateFile });
+  t.after(() => server.close());
+  let base = `http://127.0.0.1:${server.port}`;
+  const post = (route, body = {}) =>
+    fetch(`${base}${route}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: base },
+      body: JSON.stringify(body),
+    });
+  const session = await (await post("/api/sessions", { file })).json();
+  const handoff = await (await post(`/api/${session.key}/chrome-loads/begin`)).json();
+  const load = await (
+    await post(`/api/${session.key}/artifact-loads/begin`, {
+      request_id: "flagless-failures",
+      request_sequence: 1,
+      chrome_load_token: handoff.chrome_load_token,
+    })
+  ).json();
+  for (const [index, page] of ["a.html", "b.html"].entries()) {
+    const html = await fetch(`${base}/artifact/${session.key}/${page}`).then((r) => r.text());
+    const script = html.match(/<script src="([^"]*\/sdk\.js\?[^"]+)"><\/script>/)?.[1];
+    assert.ok(script);
+    const params = new URL(script, base).searchParams;
+    const report = { ...failure(load, page, index + 1), page_proof: params.get("page_proof") };
+    for (const invalid of [
+      { ...report, page_proof: "unverified" },
+      { ...report, page_proof: undefined },
+      { ...report, page: undefined },
+      { ...report, document_sequence: 0 },
+      { ...report, document_sequence: true },
+      { ...report, document_sequence: [index + 1] },
+      { ...report, artifact_load_token: "stale" },
+    ])
+      assert.ok([400, 409].includes((await post(`/api/${session.key}/artifact-failures`, invalid)).status));
+    assert.equal((await post(`/api/${session.key}/artifact-failures`, report)).status, 200);
+  }
+  await server.close();
+  server = await serve({ port: 0, stateFile });
+  base = `http://127.0.0.1:${server.port}`;
+  for (const page of ["a.html", "b.html"]) {
+    const delivered = await fetch(`${base}/api/poll?file=${encodeURIComponent(file)}&timeoutMs=0`).then((r) =>
+      r.json(),
+    );
+    assert.deepEqual(delivered.prompts, []);
+    assert.deepEqual(
+      delivered.artifact_failures.map((item) => item.page),
+      [page],
+    );
+    assert.equal(delivered.dom_snapshot, "");
+    assert.equal(delivered.snapshot_page, null);
+    assert.equal(delivered.feedback_batch, undefined);
+    const output = createPollOutput({ file, response: delivered });
+    assert.equal(output.session.file, file);
+    assert.equal(output.artifact_failures[0].page, page);
+  }
 });
 
 test("HTTP and CLI poll deliver A then B after server restart with an exact dot-prefixed entry", async (t) => {
