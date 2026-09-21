@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { execFile, spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,9 +13,16 @@ import {
   verifyPageProof,
   signHistoricalDestination,
   verifyHistoricalDestination,
+  windowsPageProofAcl,
 } from "../src/artifact-page.js";
 
 const execFileAsync = promisify(execFile);
+// Windows runs the production shell. Elsewhere PowerShell 7, when installed, still executes the
+// script's operation dispatch before it reaches any Windows-only API.
+const ACL_SHELL = process.platform === "win32" ? "powershell.exe" : "pwsh";
+const ACL_SHELL_AVAILABLE =
+  spawnSync(ACL_SHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0"], { windowsHide: true })
+    .status === 0;
 
 test("historical receipts are bounded and domain separated, binding root, entry, session, route, URL and document", () => {
   const key = Buffer.alloc(32, 8);
@@ -76,29 +83,49 @@ test(
     assert.throws(() => signPageProof(key, "session", "/tmp/root", "sibling\\page.html", file));
   },
 );
+// An independent reading of the key's security descriptor. It is handed its target through the
+// environment and uses no module cmdlets: a Windows PowerShell child of a PowerShell 7 step
+// inherits a PSModulePath whose modules it cannot load, and text after -Command is parsed as code.
 const WINDOWS_ACL_INSPECTION_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-$target = $args[0]
 $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$acl = Get-Acl -LiteralPath $target
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor
+  [System.Security.AccessControl.AccessControlSections]::Owner
+$acl = [System.Security.AccessControl.FileSecurity]::new($env:LAVISH_AXI_TEST_ACL_TARGET, $sections)
 $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-$foreignAllowCount = @(
-  $acl.GetAccessRules(
-    $true,
-    $true,
-    [System.Security.Principal.SecurityIdentifier]
-  ) | Where-Object {
-    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-    $_.IdentityReference.Value -ne $currentUserSid
+$foreignAllowCount = 0
+foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+  if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+      $rule.IdentityReference.Value -ne $currentUserSid) {
+    $foreignAllowCount += 1
   }
-).Count
-[pscustomobject]@{
-  inheritanceProtected = [bool]$acl.AreAccessRulesProtected
-  currentUserSid = $currentUserSid
-  ownerSid = $ownerSid
-  foreignAllowCount = [int]$foreignAllowCount
-} | ConvertTo-Json -Compress
+}
+[Console]::Out.Write(
+  [string]::Join('|', @([string]$acl.AreAccessRulesProtected, $currentUserSid, $ownerSid, [string]$foreignAllowCount))
+)
 `;
+
+async function inspectWindowsAcl(file) {
+  const inspection = await execFileAsync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_ACL_INSPECTION_SCRIPT],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 64 * 1024,
+      env: { ...process.env, LAVISH_AXI_TEST_ACL_TARGET: file },
+    },
+  );
+  const [inheritanceProtected, currentUserSid, ownerSid, foreignAllowCount] = String(inspection.stdout || "")
+    .trim()
+    .split("|");
+  return {
+    inheritanceProtected: inheritanceProtected === "True",
+    currentUserSid,
+    ownerSid,
+    foreignAllowCount: Number(foreignAllowCount),
+  };
+}
 
 test("page proofs bind the session, canonical root, and normalized page", () => {
   const key = Buffer.alloc(32, 7);
@@ -155,12 +182,7 @@ test(
       for (const key of keys) assert.deepEqual(key, first);
       assert.deepEqual(await loadPageProofKey(root), first);
       assert.deepEqual(await readdir(root), ["page-proof.key"]);
-      const inspection = await execFileAsync(
-        "powershell.exe",
-        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_ACL_INSPECTION_SCRIPT, keyFile],
-        { encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 },
-      );
-      const acl = JSON.parse(String(inspection.stdout || "").trim());
+      const acl = await inspectWindowsAcl(keyFile);
       assert.equal(acl.inheritanceProtected, true);
       assert.match(acl.currentUserSid, /^S-\d(?:-\d+)+$/);
       assert.equal(acl.ownerSid, acl.currentUserSid);
@@ -171,12 +193,83 @@ test(
   },
 );
 
+test(
+  "production Windows verification rejects a key that inherits its directory's ACL",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-windows-inherited-"));
+    const keyFile = path.join(root, "page-proof.key");
+    try {
+      await writeFile(keyFile, Buffer.alloc(32, 5));
+      assert.equal((await inspectWindowsAcl(keyFile)).inheritanceProtected, false);
+      await assert.rejects(
+        loadPageProofKey(root),
+        /page-proof\.key.*ACL is not owner-only.*invalidates existing queued page proofs/is,
+      );
+      assert.deepEqual(await readFile(keyFile), Buffer.alloc(32, 5));
+      assert.deepEqual(await readdir(root), ["page-proof.key"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "production Windows key paths reach the ACL helper as data, never as script text",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const parent = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-windows-path-"));
+    const root = path.join(parent, "it's a $(throw 'parsed') dir; exit 7 #");
+    try {
+      await mkdir(root);
+      const key = await loadPageProofKey(root);
+      assert.equal(key.length, 32);
+      assert.deepEqual(await loadPageProofKey(root), key);
+      assert.deepEqual(await readdir(root), ["page-proof.key"]);
+      const acl = await inspectWindowsAcl(path.join(root, "page-proof.key"));
+      assert.equal(acl.inheritanceProtected, true);
+      assert.equal(acl.ownerSid, acl.currentUserSid);
+      assert.equal(acl.foreignAllowCount, 0);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "the ACL helper receives its operation and refuses one it does not implement",
+  { skip: !ACL_SHELL_AVAILABLE && `${ACL_SHELL} is not installed` },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-acl-operation-"));
+    const keyFile = path.join(root, "page-proof.key");
+    try {
+      await writeFile(keyFile, Buffer.alloc(32, 3), { mode: 0o600 });
+      // An operation that never arrives must not read as a verification that passed, and an
+      // unknown one must not fall through to either branch.
+      await assert.rejects(
+        windowsPageProofAcl(keyFile, "rotate", { shell: ACL_SHELL }),
+        /unsupported page-proof ACL operation 'rotate'/,
+      );
+      await assert.rejects(
+        windowsPageProofAcl(keyFile, "", { shell: ACL_SHELL }),
+        /unsupported page-proof ACL operation ''/,
+      );
+      assert.deepEqual(await readFile(keyFile), Buffer.alloc(32, 3));
+      assert.deepEqual(await readdir(root), ["page-proof.key"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test("an existing corrupt page proof key fails without silent rotation", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "lavish-page-proof-corrupt-"));
   const keyFile = path.join(root, "page-proof.key");
   try {
-    await writeFile(keyFile, Buffer.alloc(31));
-    await chmod(keyFile, 0o600);
+    // Start from a production key so the length check is reached on Windows too, where a plainly
+    // written file is refused for its inherited ACL first.
+    await loadPageProofKey(root);
+    await truncate(keyFile, 31);
     await assert.rejects(
       loadPageProofKey(root),
       /page-proof\.key.*exactly 32 bytes.*invalidates existing queued page proofs/i,

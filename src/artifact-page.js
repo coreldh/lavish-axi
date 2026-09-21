@@ -13,18 +13,36 @@ const PAGE_PROOF_MAX_PAGE_BYTES = 16 * 1024;
 const execFileAsync = promisify(execFile);
 const artifactPageIdentities = new WeakMap();
 const pageProofKeyIdentities = new WeakMap();
+const WINDOWS_PAGE_PROOF_ACL_OPERATION_ENV = "LAVISH_AXI_PAGE_PROOF_ACL_OPERATION";
+const WINDOWS_PAGE_PROOF_ACL_TARGET_ENV = "LAVISH_AXI_PAGE_PROOF_ACL_TARGET";
+// Two properties of how this script is started are load-bearing:
+// - Its inputs arrive through the environment. PowerShell appends every argument after -Command
+//   to the command text instead of binding $args, so an operation passed there never arrived
+//   (create fell through to verify) and the key path was parsed as script.
+// - It uses only language constructs and .NET types, never a module cmdlet. When an ancestor
+//   process is PowerShell 7 (a GitHub Actions step, a pwsh terminal), Windows PowerShell inherits
+//   a PSModulePath naming PowerShell 7 modules it cannot load, so Get-Acl and even Write-Output
+//   fail to autoload.
+// An operation that is neither create nor verify is refused, so nothing can fall through to a
+// branch it did not ask for.
 const WINDOWS_PAGE_PROOF_ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-$operation = $args[0]
-$target = $args[1]
+$operation = [string]$env:${WINDOWS_PAGE_PROOF_ACL_OPERATION_ENV}
+$target = [string]$env:${WINDOWS_PAGE_PROOF_ACL_TARGET_ENV}
+if ($operation -cne 'create' -and $operation -cne 'verify') {
+  throw "unsupported page-proof ACL operation '$operation'"
+}
+if ($target.Length -eq 0) {
+  throw 'the page-proof ACL target is missing'
+}
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-  $sid,
-  [System.Security.AccessControl.FileSystemRights]::FullControl,
-  [System.Security.AccessControl.AccessControlType]::Allow
-)
-if ($operation -eq 'create') {
+if ($operation -ceq 'create') {
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $sid,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
   $security = [System.Security.AccessControl.FileSecurity]::new()
   $security.SetOwner($sid)
   $security.SetAccessRuleProtection($true, $false)
@@ -49,29 +67,21 @@ if ($operation -eq 'create') {
   }
   exit 0
 }
-$acl = Get-Acl -LiteralPath $target
-$ownerSid = try {
-  ([System.Security.Principal.NTAccount]::new($acl.Owner)).Translate(
-    [System.Security.Principal.SecurityIdentifier]
-  ).Value
-} catch {
-  [System.Security.Principal.SecurityIdentifier]::new($acl.Owner).Value
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor
+  [System.Security.AccessControl.AccessControlSections]::Owner
+$acl = [System.Security.AccessControl.FileSecurity]::new($target, $sections)
+$ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+$foreignAllows = 0
+$ownerAllows = 0
+foreach ($entry in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+  if ($entry.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+  if ($entry.IdentityReference.Value -eq $sid.Value) { $ownerAllows += 1 } else { $foreignAllows += 1 }
 }
-$rules = @($acl.GetAccessRules(
-  $true,
-  $true,
-  [System.Security.Principal.SecurityIdentifier]
-))
-$allows = @($rules | Where-Object {
-  $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
-})
-$foreignAllows = @($allows | Where-Object { $_.IdentityReference.Value -ne $sid.Value })
-$ownerAllows = @($allows | Where-Object { $_.IdentityReference.Value -eq $sid.Value })
-if (-not $acl.AreAccessRulesProtected -or $ownerSid -ne $sid.Value -or
-    $foreignAllows.Count -ne 0 -or $ownerAllows.Count -eq 0) {
+if (-not $acl.AreAccessRulesProtected -or $null -eq $ownerSid -or $ownerSid.Value -ne $sid.Value -or
+    $foreignAllows -ne 0 -or $ownerAllows -eq 0) {
   throw 'the file ACL is not owner-only'
 }
-Write-Output 'PAGE_PROOF_ACL_OK'
+[Console]::Out.Write('PAGE_PROOF_ACL_OK')
 `;
 
 export function pageProofKeyPath(stateDir) {
@@ -271,11 +281,24 @@ function pageProofKeyError(file, detail) {
   );
 }
 
-async function windowsPageProofAcl(file, operation) {
+/**
+ * Create (`create`) or prove (`verify`) the owner-only protected ACL of a Windows key file.
+ * `shell` exists so the script's dispatch can be executed where Windows PowerShell is absent.
+ */
+export async function windowsPageProofAcl(file, operation, { shell = "powershell.exe" } = {}) {
   const result = await execFileAsync(
-    "powershell.exe",
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PAGE_PROOF_ACL_SCRIPT, operation, file],
-    { encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 },
+    shell,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PAGE_PROOF_ACL_SCRIPT],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 64 * 1024,
+      env: {
+        ...process.env,
+        [WINDOWS_PAGE_PROOF_ACL_OPERATION_ENV]: String(operation),
+        [WINDOWS_PAGE_PROOF_ACL_TARGET_ENV]: String(file),
+      },
+    },
   );
   if (operation === "verify" && String(result.stdout || "").trim() !== "PAGE_PROOF_ACL_OK") {
     throw new Error("the file ACL could not be verified as owner-only");

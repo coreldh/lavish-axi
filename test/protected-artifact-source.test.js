@@ -8,11 +8,19 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { promisify } from "node:util";
 
+import { loadPageProofKey } from "../src/artifact-page.js";
 import { serve } from "../src/server.js";
 import { shareCommand } from "../src/cli.js";
 
 const marker = "0123456789ABCDEF".repeat(2);
 const execFileAsync = promisify(execFile);
+
+// The server only accepts an owner-only key, which on Windows is a protected ACL a plain write
+// cannot produce. Let production create the file, then replace its bytes in place.
+async function seedPageProofKey(root, bytes) {
+  await loadPageProofKey(root);
+  await writeFile(path.join(root, "page-proof.key"), bytes, { flag: "r+" });
+}
 // A regression must never send test fixtures to the public hosting service.
 const originalApiUrl = process.env.LAVISH_AXI_HTML_APP_API_URL;
 process.env.LAVISH_AXI_HTML_APP_API_URL = "http://127.0.0.1:1";
@@ -26,7 +34,7 @@ test("HTML serving and browser export/share protect the loaded key inode even af
   const keyFile = path.join(root, "page-proof.key");
   const entry = path.join(root, "entry.html");
   const alias = path.join(root, "leak.html");
-  await writeFile(keyFile, marker, { mode: 0o600 });
+  await seedPageProofKey(root, marker);
   await writeFile(entry, '<!doctype html><body><img src="old-key.png">NORMAL ENTRY</body>');
   const published = [];
   const host = createServer(async (req, res) => {
@@ -189,7 +197,7 @@ test("document and export source swaps cannot read key bytes through the opened 
   const root = await mkdtemp(path.join(tmpdir(), "lavish-source-swap-"));
   const keyFile = path.join(root, "page-proof.key");
   const entry = path.join(root, "entry.html");
-  await writeFile(keyFile, marker, { mode: 0o600 });
+  await seedPageProofKey(root, marker);
   await writeFile(entry, "<!doctype html><p>SAFE</p>");
   let attack = false;
   let reads = 0;
