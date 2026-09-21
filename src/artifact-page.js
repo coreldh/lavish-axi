@@ -478,3 +478,33 @@ export async function readResolvedArtifactPage(resolution, { openFile = open, fo
 export async function canonicalArtifactRoot(root) {
   return realpath(path.resolve(root));
 }
+
+/**
+ * Compare one decoded identity per path segment, preserving authored URL spelling.
+ * The expected path must encode an independently authorized lexical served route:
+ * this does not authorize aliases or backslashes (only the saved POSIX entry can).
+ * Keep the standalone chrome-client.js counterpart in sync.
+ * @param {string} pathname
+ * @param {string} expectedPath
+ */
+export function artifactDestinationPathMatches(pathname, expectedPath) {
+  try {
+    const actual = pathname.split("/");
+    const expected = expectedPath.split("/");
+    return (
+      actual.length === expected.length &&
+      actual.every((part, index) => {
+        const decoded = decodeURIComponent(part);
+        return (
+          decoded !== "." &&
+          decoded !== ".." &&
+          !decoded.includes("\0") &&
+          !decoded.includes("/") &&
+          decoded === decodeURIComponent(expected[index])
+        );
+      })
+    );
+  } catch {
+    return false;
+  }
+}

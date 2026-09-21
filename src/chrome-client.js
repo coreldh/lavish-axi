@@ -522,6 +522,30 @@ function frameLocationDestination() {
   }
 }
 
+// Compare exactly one decoding per segment, not URL spellings or normalized paths.
+// Keep in sync with artifactDestinationPathMatches in artifact-page.js.
+function artifactDestinationPathMatches(pathname, expectedPath) {
+  try {
+    const actual = pathname.split("/");
+    const expected = expectedPath.split("/");
+    return (
+      actual.length === expected.length &&
+      actual.every((part, index) => {
+        const decoded = decodeURIComponent(part);
+        return (
+          decoded !== "." &&
+          decoded !== ".." &&
+          !decoded.includes("\0") &&
+          !decoded.includes("/") &&
+          decoded === decodeURIComponent(expected[index])
+        );
+      })
+    );
+  } catch {
+    return false;
+  }
+}
+
 function normalizeArtifactDestination(value, servedRoute = "") {
   const candidate = String(value || "");
   const fallback = destinationForServedRoute(servedRoute);
@@ -550,7 +574,14 @@ function normalizeArtifactDestination(value, servedRoute = "") {
     if (!parsed || (typeof URL === "function" && parsed.origin !== location.origin)) return "";
     const pathName = parsed.pathname;
     if (!pathName.startsWith(artifactPathPrefix())) return "";
-    if (fallback && pathName !== navigationPath(fallback)) return "";
+    // Inspect before URL parsing too: it otherwise erases dot-segment traversal.
+    const rawPath = navigationPath(fallbackLocationDestination(candidate));
+    if (
+      fallback &&
+      (!artifactDestinationPathMatches(rawPath, navigationPath(fallback)) ||
+        !artifactDestinationPathMatches(pathName, navigationPath(fallback)))
+    )
+      return "";
     return stripControlledReloadParameter(pathName + parsed.search + parsed.hash) || "";
   } catch {
     return "";
@@ -2385,8 +2416,44 @@ function activateComposerPage(page) {
   chatAttachmentController.render();
 }
 
+function hasOtherPageFeedback(page) {
+  if (!modernArtifactProtocol) return false;
+  const other = (item) => item.page !== page;
+  return (
+    queued.some(other) ||
+    (composerPage !== null &&
+      composerPage !== page &&
+      (chatInput.value.trim() ||
+        chatAttachmentController.hasPending() ||
+        chatAttachmentController.hasErrors() ||
+        chatAttachmentController.collectReady().length)) ||
+    [...feedbackPreparations].some(other) ||
+    [...composerDrafts].some(([owner, text]) => owner !== page && text.trim()) ||
+    [...composerAttachments].some(
+      ([owner, controller]) =>
+        owner !== page && (controller.hasPending() || controller.hasErrors() || controller.collectReady().length),
+    ) ||
+    [...pageReviewStates.values()].some((record) => other(record) && reviewStateHasUnsentDraft(record.reviewState)) ||
+    layoutWarnings.some(
+      (warning) =>
+        warning && other(warning) && warning.active && warning.selectable && selectedWarningIds.has(warning.id),
+    )
+  );
+}
+
+function blockTerminalForOtherPages(page, terminal = null) {
+  if (!hasOtherPageFeedback(page)) return false;
+  if (terminal) releaseTerminalSubmission(terminal);
+  clearPersistentSendFailure();
+  showPersistentSendFailure(
+    "Other pages still have unsent feedback. Use Send to Agent for this page, then Back/Forward to send the remaining feedback. Use Send & End when no other page has pending work.",
+  );
+  return true;
+}
+
 function sendQueued(endAfter) {
   if (ended || (modernArtifactProtocol && !currentArtifactBinding)) return;
+  if (endAfter && blockTerminalForOtherPages(currentArtifactBinding?.page, terminalSubmission)) return;
   if (terminalSubmission) {
     if (endAfter && !terminalSubmission.inFlight) retryTerminalSubmission();
     return;
@@ -2469,6 +2536,7 @@ function finishTerminalPreparation(terminal, preparations) {
 
 function completeTerminalPreparation(terminal, results) {
   if (terminalSubmission !== terminal || ended) return;
+  if (blockTerminalForOtherPages(terminal.page, terminal)) return;
   if (results.some((succeeded) => !succeeded)) {
     releaseTerminalSubmission(terminal);
     return;
@@ -2490,6 +2558,7 @@ function completeTerminalPreparation(terminal, results) {
 
 function retryTerminalSubmission() {
   if (!terminalSubmission || terminalSubmission.inFlight || ended) return;
+  if (blockTerminalForOtherPages(terminalSubmission.page, terminalSubmission)) return;
   if (modernArtifactProtocol && terminalSubmission.page !== currentArtifactBinding?.page) return;
   terminalSubmission.inFlight = true;
   updateSendState();
@@ -2548,6 +2617,7 @@ async function submitQueued(submission) {
 }
 
 async function submitQueuedOnce(submission, preserveFailureState = false) {
+  if (submission.endAfter && blockTerminalForOtherPages(submission.terminal?.page, submission.terminal)) return false;
   settleQueuedFromTranscript(displayedChat);
   const prompts = submission.prompts.filter(
     (prompt) => !deliveredPrompts.has(prompt) && !promptAcknowledgedInChat(prompt, displayedChat),
@@ -2592,6 +2662,7 @@ async function submitQueuedOnce(submission, preserveFailureState = false) {
     // useful terminal batch and Express' request-size limit. Retry exactly once
     // without it; never mutate or split the user's exact feedback batch.
     if (response.status === 413 && body.domSnapshot) {
+      if (shouldEndSession && blockTerminalForOtherPages(submission.terminal?.page, submission.terminal)) return false;
       body.domSnapshot = "";
       if (modernArtifactProtocol) {
         body.snapshot_page = null;
@@ -5276,6 +5347,11 @@ function challengeArtifactDocument(expectedDocumentId = "") {
     stampLegacyQueuedPrompts(binding);
     activatePageReviewState(binding.page);
     activateComposerPage(binding.page);
+    // A pre-upgrade/restored terminal reservation must not lock the controls
+    // needed to deliver another page's retained work.
+    if (terminalSubmission && !terminalSubmission.inFlight) {
+      blockTerminalForOtherPages(terminalSubmission.page, terminalSubmission);
+    }
     render();
     renderWarnings();
     const destination = bindingDestination(binding);

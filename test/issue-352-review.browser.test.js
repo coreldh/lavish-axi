@@ -12,7 +12,7 @@ const runBrowserE2e = process.env.LAVISH_AXI_BROWSER_E2E === "1";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 test(
-  "352 stale history retains the accepted alias, author query and fragment",
+  "352 stale history retains the accepted plus-sign alias, author query and fragment",
   { skip: !runBrowserE2e, timeout: 180_000 },
   async () => {
     const temp = await mkdtemp(path.join(tmpdir(), "lavish-352-history-"));
@@ -35,7 +35,7 @@ test(
     try {
       await writeFile(
         entry,
-        '<!doctype html><body><a href="alias.html?view=review&view=full#target">Open history target</a></body>',
+        '<!doctype html><body><a href="alias+review.html?view=review&view=full#target">Open history target</a></body>',
       );
       await writeFile(
         path.join(temp, "a.html"),
@@ -49,7 +49,7 @@ test(
         });</script></body>`,
       );
       await writeFile(path.join(temp, "b.html"), "<!doctype html><body><p>Second document</p></body>");
-      await symlink("a.html", path.join(temp, "alias.html"));
+      await symlink("a.html", path.join(temp, "alias+review.html"));
       const opened = run(process.execPath, [cli, entry, "--no-open"], env);
       const url = opened.match(/url:\s*"([^"]+)"/)?.[1];
       assert.ok(url, opened);
@@ -74,7 +74,7 @@ test(
       await eventually(
         async () =>
           evalChrome(
-            '() => Array.from(historicalDestinations.values()).some(r => r.url.endsWith("alias.html?view=review&view=full#target"))',
+            '() => Array.from(historicalDestinations.values()).some(r => r.url.endsWith("alias+review.html?view=review&view=full#target"))',
           ),
         (text) => /true/.test(text),
         "alias receipt was not retained",
@@ -109,7 +109,7 @@ test(
         await eventually(
           async () =>
             evalChrome(
-              `() => Array.from(historicalDestinations.values()).some(r => r.url.endsWith("alias.html?view=review&view=full#${fragment}"))`,
+              `() => Array.from(historicalDestinations.values()).some(r => r.url.endsWith("alias+review.html?view=review&view=full#${fragment}"))`,
             ),
           (text) => /true/.test(text),
           `successful ${label} did not get a destination receipt`,
@@ -155,7 +155,7 @@ test(
       browser("back");
       await eventually(
         async () => evalChrome("() => currentArtifactBinding?.destination"),
-        (text) => text.includes("alias.html?view=review&view=full#replaced"),
+        (text) => text.includes("alias+review.html?view=review&view=full#replaced"),
         "Back lost the exact historical destination",
       );
       assert.match(browser("snapshot"), /Historical alias target/);
@@ -193,7 +193,7 @@ test(
         await eventually(
           async () =>
             evalChrome(
-              "() => window.__historyRecoveryRequests.length > 0 && currentArtifactBinding?.destination.endsWith('alias.html?view=review&view=full#replaced')",
+              "() => window.__historyRecoveryRequests.length > 0 && currentArtifactBinding?.destination.endsWith('alias+review.html?view=review&view=full#replaced')",
             ),
           (text) => /result:\s*"true"/.test(text),
           "stale historical document did not recover through its receipt",

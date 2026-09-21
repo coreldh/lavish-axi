@@ -45,6 +45,80 @@ function injectedPageContext(base, html) {
   };
 }
 
+test("destination receipts authenticate decoded segments while preserving authored URL spelling", async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "lavish-url-spelling-")));
+  const entry = path.join(root, "entry.html");
+  await writeFile(entry, "<p>Entry</p>");
+  const server = await serve({ port: 0, stateFile: path.join(root, "state.json") });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { session, handoff, load } = await openAndLoad(base, entry);
+    let sequence = 1;
+    let currentLoad = load;
+    const post = (route, body) =>
+      fetch(`${base}/api/${session.key}/${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify(body),
+      });
+    for (const [file, spelling] of [
+      ["a+b.html", "a+b.html"],
+      ["a+b.html", "a%2bb.html"],
+      ["100%.html", "100%25.html"],
+      ["café space.html", "caf%c3%a9%20space.html"],
+    ]) {
+      await writeFile(path.join(root, file), "<p>Sibling</p>");
+      const context = injectedPageContext(
+        base,
+        await fetch(`${base}/artifact/${session.key}/${spelling}`).then((r) => r.text()),
+      );
+      const destination = {
+        ...context,
+        url: `/artifact/${session.key}/${spelling}?author=a+b#part`,
+        query: "author=a+b",
+        fragment: "part",
+      };
+      const mint = (candidate) =>
+        post("artifact-bindings/validate", {
+          ...currentLoad,
+          ...context,
+          served_route: context.route,
+          document_id: "spelling-document",
+          destination: candidate,
+        });
+      const signed = await mint(destination);
+      assert.equal(signed.status, 200, spelling);
+      const { receipt } = await signed.json();
+      for (const unsafe of [
+        "sub%2f..%2f" + spelling,
+        "%2e%2e/" + spelling,
+        "sub/../" + spelling,
+        "bad%ZZ.html",
+        "sub%5c" + spelling,
+        "other.html",
+      ]) {
+        assert.equal(
+          (await mint({ ...destination, url: `/artifact/${session.key}/${unsafe}?author=a+b#part` })).status,
+          403,
+          unsafe,
+        );
+      }
+      const recovered = await post("artifact-loads/begin", {
+        request_id: `spelling-${++sequence}`,
+        request_sequence: sequence,
+        chrome_load_token: handoff.chrome_load_token,
+        historical_page: { ...destination, document_id: "spelling-document", receipt },
+      });
+      assert.equal(recovered.status, 200);
+      currentLoad = await recovered.json();
+      assert.equal(currentLoad.artifact_url, destination.url);
+    }
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("historical destination receipts bind exact URLs and documents across restart, and fail closed on races", async () => {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "lavish-history-receipts-")));
   const entry = path.join(root, "entry.html");

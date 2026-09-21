@@ -62,6 +62,7 @@ import { serializeChat, serializeChatAckIds, serializeChatSync } from "./chat-me
 import { formatServerLogLine, serverStdioIsTimestamped } from "./server-log.js";
 import { injectLavishSdk } from "./html-transform.js";
 import {
+  artifactDestinationPathMatches,
   canonicalArtifactRoot,
   isArtifactHtmlPage,
   loadPageProofKey,
@@ -1099,7 +1100,8 @@ export async function serve({
       const expectedPath = artifactDocumentUrl(session.key, resolution.servedRoute || route);
       if (
         parsed.origin !== base ||
-        parsed.pathname !== expectedPath ||
+        !artifactDestinationPathMatches(rawUrl.split(/[?#]/, 1)[0], expectedPath) ||
+        !artifactDestinationPathMatches(parsed.pathname, expectedPath) ||
         parsed.search.slice(1) !== query ||
         parsed.hash.slice(1) !== fragment
       ) {
@@ -1113,7 +1115,7 @@ export async function serve({
       }
       return {
         ok: /** @type {const} */ (true),
-        artifactUrl: expectedPath + parsed.search + parsed.hash,
+        artifactUrl: parsed.pathname + parsed.search + parsed.hash,
         page: claim.page,
         pageProof: claim.proof,
         servedRoute: resolution.servedRoute || route,

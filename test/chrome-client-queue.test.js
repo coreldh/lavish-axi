@@ -6854,6 +6854,168 @@ test("protocol 1 rejects queued prior-generation feedback when the next load beg
   assert.deepEqual(chrome.queued(), []);
 });
 
+test("protocol 1 retains authored equivalent URL spellings through reload", async () => {
+  for (const [route, spelling] of [
+    ["a+b.html", "a+b.html"],
+    ["a+b.html", "a%2bb.html"],
+    ["100%.html", "100%25.html"],
+    ["café space.html", "caf%c3%a9%20space.html"],
+  ]) {
+    const destination = `/artifact/abc/${spelling}?author=a+b#part`;
+    const binding = { ...protocolWhiteboardBinding(route), destination };
+    const chrome = await createChromeHarness({
+      artifactSrc: destination,
+      sessionData: { ...defaultSessionData, pageProtocol: 1 },
+      modernBinding: binding,
+    });
+    await flushPromises();
+    await flushPromises();
+    assert.ok(
+      chrome.modernPostedToFrame.some((message) => message.type === "lavish:activate"),
+      spelling,
+    );
+    chrome.element("reloadArtifact").click();
+    await flushPromises();
+    await flushPromises();
+    assert.equal(JSON.parse(chrome.artifactBeginRequests.at(-1).init.body).destination.url, destination);
+    assert.ok(chrome.replacedDestinations.at(-1).startsWith(`/artifact/abc/${spelling}?author=a+b&`));
+  }
+});
+
+test("protocol 1 Send & End blocks atomically until other page queues are sent", async () => {
+  const a = protocolWhiteboardBinding("a.html", "a");
+  const b = protocolWhiteboardBinding("b.html", "b");
+  const posts = [];
+  let ends = 0;
+  const chrome = await createChromeHarness({
+    storedQueue: [
+      { prompt_id: "pending-a", prompt: "A", page: "a.html", page_proof: a.proof },
+      { prompt_id: "pending-b", prompt: "B", page: "b.html", page_proof: b.proof },
+    ],
+    artifactSrc: b.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: b,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) posts.push(JSON.parse(init.body));
+      if (String(url).endsWith("/end")) ends++;
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("chatInput").value = "Unchanged composer";
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.equal(posts.length, 0);
+  assert.equal(ends, 0);
+  assert.equal(chrome.queued().length, 2);
+  assert.equal(chrome.element("chatInput").value, "Unchanged composer");
+  assert.match(chrome.element("sendHint").textContent, /Back\/Forward/);
+  assert.equal(chrome.element("send").disabled, false);
+  chrome.element("send").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.deepEqual(
+    posts[0].prompts.map((prompt) => prompt.page),
+    ["b.html", "b.html"],
+  );
+  assert.equal(posts[0].endSession, undefined);
+  chrome.updateModernBinding(a);
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: a.documentId });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.deepEqual(
+    posts[1].prompts.map((prompt) => prompt.page),
+    ["a.html"],
+  );
+  assert.equal(posts[1].endSession, true);
+  assert.equal(posts.length, 2);
+  assert.equal(chrome.queued().length, 0);
+});
+
+test("protocol 1 terminal delivery rechecks other-page work after the snapshot wait", async () => {
+  const a = protocolWhiteboardBinding("a.html", "a");
+  const b = protocolWhiteboardBinding("b.html", "b");
+  const posts = [];
+  const chrome = await createChromeHarness({
+    storedQueue: [{ prompt_id: "pending-a", prompt: "A", page: "a.html", page_proof: a.proof }],
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+    fetchImpl: async (url, init) => {
+      if (/\/(prompts|end)$/.test(String(url))) posts.push(init);
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("sendAndEnd").click();
+  chrome.updateModernBinding(b);
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: b.documentId });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("chatInput").value = "B work arriving during snapshot wait";
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.equal(posts.length, 0);
+  assert.equal(chrome.queued().length, 1);
+  assert.match(chrome.element("sendHint").textContent, /Back\/Forward/);
+  assert.equal(chrome.element("send").disabled, false);
+});
+
+test("protocol 1 terminal 413 retry blocks if another page selects feedback during the rejected POST", async () => {
+  const a = protocolWhiteboardBinding("a.html", "a");
+  const b = protocolWhiteboardBinding("b.html", "b");
+  const posts = [];
+  let release = () => {};
+  const chrome = await createChromeHarness({
+    storedQueue: [{ prompt_id: "pending-a", prompt: "A", page: "a.html", page_proof: a.proof }],
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith("/prompts")) {
+        posts.push(JSON.parse(init.body));
+        if (posts.length === 1)
+          return new Promise((resolve) => {
+            release = () => resolve({ ok: false, status: 413, json: async () => ({}) });
+          });
+      }
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  chrome.element("sendAndEnd").click();
+  await flushPromises();
+  const snapshotRequest = chrome.modernPostedToFrame
+    .filter((message) => message.type === "lavish:requestSnapshot")
+    .at(-1);
+  chrome.sendModernMessage({ ...snapshotRequest, type: "lavish:snapshot", snapshot: "<p>A snapshot</p>" });
+  await flushPromises();
+  assert.equal(posts.length, 1);
+  chrome.updateModernBinding(b);
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: b.documentId });
+  await flushPromises();
+  await flushPromises();
+  chrome.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload({ id: "wb", page: "b.html" })] }),
+  });
+  chrome.element("warningsSelectAll").checked = true;
+  chrome.element("warningsSelectAll").onchange();
+  release();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(posts.length, 1, "the rejected POST is not retried or delivered");
+  assert.equal(chrome.queued().length, 1);
+  assert.equal(chrome.element("send").disabled, false);
+  assert.match(chrome.element("sendHint").textContent, /Back\/Forward/);
+});
+
 test("protocol 1 encodes reserved characters in a served-route fallback", async () => {
   const route = "sub folder/report#draft%.html";
   const expectedPath = "/artifact/abc/sub%20folder/report%23draft%25.html";
@@ -7409,12 +7571,9 @@ test("protocol 1 displays and sends only the authenticated page and restores oth
   assert.equal(posts[1].prompts[1].attachments, undefined);
 });
 
-test("protocol 1 terminal reservations survive reload without collecting another page", async () => {
+test("protocol 1 single-page terminal reservations survive reload and navigation", async () => {
   const a = protocolWhiteboardBinding("a.html", "a");
-  const storedQueue = [
-    { prompt_id: "pending-a", prompt: "A", tag: "message", page: "a.html", page_proof: "proof-a" },
-    { prompt_id: "pending-b", prompt: "B", tag: "message", page: "b.html", page_proof: "proof-b" },
-  ];
+  const storedQueue = [{ prompt_id: "pending-a", prompt: "A", tag: "message", page: "a.html", page_proof: "proof-a" }];
   const storage = new Map();
   const posts = [];
   const chrome = await createChromeHarness({
@@ -7470,7 +7629,7 @@ test("protocol 1 terminal reservations survive reload without collecting another
   );
   assert.deepEqual(
     restored.queued().map((prompt) => prompt.page),
-    ["b.html"],
+    [],
   );
 
   const migrated = await createChromeHarness({
@@ -7487,7 +7646,133 @@ test("protocol 1 terminal reservations survive reload without collecting another
     false,
     "unscoped legacy reservations restore as editable page queues",
   );
-  assert.equal(migrated.queued().length, 2);
+  assert.equal(migrated.queued().length, 1);
+});
+
+test("protocol 1 restored terminal reservations unlock when another page has pending work", async () => {
+  const b = protocolWhiteboardBinding("b.html", "b");
+  const storage = new Map([["lavish-axi:terminal:abc", JSON.stringify({ page: "a.html", ids: ["pending-a"] })]]);
+  const posts = [];
+  const chrome = await createChromeHarness({
+    storage,
+    storedQueue: [
+      { prompt_id: "pending-a", prompt: "A", page: "a.html", page_proof: "proof-a" },
+      { prompt_id: "pending-b", prompt: "B", page: "b.html", page_proof: "proof-b" },
+    ],
+    artifactSrc: b.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: b,
+    fetchImpl: async (url, init) => {
+      posts.push([String(url), init]);
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.element("send").disabled, false);
+  assert.equal(chrome.frame.inert, false);
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.equal(posts.filter(([url]) => /\/(prompts|end)$/.test(url)).length, 0);
+  assert.equal(chrome.queued().length, 2);
+  assert.match(chrome.element("sendHint").textContent, /Back\/Forward/);
+  assert.equal(storage.has("lavish-axi:terminal:abc"), false);
+});
+
+test("protocol 1 restored other-page drafts block terminal delivery without a queued prompt", async () => {
+  const a = protocolWhiteboardBinding("a.html", "a");
+  const storage = new Map([
+    ["lavish-axi:terminal:abc", JSON.stringify({ page: "a.html", ids: ["pending-a"] })],
+    ["lavish-axi:queued:abc:drafts", JSON.stringify([["b.html", "Retained B draft"]])],
+  ]);
+  const posts = [];
+  const chrome = await createChromeHarness({
+    storage,
+    storedQueue: [{ prompt_id: "pending-a", prompt: "A", page: "a.html", page_proof: a.proof }],
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+    fetchImpl: async (url, init) => {
+      if (/\/(prompts|end)$/.test(String(url))) posts.push(init);
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.element("send").disabled, false);
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.equal(posts.length, 0);
+  assert.equal(chrome.queued().length, 1);
+  assert.match(chrome.element("sendHint").textContent, /Back\/Forward/);
+  assert.equal(storage.has("lavish-axi:terminal:abc"), false);
+  assert.equal(JSON.parse(storage.get("lavish-axi:queued:abc:drafts"))[0][1], "Retained B draft");
+});
+
+test("protocol 1 terminal guard owns drafts, attachments and warning selections by page", async () => {
+  for (const kind of [
+    "draft",
+    "annotation",
+    "warning",
+    "pending-attachment",
+    "ready-attachment",
+    "error-attachment",
+    "empty",
+  ]) {
+    const a = protocolWhiteboardBinding("a.html", "a");
+    const b = protocolWhiteboardBinding("b.html", "b");
+    const posts = [];
+    const chrome = await createChromeHarness({
+      artifactSrc: a.destination,
+      sessionData: { ...defaultSessionData, pageProtocol: 1 },
+      modernBinding: a,
+      fetchImpl: async (url, init) => {
+        if (String(url).endsWith("/attachments")) {
+          if (kind === "pending-attachment") return new Promise(() => {});
+          if (kind === "error-attachment") throw new Error("offline");
+          return { ok: true, json: async () => ({ attachment: { id: "a".repeat(64) + ".png" } }) };
+        }
+        if (/\/(prompts|end)$/.test(String(url))) posts.push(JSON.parse(init.body || "{}"));
+        return { ok: true, json: async () => ({}) };
+      },
+    });
+    await flushPromises();
+    await flushPromises();
+    if (kind === "draft") chrome.element("chatInput").value = "Retained A draft";
+    if (kind === "annotation" || kind === "empty")
+      chrome.sendModernMessage({
+        ...chrome.modernPostedToFrame.filter((message) => message.type === "lavish:activate").at(-1),
+        type: "lavish:reviewState",
+        state: { card: kind === "annotation" ? { selector: "h1", text: "A annotation draft" } : null, fields: [] },
+      });
+    if (kind.endsWith("attachment"))
+      chrome.element("chatInput").dispatch("paste", clipboardEvent(pastedImage("a.png")));
+    chrome.eventSource().listeners.get("layout-warnings")({
+      data: JSON.stringify({ warnings: [warningPayload({ id: "wa", page: "a.html" })] }),
+    });
+    if (kind === "warning") {
+      chrome.element("warningsSelectAll").checked = true;
+      chrome.element("warningsSelectAll").onchange();
+    }
+    await flushPromises();
+    await flushPromises();
+    chrome.updateModernBinding(b);
+    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: b.documentId });
+    await flushPromises();
+    await flushPromises();
+    chrome.element("chatInput").value = "B composer";
+    chrome.element("sendAndEnd").click();
+    chrome.runTimers(5000);
+    await flushPromises();
+    assert.equal(posts.length, kind === "empty" ? 1 : 0, kind);
+    if (kind === "empty") assert.equal(posts[0].endSession, true);
+    else {
+      assert.equal(chrome.element("chatInput").value, "B composer", kind);
+      assert.match(chrome.element("sendHint").textContent, /Back\/Forward/, kind);
+    }
+  }
 });
 
 test("protocol 1 warning selection and delayed preparation stay with the captured page", async () => {
