@@ -11,9 +11,9 @@ test("352-M01", { skip: !acceptance, timeout: 600_000 }, async (t) => {
     child.plan(1);
     child.assert.equal(result.originalGreen, true);
   });
-  await t.test("sibling-loads-without-review", (child) => {
+  await t.test("sibling-review-unavailable", (child) => {
     child.plan(1);
-    child.assert.equal(result.siblingLoadsWithoutReview, true);
+    child.assert.equal(result.siblingReviewUnavailable, true);
   });
   await t.test("intended-assertion-red", (child) => {
     child.plan(1);

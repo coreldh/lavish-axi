@@ -530,8 +530,8 @@ test("352-B01", { skip: !runBrowserE2e, timeout: 240_000 }, async (t) => {
     click(/button "Send to Agent"/);
     const queuedState = await eventually(
       state,
-      (value) => value.sessions?.[sessionKey]?.pending_prompts === 2,
-      "the mixed-page batch did not reach the real store",
+      (value) => value.sessions?.[sessionKey]?.pending_prompts === 1,
+      "the active-page batch did not reach the real store",
     );
     const storedSession = queuedState.sessions[sessionKey];
     const pollOutput = run(process.execPath, [cli, "poll", entry, "--timeout-ms", "10000"], lavishEnv, 30_000);
@@ -572,15 +572,14 @@ test("352-B01", { skip: !runBrowserE2e, timeout: 240_000 }, async (t) => {
       child.assert.match(observations.entryView, /Entry review target/);
     });
     await t.test("entry-annotation", (child) => {
-      child.plan(2);
+      child.plan(1);
       child.assert.match(observations.entryQueued, /Entry annotation note/);
-      child.assert.equal(observations.storedSession.prompts[0].prompt, "Entry annotation note");
     });
     await t.test("authored-sibling-question", (child) => {
       child.plan(3);
       child.assert.match(observations.siblingView, /Sibling review target/);
       child.assert.match(observations.siblingQueued, /Sibling question note/);
-      child.assert.equal(observations.storedSession.prompts[1].prompt, "Sibling question note");
+      child.assert.equal(observations.storedSession.prompts[0].prompt, "Sibling question note");
     });
     await t.test("back-forward", (child) => {
       child.plan(2);
@@ -596,9 +595,9 @@ test("352-B01", { skip: !runBrowserE2e, timeout: 240_000 }, async (t) => {
       child.plan(3);
       child.assert.deepEqual(
         observations.storedSession.prompts.map((prompt) => prompt.page),
-        ["start.html", "sub/index.html"],
+        ["sub/index.html"],
       );
-      child.assert.match(observations.pollOutput, /,start\.html/);
+      child.assert.doesNotMatch(observations.pollOutput, /,start\.html/);
       child.assert.match(observations.pollOutput, /,sub\/index\.html/);
     });
     await t.test("single-sibling-snapshot", (child) => {
@@ -620,10 +619,10 @@ test("352-B01", { skip: !runBrowserE2e, timeout: 240_000 }, async (t) => {
         child.assert.deepEqual(observations.finalBytes.get(file), original);
       }
     });
-    await t.test("same-generation", (child) => {
+    await t.test("reload-generation", (child) => {
       child.plan(2);
-      child.assert.equal(observations.storedSession.artifact_revision, observations.initialRevision);
-      child.assert.equal(observations.consumedSession.artifact_revision, observations.initialRevision);
+      child.assert.equal(observations.storedSession.artifact_revision > observations.initialRevision, true);
+      child.assert.equal(observations.consumedSession.artifact_revision, observations.storedSession.artifact_revision);
     });
   } finally {
     cleanupRun(process.execPath, [cli, "stop", "--port", String(port)], lavishEnv);

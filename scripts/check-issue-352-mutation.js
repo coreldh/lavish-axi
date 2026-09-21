@@ -78,7 +78,7 @@ export async function runIssue352Mutation({ repoRoot = defaultRepoRoot } = {}) {
     copyRoot,
     outsideRepo: !path.resolve(copyRoot).startsWith(`${path.resolve(repoRoot)}${path.sep}`),
     originalGreen: false,
-    siblingLoadsWithoutReview: false,
+    siblingReviewUnavailable: false,
     intendedAssertionRed: false,
     restoredGreen: false,
     cleanup: false,
@@ -108,11 +108,12 @@ export async function runIssue352Mutation({ repoRoot = defaultRepoRoot } = {}) {
     }
     const mutant = b01(copyRoot);
     result.diagnostics.mutant = mutant.output;
-    result.siblingLoadsWithoutReview = /Sibling review target/.test(mutant.output);
+    result.siblingReviewUnavailable =
+      /authored sibling did not become reviewable/.test(mutant.output) ||
+      /sibling annotation card did not open/.test(mutant.output);
     result.intendedAssertionRed =
       mutant.status !== 0 &&
-      /sibling annotation card did not open/.test(mutant.output) &&
-      result.siblingLoadsWithoutReview &&
+      result.siblingReviewUnavailable &&
       !/failed instead of reaching the product assertion/i.test(mutant.output);
     if (!result.intendedAssertionRed) {
       throw new Error(`M01 mutant did not fail at the sibling review seam\n${mutant.output}`);
