@@ -10806,3 +10806,66 @@ test("protocol 1 authenticates the chrome to the document before it is challenge
   await flushPromises();
   assert.equal(activated(), true);
 });
+
+for (const stage of ["chrome-auth", "binding validation"]) {
+  test(`protocol 1 keeps an authenticated handshake when the frame load fires during ${stage}`, async () => {
+    const nonce = "nonce-AAAAAAAAAAAAAAAAAAAAAAAA";
+    const binding = {
+      page: "page-a.html",
+      proof: "proof-a",
+      route: "page-a.html",
+      destination: "/artifact/abc/page-a.html",
+      documentId: "document-a",
+      token: "harness-load-1",
+      revision: 1,
+      chromeAuth: "server-mac",
+    };
+    /** @type {Array<() => void>} */
+    const releases = [];
+    const deferred = (response) =>
+      new Promise((resolve) => {
+        releases.push(() => resolve(response));
+      });
+    const bindingValidationResponses = [];
+    if (stage === "binding validation") {
+      bindingValidationResponses.push(deferred({ ok: true, status: 204, json: async () => ({}) }));
+    }
+    const authResponse = { ok: true, status: 200, json: async () => ({ chrome_auth: "server-mac" }) };
+    const chrome = await createChromeHarness({
+      artifactSrc: binding.destination,
+      sessionData: {
+        ...defaultSessionData,
+        pageProtocol: 1,
+        initialArtifactLoadToken: "harness-load-1",
+        initialArtifactRevision: 1,
+      },
+      modernBinding: binding,
+      bindingValidationResponses,
+      fetchImpl: async (url) => {
+        if (String(url).includes("/artifact-bindings/chrome-auth")) {
+          return stage === "chrome-auth" ? deferred(authResponse) : authResponse;
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+    await flushPromises();
+    const activated = () => chrome.modernPostedToFrame.some((message) => message.type === "lavish:activate");
+
+    // The end-of-body SDK announces readiness before the document's load event reaches the chrome.
+    chrome.dispatchWindowEvent("message", {
+      source: chrome.frame.contentWindow,
+      data: { type: "lavish:ready", page_protocol: 1, document_id: "document-a", document_nonce: nonce },
+    });
+    await flushPromises();
+    await flushPromises();
+    assert.equal(releases.length, 1, `the ${stage} request is in flight`);
+    assert.equal(activated(), false);
+
+    chrome.dispatchFrameLoad();
+    releases[0]();
+    await flushPromises();
+    await flushPromises();
+    await flushPromises();
+    assert.equal(activated(), true, "the document binds without waiting for another readiness retry");
+  });
+}

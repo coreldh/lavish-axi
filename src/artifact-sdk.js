@@ -567,8 +567,10 @@ export function createArtifactSdk(
       if (readyRetryTimer) window.clearTimeout(readyRetryTimer);
       readyRetryTimer = undefined;
     };
+    const chromeOrigin = String(window.location?.origin || "");
     const readyListener = (event) => {
       if (accepted || event.source !== parent) return;
+      if (!chromeOrigin || chromeOrigin === "null" || event.origin !== chromeOrigin) return;
       const message = event.data || {};
       const port = event.ports && event.ports[0];
       if (message.type !== "lavish:challenge" || !port) return;

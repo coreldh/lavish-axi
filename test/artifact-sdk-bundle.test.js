@@ -109,6 +109,7 @@ function bootSdk({
   revisionsScript = null,
   revisionMarkElements = [],
   sdkOptions = undefined,
+  origin = "http://127.0.0.1",
 } = {}) {
   const posted = [];
   const documentListeners = [];
@@ -180,7 +181,7 @@ function bootSdk({
     scrollX: 0,
     scrollY: 0,
     location: {
-      origin: "http://127.0.0.1",
+      origin,
       pathname: "/artifact/abc/sub/page.html",
       search: "?view=full",
       hash: "#notes",
@@ -229,15 +230,18 @@ function bootSdk({
       }
       assert.fail("the SDK timer queue did not settle");
     },
-    // The chrome is the only legitimate sender, so its messages arrive with `source: parent`.
+    // The chrome is the only legitimate sender, so its messages arrive with `source: parent`
+    // from the server origin the artifact URL also names.
     sendChromeMessage(data) {
       const listeners = windowListeners.filter((entry) => entry.type === "message");
       assert.ok(listeners.length > 0, "the SDK registers a window message listener");
-      for (const listener of listeners) listener.handler({ source: sandbox.parent, data });
+      for (const listener of listeners) {
+        listener.handler({ source: sandbox.parent, origin: sandbox.window.location.origin, data });
+      }
     },
     dispatchWindowEvent(type, properties = {}) {
       for (const listener of windowListeners.filter((entry) => entry.type === type)) {
-        listener.handler({ source: sandbox.parent, ...properties });
+        listener.handler({ source: sandbox.parent, origin: sandbox.window.location.origin, ...properties });
       }
     },
     documentListenerCount(type) {
@@ -901,4 +905,60 @@ test("the protocol-1 SDK reveals nothing to a parent that cannot present this do
   assert.equal(seen.length, 1);
   assert.equal(seen[0].type, "lavish:challengeResponse");
   assert.equal(seen[0].page_proof, "proof-sub-page");
+});
+
+test("the protocol-1 SDK ignores the genuine chrome auth when a foreign or opaque parent relays it", async (t) => {
+  const boot = (origin = undefined) =>
+    bootSdk({
+      origin,
+      sdkOptions: {
+        pageProtocol: 1,
+        page: "sub/page.html",
+        pageProof: "proof-sub-page",
+        servedRoute: "sub/page.html",
+        chromeNonce: TEST_CHROME_NONCE,
+        chromeAuth: TEST_CHROME_AUTH,
+      },
+    });
+  const attempt = async (sdk, origin) => {
+    const channel = new MessageChannel();
+    /** @type {any} */ (channel.port1).unref?.();
+    /** @type {any} */ (channel.port2).unref?.();
+    t.after(() => {
+      channel.port1.close();
+      channel.port2.close();
+    });
+    const seen = portMessagesWithin(channel.port1);
+    sdk.dispatchWindowEvent("message", {
+      origin,
+      data: { type: "lavish:challenge", challenge: "relayed", chrome_auth: TEST_CHROME_AUTH },
+      ports: [channel.port2],
+    });
+    const messages = await seen;
+    channel.port1.postMessage({
+      type: "lavish:activate",
+      document_id: sdk.posted.find((message) => message.type === "lavish:ready")?.document_id,
+      document_sequence: 1,
+    });
+    return messages;
+  };
+
+  // An external page left in the chrome's artifact frame can obtain the MAC for any nonce it
+  // announces, then frame this document top-level in a popup it controls and relay that MAC.
+  const sdk = boot();
+  const clickListenersBefore = sdk.documentListenerCount("click");
+  for (const origin of ["http://evil.example", "http://127.0.0.1:4388", "null", "", undefined]) {
+    assert.deepEqual(await attempt(sdk, origin), [], `no response for origin ${origin}`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(sdk.documentListenerCount("click"), clickListenersBefore, "the review SDK never installed");
+
+  // A document whose own URL has no tuple origin can never accept an opaque sender.
+  const opaque = boot("null");
+  assert.deepEqual(await attempt(opaque, "null"), []);
+
+  // Positive control: the same MAC from the chrome's own origin completes the challenge.
+  const seen = await attempt(sdk, "http://127.0.0.1");
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].type, "lavish:challengeResponse");
 });

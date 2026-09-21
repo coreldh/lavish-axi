@@ -390,10 +390,12 @@ test(
       const artifactUrl = new URL(`/artifact/${key}/${encodeURIComponent(path.basename(entry))}`, url).href;
       const before = (await readState()).sessions[key];
       // The hostile parent speaks the CURRENT protocol: it answers readiness with a real
-      // MessageChannel challenge (no auth, forged auth, the public nonce as auth), tries to
+      // MessageChannel challenge (no auth, forged auth, the public nonce as auth, and the genuine
+      // MAC the chrome would hand to an external page left in its artifact frame), tries to
       // activate the port anyway, replays the obsolete bind, and drives review routes directly.
       const hostile = `<script>
-        window.received=[];window.portMessages=[];window.routeStatuses=[];
+        window.received=[];window.portMessages=[];window.routeStatuses=[];window.oracle=[];
+        const asked={};
         addEventListener('message',e=>{
           received.push(e.data);
           if(e.data&&e.data.relay!==undefined)return;
@@ -403,6 +405,18 @@ test(
             c.port1.onmessage=m=>portMessages.push(m.data);
             e.source.postMessage({type:'lavish:challenge',challenge:'hostile',chrome_auth},'*',[c.port2]);
             c.port1.postMessage({type:'lavish:activate',document_id:e.data&&e.data.document_id,document_sequence:1});
+          }
+          const nonce=e.data&&e.data.document_nonce;
+          if(nonce&&!asked[nonce]){
+            asked[nonce]=true;
+            const source=e.source;
+            fetch('/mac?nonce='+encodeURIComponent(nonce)).then(r=>r.json()).then(b=>{
+              oracle.push(b.chrome_auth||'');
+              if(!b.chrome_auth)return;
+              const c=new MessageChannel();
+              c.port1.onmessage=m=>portMessages.push(m.data);
+              source.postMessage({type:'lavish:challenge',challenge:'relayed',chrome_auth:b.chrome_auth},'*',[c.port2]);
+            },()=>oracle.push(''));
           }
           e.source.postMessage({type:'lavish:bind',...e.data},'*');
           e.source.postMessage({type:'lavish:setAnnotationMode',enabled:true},'*');
@@ -416,12 +430,24 @@ test(
         post('artifact-bindings/chrome-auth',{document_nonce:'x'.repeat(32)});
       </script><iframe id="direct" src="${artifactUrl}"></iframe>
       <iframe id="intermediate" sandbox="allow-scripts" srcdoc="<script>parent.postMessage({relay:'alive'},'*');addEventListener('message',e=>parent.postMessage({relay:e.data},'*'))</script><iframe src='${artifactUrl}'></iframe>"></iframe>`;
+      const live = new URL(
+        (await fetch(artifactUrl).then((response) => response.text())).match(
+          /<script src="([^"]*\/sdk\.js\?[^"]+)"><\/script>/,
+        )?.[1] || "",
+        artifactUrl,
+      );
       const hostilePort = await freePort();
       hostileServer = spawn(process.execPath, ["-e", HOSTILE_SERVER_SCRIPT], {
         env: {
           ...process.env,
           LAVISH_HOSTILE_PORT: String(hostilePort),
           LAVISH_HOSTILE_HTML: Buffer.from(hostile).toString("base64"),
+          LAVISH_HOSTILE_ORACLE: JSON.stringify({
+            url: new URL(`/api/${key}/artifact-bindings/chrome-auth`, url).href,
+            origin: new URL(url).origin,
+            artifact_load_token: live.searchParams.get("artifact_load_token"),
+            artifact_revision: Number(live.searchParams.get("artifact_revision")),
+          }),
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -434,9 +460,11 @@ test(
       await new Promise((resolve) => setTimeout(resolve, 3000));
       const result = browser(
         "eval",
-        "() => JSON.stringify({received: window.received, ports: window.portMessages, routes: window.routeStatuses.sort()})",
+        "() => JSON.stringify({received: window.received, ports: window.portMessages, routes: window.routeStatuses.sort(), oracle: window.oracle})",
       );
       const observed = parseEvalJson(result);
+      assert.ok(observed.oracle.length > 0, "the hostile parent asked the oracle for the document's MAC");
+      for (const auth of observed.oracle) assert.ok(auth, "the relayed MAC is the genuine one");
       // The authored page renders and may announce readiness, but that is all a foreign parent gets.
       assert.match(browser("snapshot"), /Exact entry target/);
       assert.deepEqual(observed.ports, [], "no challenge response or bound-port traffic reaches a foreign parent");
@@ -680,10 +708,29 @@ test(
   },
 );
 
+// '/mac' stands in for the chrome, which fetches the MAC for whatever nonce its frame announces.
 const HOSTILE_SERVER_SCRIPT = String.raw`
 const http = require("node:http");
 const html = Buffer.from(process.env.LAVISH_HOSTILE_HTML, "base64");
-const server = http.createServer((_req, res) => {
+const oracle = process.env.LAVISH_HOSTILE_ORACLE ? JSON.parse(process.env.LAVISH_HOSTILE_ORACLE) : null;
+const server = http.createServer(async (req, res) => {
+  const requested = new URL(req.url, "http://127.0.0.1");
+  if (requested.pathname === "/mac" && oracle) {
+    const body = await fetch(oracle.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: oracle.origin },
+      body: JSON.stringify({
+        artifact_load_token: oracle.artifact_load_token,
+        artifact_revision: oracle.artifact_revision,
+        document_nonce: requested.searchParams.get("nonce"),
+      }),
+    })
+      .then((response) => response.json())
+      .catch(() => ({}));
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+    return;
+  }
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
 });

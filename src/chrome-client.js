@@ -342,6 +342,7 @@ let currentArtifactBinding = null;
 /** @type {{ documentId: string, port: MessagePort, timeout: ReturnType<typeof setTimeout> } | null} */
 let artifactChallengeAttempt = null;
 let latestReadyDocumentId = "";
+let latestReadyNonce = "";
 let nextDocumentSequence = 0;
 let nextBindingVersion = 0;
 let artifactLoadRecoveryAttempt = 0;
@@ -5447,6 +5448,7 @@ if (modernArtifactProtocol) {
     latestReadyDocumentId = String(message.document_id || "");
     const documentId = latestReadyDocumentId;
     const nonce = typeof message.document_nonce === "string" ? message.document_nonce : "";
+    latestReadyNonce = nonce;
     if (!nonce) {
       challengeArtifactDocument(documentId);
       return;
@@ -5784,7 +5786,7 @@ document.addEventListener(
   true,
 );
 frame.addEventListener("load", () => {
-  if (modernArtifactProtocol && !currentArtifactBinding) {
+  if (modernArtifactProtocol && !currentArtifactBinding && !latestReadyNonce) {
     latestReadyDocumentId = "";
     if (artifactChallengeAttempt) {
       clearTimeout(artifactChallengeAttempt.timeout);
