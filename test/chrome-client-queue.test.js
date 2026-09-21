@@ -7015,6 +7015,123 @@ test("protocol 1 Send & End blocks atomically until other page queues are sent",
   assert.equal(chrome.queued().length, 0);
 });
 
+test("protocol 1 in-flight terminal sends keep newly authenticated pages inert until settlement", async () => {
+  for (const succeeds of [true, false]) {
+    const a = protocolWhiteboardBinding("a.html", "a");
+    const b = protocolWhiteboardBinding("b.html", "b");
+    const posts = [];
+    let release = () => {};
+    const chrome = await createChromeHarness({
+      storedQueue: [{ prompt_id: "pending-a", prompt: "A", page: a.page, page_proof: a.proof }],
+      artifactSrc: a.destination,
+      sessionData: { ...defaultSessionData, pageProtocol: 1 },
+      modernBinding: a,
+      fetchImpl: async (url, init) => {
+        if (String(url).endsWith("/prompts")) {
+          posts.push(JSON.parse(init.body));
+          return new Promise((resolve) => {
+            release = () => resolve({ ok: succeeds, status: succeeds ? 200 : 500, json: async () => ({}) });
+          });
+        }
+        return { ok: true, json: async () => ({}) };
+      },
+    });
+    await flushPromises();
+    await flushPromises();
+    chrome.eventSource().listeners.get("layout-warnings")({
+      data: JSON.stringify({
+        warnings: [warningPayload({ id: "wa", page: a.page }), warningPayload({ id: "wb", page: b.page })],
+      }),
+    });
+    assert.equal(chrome.warningRows()[0].children[0].disabled, false);
+    chrome.element("sendAndEnd").click();
+    assert.equal(chrome.warningRows()[0].children[0].disabled, true, "existing rows lock immediately");
+    chrome.runTimers(5000);
+    await flushPromises();
+    assert.equal(posts.length, 1);
+    assert.equal(chrome.frame.inert, true);
+    // Native browser history can change the document despite an inert iframe.
+    chrome.updateModernBinding(b);
+    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: b.documentId });
+    await flushPromises();
+    await flushPromises();
+    assert.equal(
+      chrome.modernPostedToFrame.filter((message) => message.type === "lavish:activate").at(-1).page,
+      b.page,
+    );
+    assert.equal(chrome.frame.inert, true, "B cannot accept a new draft while A can still end the session");
+    assert.equal(chrome.element("chatInput").disabled, true);
+    const selection = chrome.warningRows()[0].children[0];
+    assert.equal(selection.disabled, true);
+    assert.equal(chrome.element("warningsSelectAll").disabled, true);
+    // Handler guards also reject already-dispatched or programmatic change events.
+    selection.checked = true;
+    selection.dispatch("change");
+    chrome.element("warningsSelectAll").checked = true;
+    chrome.element("warningsSelectAll").onchange();
+    assert.equal(selection.checked, false);
+    assert.equal(chrome.element("warningsSelectAll").checked, false);
+    assert.equal(chrome.element("warningsSelected").textContent, "None selected");
+    release();
+    await flushPromises();
+    await flushPromises();
+    assert.equal(chrome.frame.inert, succeeds, "only a failed reservation restores navigation on B");
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].endSession, true);
+    assert.deepEqual(
+      posts[0].prompts.map((prompt) => prompt.page),
+      [a.page],
+    );
+    assert.equal(chrome.queued().length, succeeds ? 0 : 1);
+    if (!succeeds) {
+      assert.equal(selection.disabled, false, "failed reservations restore selection on B");
+      assert.equal(chrome.element("warningsSelectAll").disabled, false);
+      selection.checked = true;
+      selection.dispatch("change");
+      assert.equal(chrome.element("warningsSelected").textContent, "1 selected");
+    }
+  }
+});
+
+test("in-flight terminal warning locks prevent Dismiss from clearing an existing selection", async () => {
+  let release = () => {};
+  let dismisses = 0;
+  const chrome = await createChromeHarness({
+    storedQueue: [{ prompt_id: "pending", prompt: "A", tag: "message" }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/prompts"))
+        return new Promise((resolve) => {
+          release = () => resolve({ ok: false, status: 500, json: async () => ({}) });
+        });
+      if (String(url).endsWith("/layout-warnings/dismiss")) dismisses++;
+      return { ok: true, json: async () => ({ warnings: [] }) };
+    },
+  });
+  chrome.eventSource().listeners.get("layout-warnings")({ data: JSON.stringify({ warnings: [warningPayload()] }) });
+  chrome.element("warningsSelectAll").checked = true;
+  chrome.element("warningsSelectAll").onchange();
+  const dismiss = chrome
+    .warningRows()[0]
+    .children[1].children.at(-1)
+    .children.find((child) => child.textContent === "Dismiss");
+  chrome.element("sendAndEnd").click();
+  chrome.runTimers(5000);
+  await flushPromises();
+  assert.equal(dismiss.disabled, true);
+  dismiss.dispatch("click");
+  await flushPromises();
+  assert.equal(dismisses, 0);
+  assert.equal(chrome.element("warningsSelected").textContent, "1 selected");
+  release();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(dismiss.disabled, false);
+  dismiss.click();
+  await flushPromises();
+  assert.equal(dismisses, 1);
+  assert.equal(chrome.element("warningsSelected").textContent, "None selected");
+});
+
 test("protocol 1 terminal delivery rechecks other-page work after the snapshot wait", async () => {
   const a = protocolWhiteboardBinding("a.html", "a");
   const b = protocolWhiteboardBinding("b.html", "b");
@@ -7045,7 +7162,7 @@ test("protocol 1 terminal delivery rechecks other-page work after the snapshot w
   assert.equal(chrome.element("send").disabled, false);
 });
 
-test("protocol 1 terminal 413 retry blocks if another page selects feedback during the rejected POST", async () => {
+test("protocol 1 terminal 413 retry blocks if another page reports a draft during the rejected POST", async () => {
   const a = protocolWhiteboardBinding("a.html", "a");
   const b = protocolWhiteboardBinding("b.html", "b");
   const posts = [];
@@ -7083,8 +7200,12 @@ test("protocol 1 terminal 413 retry blocks if another page selects feedback duri
   chrome.eventSource().listeners.get("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload({ id: "wb", page: "b.html" })] }),
   });
-  chrome.element("warningsSelectAll").checked = true;
-  chrome.element("warningsSelectAll").onchange();
+  chrome.sendModernMessage({
+    ...chrome.modernPostedToFrame.filter((message) => message.type === "lavish:activate").at(-1),
+    type: "lavish:reviewState",
+    state: { card: { selector: "h1", text: "Delayed B draft state" }, fields: [] },
+  });
+  await flushPromises();
   release();
   await flushPromises();
   await flushPromises();
@@ -7693,6 +7814,11 @@ test("protocol 1 single-page terminal reservations survive reload and navigation
   await flushPromises();
   await flushPromises();
   assert.equal(restored.frame.inert, false, "a reservation on A must not trap navigation on B");
+  restored.eventSource().listeners.get("layout-warnings")({
+    data: JSON.stringify({ warnings: [warningPayload({ id: "restored-b", page: b.page })] }),
+  });
+  assert.equal(restored.warningRows()[0].children[0].disabled, false);
+  assert.equal(restored.element("warningsSelectAll").disabled, false);
   assert.equal(restored.element("sendAndEnd").disabled, true);
   restored.updateModernBinding(a);
   restored.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: a.documentId });

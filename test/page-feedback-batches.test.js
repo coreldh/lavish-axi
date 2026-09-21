@@ -114,6 +114,37 @@ test("partial and rejected fatal page contexts cannot create modern batches whil
   assert.equal(delivered.artifact_failures[0].detail, "Legacy entry");
 });
 
+test("camel-case proof-only reports cannot bypass fatal or layout context validation as legacy", async (t) => {
+  for (const method of ["recordArtifactFailures", "recordLayoutDiagnostics"]) {
+    const { store, key, load } = await fixture(t);
+    const legacy = {
+      artifact_load_token: load.artifact_load_token,
+      artifact_revision: load.artifact_revision,
+      artifact_pass_sequence: 1,
+      complete: true,
+      viewport_width: 1080,
+      findings: [{ selector: "html", kind: "page-horizontal-overflow", overflowPx: 20, severity: "error" }],
+      failures: [{ kind: "artifact-unavailable", detail: "Legacy entry" }],
+    };
+    for (const options of [{}, { validatePageContext: async () => ({ ok: false }) }]) {
+      for (const pageProof of ["forged", "", null, undefined]) {
+        const rejected = await store[method](key, { ...legacy, pageProof }, options);
+        assert.equal(rejected.stale, true, method);
+        assert.equal(rejected.invalid_page_context, true, method);
+      }
+    }
+    const unchanged = await store.findByKey(key);
+    assert.equal(unchanged.artifact_failures.length, 0);
+    assert.equal(unchanged.layout_warnings.length, 0);
+    const accepted = await store[method](key, legacy);
+    assert.equal(
+      accepted.changed,
+      true,
+      "genuine legacy input remains valid and rejected reports do not advance ordering",
+    );
+  }
+});
+
 test("trusted fatal context aliases infer modern batches while unbound pre-SDK failures stay legacy", async (t) => {
   const { store, key, load } = await fixture(t);
   const unbound = {
@@ -373,6 +404,24 @@ test("HTTP flagless fatal-only reports reject forged context and poll A then B a
     assert.ok(script);
     const params = new URL(script, base).searchParams;
     const report = { ...failure(load, page, index + 1), page_proof: params.get("page_proof") };
+    const proofOnly = {
+      artifact_load_token: load.artifact_load_token,
+      artifact_revision: load.artifact_revision,
+      pageProof: "forged",
+      failures: report.failures,
+    };
+    assert.equal((await post(`/api/${session.key}/artifact-failures`, proofOnly)).status, 400);
+    assert.equal(
+      (
+        await post(`/api/${session.key}/layout-diagnostics`, {
+          ...proofOnly,
+          artifact_pass_sequence: 1,
+          complete: true,
+          findings: [],
+        })
+      ).status,
+      400,
+    );
     for (const invalid of [
       { ...report, page_proof: "unverified" },
       { ...report, page_proof: undefined },

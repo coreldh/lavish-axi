@@ -1617,6 +1617,7 @@ function hasDocumentContext(payload) {
   return (
     Object.hasOwn(source, "page") ||
     Object.hasOwn(source, "page_proof") ||
+    Object.hasOwn(source, "pageProof") ||
     Object.hasOwn(source, "document_sequence") ||
     Object.hasOwn(source, "documentSequence")
   );

@@ -1119,10 +1119,13 @@ function updateSendState() {
   // A terminal send owns the exact review batch, so freeze interactions inside the
   // artifact without disabling annotation mode. Disabling annotation mode closes the
   // SDK card and destroys an unsent draft before delivery has actually succeeded.
-  // A restored reservation must not trap the reviewer on another page: leave
-  // authored navigation usable so they can return to its page and retry.
+  // Native history can replace the document even while the iframe is inert;
+  // keep the replacement inert too until the terminal request settles.
+  // A restored or failed reservation may leave authored navigation usable on
+  // another page so the reviewer can return to its page and retry.
   frame.inert =
     ended ||
+    Boolean(terminalSubmission?.inFlight) ||
     (terminalReserved && (!modernArtifactProtocol || terminalSubmission.page === currentArtifactBinding?.page));
   const unavailable = modernArtifactProtocol && !currentArtifactBinding;
   sendButton.disabled = ended || terminalReserved || unavailable;
@@ -3156,8 +3159,9 @@ function createWarningRow(warning) {
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
   checkbox.className = "warning-select";
+  checkbox.dataset.warningId = warning.id;
   checkbox.checked = selectable && selectedWarningIds.has(warning.id);
-  checkbox.disabled = !selectable;
+  checkbox.disabled = !selectable || Boolean(terminalSubmission?.inFlight);
   checkbox.setAttribute(
     "aria-label",
     selectable
@@ -3165,6 +3169,10 @@ function createWarningRow(warning) {
       : warning.title + " on " + warning.viewport_label + " " + unavailableLabel,
   );
   checkbox.addEventListener("change", () => {
+    if (terminalSubmission?.inFlight) {
+      checkbox.checked = selectable && selectedWarningIds.has(warning.id);
+      return;
+    }
     if (checkbox.checked) selectedWarningIds.add(warning.id);
     else selectedWarningIds.delete(warning.id);
     persistWarningSelection();
@@ -3215,9 +3223,10 @@ function createWarningRow(warning) {
   }
   const dismiss = document.createElement("button");
   dismiss.type = "button";
-  dismiss.className = "warning-action";
+  dismiss.className = "warning-action warning-dismiss";
+  dismiss.dataset.warningId = warning.id;
   dismiss.textContent = "Dismiss";
-  dismiss.disabled = !selectable;
+  dismiss.disabled = !selectable || Boolean(terminalSubmission?.inFlight);
   dismiss.setAttribute(
     "aria-label",
     selectable
@@ -3275,7 +3284,15 @@ function updateWarningSelectionState() {
   const pending = pendingLayoutWarningIds();
   const selectable = activeWarnings().filter((warning) => warning.selectable && !pending.has(warning.id));
   const selectedCount = selectable.filter((warning) => selectedWarningIds.has(warning.id)).length;
-  warningsSelectAll.disabled = selectable.length === 0;
+  const selectionLocked = Boolean(terminalSubmission?.inFlight);
+  const selectableIds = new Set(selectable.map((warning) => warning.id));
+  for (const selector of [".warning-select", ".warning-dismiss"]) {
+    for (const element of warningsList.querySelectorAll(selector)) {
+      const control = /** @type {HTMLInputElement | HTMLButtonElement} */ (element);
+      control.disabled = selectionLocked || !selectableIds.has(control.dataset.warningId);
+    }
+  }
+  warningsSelectAll.disabled = selectable.length === 0 || selectionLocked;
   // Default selection is never "everything": Select all is an explicit action.
   warningsSelectAll.checked = selectable.length > 0 && selectedCount === selectable.length;
   warningsSelectAll.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
@@ -3284,6 +3301,10 @@ function updateWarningSelectionState() {
 }
 
 function toggleSelectAllWarnings() {
+  if (terminalSubmission?.inFlight) {
+    updateWarningSelectionState();
+    return;
+  }
   const pending = pendingLayoutWarningIds();
   const selectable = activeWarnings().filter((warning) => warning.selectable && !pending.has(warning.id));
   const shouldSelect = warningsSelectAll.checked;
@@ -3580,6 +3601,7 @@ function revealNextRevisionMark(id) {
 }
 
 async function dismissWarning(id) {
+  if (terminalSubmission?.inFlight) return;
   try {
     const response = await fetch("/api/" + key + "/layout-warnings/dismiss", {
       method: "POST",
