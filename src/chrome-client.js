@@ -342,7 +342,7 @@ let currentArtifactBinding = null;
 /** @type {{ documentId: string, port: MessagePort, timeout: ReturnType<typeof setTimeout> } | null} */
 let artifactChallengeAttempt = null;
 let latestReadyDocumentId = "";
-let latestReadyNonce = "";
+let pendingReadyLoadDocumentId = "";
 let nextDocumentSequence = 0;
 let nextBindingVersion = 0;
 let artifactLoadRecoveryAttempt = 0;
@@ -5445,10 +5445,11 @@ if (modernArtifactProtocol) {
     if (event.source !== frame.contentWindow) return;
     const message = event.data || {};
     if (message.type !== "lavish:ready" || message.page_protocol !== 1) return;
+    const previousDocumentId = latestReadyDocumentId;
     latestReadyDocumentId = String(message.document_id || "");
     const documentId = latestReadyDocumentId;
     const nonce = typeof message.document_nonce === "string" ? message.document_nonce : "";
-    latestReadyNonce = nonce;
+    if (documentId && documentId !== previousDocumentId) pendingReadyLoadDocumentId = documentId;
     if (!nonce) {
       challengeArtifactDocument(documentId);
       return;
@@ -5786,14 +5787,19 @@ document.addEventListener(
   true,
 );
 frame.addEventListener("load", () => {
-  if (modernArtifactProtocol && !currentArtifactBinding && !latestReadyNonce) {
-    latestReadyDocumentId = "";
-    if (artifactChallengeAttempt) {
-      clearTimeout(artifactChallengeAttempt.timeout);
-      artifactChallengeAttempt.port.close();
-      artifactChallengeAttempt = null;
+  if (modernArtifactProtocol && !currentArtifactBinding) {
+    const announcedDocumentLoaded =
+      pendingReadyLoadDocumentId && pendingReadyLoadDocumentId === latestReadyDocumentId;
+    pendingReadyLoadDocumentId = "";
+    if (!announcedDocumentLoaded) {
+      latestReadyDocumentId = "";
+      if (artifactChallengeAttempt) {
+        clearTimeout(artifactChallengeAttempt.timeout);
+        artifactChallengeAttempt.port.close();
+        artifactChallengeAttempt = null;
+      }
+      challengeArtifactDocument();
     }
-    challengeArtifactDocument();
   }
   if (artifactSpokeToken !== artifactLoadToken) armArtifactAvailabilityProbe(artifactLoadToken);
   postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });

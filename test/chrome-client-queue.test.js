@@ -10869,3 +10869,62 @@ for (const stage of ["chrome-auth", "binding validation"]) {
     assert.equal(activated(), true, "the document binds without waiting for another readiness retry");
   });
 }
+
+test("protocol 1 retires an unbound handshake when a later frame document loads", async () => {
+  const binding = {
+    page: "page-a.html",
+    proof: "proof-a",
+    route: "page-a.html",
+    destination: "/artifact/abc/page-a.html",
+    documentId: "document-a",
+    token: "harness-load-1",
+    revision: 1,
+    chromeAuth: "server-mac",
+  };
+  let releaseValidation;
+  const validation = new Promise((resolve) => {
+    releaseValidation = resolve;
+  });
+  const chrome = await createChromeHarness({
+    artifactSrc: binding.destination,
+    sessionData: {
+      ...defaultSessionData,
+      pageProtocol: 1,
+      initialArtifactLoadToken: "harness-load-1",
+      initialArtifactRevision: 1,
+    },
+    modernBinding: binding,
+    bindingValidationResponses: [validation],
+    fetchImpl: async (url) => {
+      if (String(url).includes("/artifact-bindings/chrome-auth")) {
+        return { ok: true, status: 200, json: async () => ({ chrome_auth: "server-mac" }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  chrome.dispatchWindowEvent("message", {
+    source: chrome.frame.contentWindow,
+    data: {
+      type: "lavish:ready",
+      page_protocol: 1,
+      document_id: "document-a",
+      document_nonce: "nonce-AAAAAAAAAAAAAAAAAAAAAAAA",
+    },
+  });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(chrome.bindingValidationRequests.length, 1);
+
+  chrome.dispatchFrameLoad();
+  chrome.dispatchFrameLoad();
+  releaseValidation({ ok: true, status: 204, json: async () => ({}) });
+  await flushPromises();
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(
+    chrome.modernPostedToFrame.some((message) => message.type === "lavish:activate"),
+    false,
+  );
+});
