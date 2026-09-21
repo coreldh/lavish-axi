@@ -325,7 +325,10 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   const departing = await departingPromise;
   assert.equal(departing.type, "lavish:documentDeparting");
   assert.equal(departing.document_sequence, 1);
-  assert.equal(departing.historical_destination_receipt, "receipt-before-bfcache");
+  // Signed history is retained by trusted chrome under document-id/exact-URL,
+  // not echoed back as authority by the untrusted artifact SDK.
+  assert.equal(departing.historical_destination_receipt, undefined);
+  assert.equal(departing.destination, firstResponse.destination);
 
   sdk.dispatchWindowEvent("pageshow", { persisted: true });
   const resumedReady = sdk.posted.at(-1);
@@ -341,7 +344,9 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
     ports: [second.port2],
   });
   const secondResponse = await secondResponsePromise;
-  assert.equal(secondResponse.historical_destination_receipt, "receipt-before-bfcache");
+  assert.equal(secondResponse.historical_destination_receipt, undefined);
+  assert.equal(secondResponse.document_id, firstResponse.document_id);
+  assert.equal(secondResponse.destination, firstResponse.destination);
   second.port1.postMessage({ ...secondResponse, type: "lavish:activate", document_sequence: 2 });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sdk.documentListenerCount("click"), clickListeners, "rebind does not duplicate the SDK");
@@ -416,7 +421,7 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
       served_route: "sub/page.html",
       destination: "/artifact/abc/sub/page.html?view=full#notes",
       document_sequence: 7,
-      historical_destination_receipt: "receipt-initial",
+      historical_destination_receipt: undefined,
     },
   );
 
@@ -424,7 +429,8 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   const unknownDestinationPromise = nextPortMessage(channel.port1);
   sdk.dispatchWindowEvent("hashchange");
   const unknownDestination = await unknownDestinationPromise;
-  assert.equal(unknownDestination.historical_destination_receipt, "");
+  assert.equal(unknownDestination.historical_destination_receipt, undefined);
+  assert.equal(unknownDestination.destination, "/artifact/abc/sub/page.html?view=full#other");
   channel.port1.postMessage({
     ...response,
     type: "lavish:historicalDestinationReceipt",
@@ -437,12 +443,14 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   const restoredDestinationPromise = nextPortMessage(channel.port1);
   sdk.dispatchWindowEvent("popstate");
   const restoredDestination = await restoredDestinationPromise;
-  assert.equal(restoredDestination.historical_destination_receipt, "receipt-initial");
+  assert.equal(restoredDestination.historical_destination_receipt, undefined);
+  assert.equal(restoredDestination.destination, "/artifact/abc/sub/page.html?view=full#notes");
   sdk.setLocation({ hash: "#other" });
   const otherDestinationPromise = nextPortMessage(channel.port1);
   sdk.dispatchWindowEvent("popstate");
   const otherDestination = await otherDestinationPromise;
-  assert.equal(otherDestination.historical_destination_receipt, "receipt-other");
+  assert.equal(otherDestination.historical_destination_receipt, undefined);
+  assert.equal(otherDestination.destination, "/artifact/abc/sub/page.html?view=full#other");
   sdk.setLocation({ hash: "#notes" });
 
   const { evidence } = buildTable(sdk);

@@ -1989,7 +1989,7 @@ test("feedback guidance edits the attributed sibling instead of assuming the ses
   assert.doesNotMatch(output.next_step, /changes to \/tmp\/site\/start\.html/);
 });
 
-test("accepted legacy feedback keeps entry attribution while modern null remains unavailable", async () => {
+test("accepted legacy feedback keeps entry attribution while modern null batches are rejected", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "lavish-cli-attribution-"));
   const artifact = path.join(dir, "entry.html");
   await writeFile(artifact, "<!doctype html><body>Entry</body>");
@@ -2030,15 +2030,12 @@ test("accepted legacy feedback keeps entry attribution while modern null remains
         snapshot_page_proof: "",
       }),
     });
-    assert.equal(modernPost.status, 200);
+    assert.equal(modernPost.status, 400);
+    assert.equal((await modernPost.json()).status, "invalid-page-context");
     const modernPoll = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`).then(
       (response) => response.json(),
     );
-    const modernOutput = createPollOutput({ file: artifact, response: modernPoll });
-    assert.equal(modernOutput.prompts[0].page, null);
-    assert.equal(modernOutput.snapshot_page, null);
-    assert.match(modernOutput.next_step, /Page attribution is unavailable/);
-    assert.match(modernOutput.next_step, /do not assume the session entry is the edit target/);
+    assert.equal(modernPoll.status, "waiting", "rejected modern feedback must not enter the legacy entry queue");
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });

@@ -64,20 +64,29 @@ export async function openVerifiedLocalFile(
 }
 
 export async function readVerifiedLocalFile(file, options = {}) {
+  // Metadata may reject an oversized asset even when its bytes are unreadable.
+  // This preflight never authorizes a read: confinement, protected identity, and
+  // the size checks still run on the handle whose bytes we actually consume.
+  if (Number.isFinite(options.maxAssetBytes) || Number.isFinite(options.maxBundleRemaining)) {
+    const preflight = await (options.statFile || stat)(file, { bigint: true });
+    rejectOversizedFile(preflight.size, options);
+  }
   const opened = await openVerifiedLocalFile(file, options);
   try {
-    if (Number.isFinite(options.maxAssetBytes) && opened.stats.size > BigInt(options.maxAssetBytes)) {
-      throw Object.assign(new Error(`${opened.stats.size} bytes exceeds per-asset cap ${options.maxAssetBytes}`), {
-        code: "TOO_LARGE",
-      });
-    }
-    if (Number.isFinite(options.maxBundleRemaining) && opened.stats.size > BigInt(options.maxBundleRemaining)) {
-      throw Object.assign(new Error(`would exceed per-bundle cap ${options.maxBundleBytes}`), {
-        code: "TOO_LARGE",
-      });
-    }
+    rejectOversizedFile(opened.stats.size, options);
     return await opened.handle.readFile();
   } finally {
     await opened.handle.close();
+  }
+}
+
+function rejectOversizedFile(size, options) {
+  if (Number.isFinite(options.maxAssetBytes) && size > BigInt(options.maxAssetBytes)) {
+    throw Object.assign(new Error(`${size} bytes exceeds per-asset cap ${options.maxAssetBytes}`), {
+      code: "TOO_LARGE",
+    });
+  }
+  if (Number.isFinite(options.maxBundleRemaining) && size > BigInt(options.maxBundleRemaining)) {
+    throw Object.assign(new Error(`would exceed per-bundle cap ${options.maxBundleBytes}`), { code: "TOO_LARGE" });
   }
 }

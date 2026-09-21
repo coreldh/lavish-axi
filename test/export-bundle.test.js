@@ -3289,6 +3289,7 @@ test("skips a local asset that exceeds the per-asset size cap and leaves it as a
 test("default reader rejects oversized assets before attempting to read them", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "lavish-export-"));
   const big = path.join(root, "big.png");
+  let opens = 0;
   try {
     await writeFile(big, Buffer.alloc(2048, 1));
     await chmod(big, 0);
@@ -3298,14 +3299,52 @@ test("default reader rejects oversized assets before attempting to read them", a
       baseDir: root,
       confineDir: root,
       maxAssetBytes: 1024,
+      openLocalFile: async () => {
+        opens += 1;
+        throw new Error("oversized assets must be rejected before opening");
+      },
     });
 
     assert.match(out, /<img src="big\.png">/);
     assert.equal(warnings.length, 1);
     assert.equal(warnings[0].kind, "too-large");
     assert.match(warnings[0].reason || "", /per-asset cap/);
+    assert.equal(opens, 0);
   } finally {
     await chmod(big, 0o600).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("default reader rechecks size on the consumed handle after the preflight races", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "lavish-export-size-race-"));
+  const file = path.join(root, "asset.png");
+  let reads = 0;
+  /** @type {import("node:fs/promises").FileHandle[]} */
+  const opened = [];
+  try {
+    await writeFile(file, Buffer.from("small"));
+    const { warnings } = await buildSelfContainedHtml('<img src="asset.png">', {
+      baseDir: root,
+      confineDir: root,
+      maxAssetBytes: 1024,
+      openLocalFile: async (target, flags) => {
+        await writeFile(target, Buffer.alloc(2048, 1));
+        const handle = await open(target, flags);
+        opened.push(handle);
+        const read = handle.readFile.bind(handle);
+        handle.readFile = (...args) => {
+          reads += 1;
+          return read(...args);
+        };
+        return handle;
+      },
+    });
+    assert.equal(warnings[0].kind, "too-large");
+    assert.equal(reads, 0, "preflight cannot authorize reading an oversized replacement");
+    assert.equal(opened.length, 1);
+    assert.equal(opened[0].fd, -1, "the rejected verified handle is closed");
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

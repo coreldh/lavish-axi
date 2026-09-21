@@ -2323,7 +2323,8 @@ export async function serve({
       res.status(403).send("Forbidden");
       return;
     }
-    res.type(opened.file);
+    // Express treats any string containing '/' as a MIME type, not a filename.
+    res.type(path.extname(opened.file) || "application/octet-stream");
     res.setHeader("content-length", String(opened.stats.size));
     try {
       await pipeline(opened.handle.createReadStream({ autoClose: false }), res);
