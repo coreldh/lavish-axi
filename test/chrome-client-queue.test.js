@@ -10881,7 +10881,8 @@ test("protocol 1 retires an unbound handshake when a later frame document loads"
     revision: 1,
     chromeAuth: "server-mac",
   };
-  let releaseValidation;
+  /** @type {(response: { ok: boolean, status: number, json: () => Promise<object> }) => void} */
+  let releaseValidation = () => {};
   const validation = new Promise((resolve) => {
     releaseValidation = resolve;
   });

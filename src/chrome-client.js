@@ -5788,8 +5788,7 @@ document.addEventListener(
 );
 frame.addEventListener("load", () => {
   if (modernArtifactProtocol && !currentArtifactBinding) {
-    const announcedDocumentLoaded =
-      pendingReadyLoadDocumentId && pendingReadyLoadDocumentId === latestReadyDocumentId;
+    const announcedDocumentLoaded = pendingReadyLoadDocumentId && pendingReadyLoadDocumentId === latestReadyDocumentId;
     pendingReadyLoadDocumentId = "";
     if (!announcedDocumentLoaded) {
       latestReadyDocumentId = "";
