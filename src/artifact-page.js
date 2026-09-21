@@ -189,6 +189,44 @@ export function verifyPageProof(key, sessionKey, canonicalRoot, page, proof, ent
 
 export { PAGE_PROOF_DOMAIN, PAGE_PROOF_KEY_BYTES, PAGE_PROOF_MAX_PAGE_BYTES };
 
+// Chrome authentication for the protocol-1 handshake. Each served document carries a fresh
+// server-minted nonce and this MAC over it. Only a same-origin chrome holding the current
+// artifact generation can obtain the MAC for a nonce, so a document that sees it in a challenge
+// knows its parent is this server's chrome before it reveals a load token or page proof. The MAC
+// is domain-separated from page proofs and grants nothing by itself.
+const CHROME_AUTH_NONCE_RE = /^[A-Za-z0-9_-]{22,128}$/;
+
+export function isChromeAuthNonce(nonce) {
+  return typeof nonce === "string" && CHROME_AUTH_NONCE_RE.test(nonce);
+}
+
+export function createChromeAuthNonce() {
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+export function signChromeAuth(key, sessionKey, nonce) {
+  if (!Buffer.isBuffer(key) || key.length !== PAGE_PROOF_KEY_BYTES) {
+    throw new TypeError("page proof key must be exactly 32 bytes");
+  }
+  if (typeof sessionKey !== "string" || !sessionKey || !isChromeAuthNonce(nonce)) {
+    throw new TypeError("invalid chrome auth input");
+  }
+  return crypto
+    .createHmac("sha256", key)
+    .update(JSON.stringify(["chrome-auth-v1", sessionKey, nonce]), "utf8")
+    .digest("base64url");
+}
+
+export function verifyChromeAuth(key, sessionKey, nonce, auth) {
+  if (!Buffer.isBuffer(key) || key.length !== PAGE_PROOF_KEY_BYTES) return false;
+  if (typeof sessionKey !== "string" || !sessionKey || !isChromeAuthNonce(nonce) || typeof auth !== "string") {
+    return false;
+  }
+  const expected = Buffer.from(signChromeAuth(key, sessionKey, nonce));
+  const actual = Buffer.from(auth);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
 // Historical evidence only. Callers must validate the complete destination before signing,
 // and resolve it afresh after verification. Keep this MAC separate from page authorization.
 function historicalDestinationPayload(sessionKey, canonicalRoot, entryFile, destination, documentId) {

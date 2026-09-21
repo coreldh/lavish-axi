@@ -457,7 +457,7 @@ export function deriveAttachmentNoticeState(state = {}) {
  * @param {number} [artifactRevision]
  * @param {string} [artifactLoadToken]
  * @param {string} [sessionKey]
- * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[], transportPort?: MessagePort | null, binding?: { page: string | null, pageProof: string, servedRoute: string, documentId: string, documentSequence: number } | null, pageProtocol?: number, page?: string | null, pageProof?: string, servedRoute?: string }} [options]
+ * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[], transportPort?: MessagePort | null, binding?: { page: string | null, pageProof: string, servedRoute: string, documentId: string, documentSequence: number } | null, pageProtocol?: number, page?: string | null, pageProof?: string, servedRoute?: string, chromeNonce?: string, chromeAuth?: string }} [options]
  */
 export function createArtifactSdk(
   deriveQueueKey,
@@ -474,6 +474,8 @@ export function createArtifactSdk(
   const embeddedPage = options?.page === null || options?.page === undefined ? null : String(options.page);
   const embeddedPageProof = String(options?.pageProof || "");
   const embeddedServedRoute = String(options?.servedRoute || "");
+  const embeddedChromeNonce = String(options?.chromeNonce || "");
+  const embeddedChromeAuth = String(options?.chromeAuth || "");
 
   // Protocol 1 deliberately has a tiny inert bootstrap.  An eligible HTML
   // document can be opened directly, inside a nested frame, or in a popup; none
@@ -572,6 +574,12 @@ export function createArtifactSdk(
       if (message.type !== "lavish:challenge" || !port) return;
       const challenge = String(message.challenge || "");
       if (!challenge || challenge.length > 200) return;
+      // Authenticate the chrome BEFORE revealing anything. Artifact pages may be framed by any
+      // parent (an authored nested iframe needs that), so `event.source === parent` proves
+      // nothing about who the parent is. Only this server's same-origin, current-generation
+      // chrome can obtain the MAC for this document's nonce; a foreign parent's challenge is
+      // dropped silently and never receives the load token, page proof, or a bound port.
+      if (!embeddedChromeAuth || message.chrome_auth !== embeddedChromeAuth) return;
       const response = {
         type: "lavish:challengeResponse",
         page_protocol: 1,
@@ -642,7 +650,11 @@ export function createArtifactSdk(
     };
     const announceReady = () => {
       if (accepted) return;
-      parent.postMessage({ type: "lavish:ready", page_protocol: 1, document_id: documentId }, "*");
+      // The nonce is not a secret: it only names which MAC the chrome must fetch.
+      parent.postMessage(
+        { type: "lavish:ready", page_protocol: 1, document_id: documentId, document_nonce: embeddedChromeNonce },
+        "*",
+      );
       readyAttempt += 1;
       if (readyAttempt < READY_RETRY_LIMIT) {
         stopReadyRetry();

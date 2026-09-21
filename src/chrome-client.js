@@ -5228,7 +5228,38 @@ function handleArtifactMessage(event, binding = null) {
   if (msg.type === "lavish:toggleAnnotationMode") toggleAnnotationMode();
 }
 
-function challengeArtifactDocument(expectedDocumentId = "") {
+// Protocol-1 documents answer a challenge only when it carries the server's MAC over their own
+// nonce, so the chrome fetches it (same-origin, current generation) before challenging. Only
+// successes are cached: the document re-announces readiness, which retries a failed fetch.
+const chromeAuthRequests = new Map();
+function requestChromeAuth(nonce) {
+  const cacheKey = String(artifactLoadToken || "") + "\n" + nonce;
+  const cached = chromeAuthRequests.get(cacheKey);
+  if (cached) return cached;
+  if (chromeAuthRequests.size >= 32) chromeAuthRequests.clear();
+  const request = fetch("/api/" + key + "/artifact-bindings/chrome-auth", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      artifact_load_token: String(artifactLoadToken || ""),
+      artifact_revision: Number(artifactLoadRevision),
+      document_nonce: nonce,
+    }),
+  })
+    .then(async (response) => {
+      const body = response.ok ? await response.json().catch(() => ({})) : {};
+      return typeof body?.chrome_auth === "string" ? body.chrome_auth : "";
+    })
+    .catch(() => "")
+    .then((auth) => {
+      if (!auth && chromeAuthRequests.get(cacheKey) === request) chromeAuthRequests.delete(cacheKey);
+      return auth;
+    });
+  chromeAuthRequests.set(cacheKey, request);
+  return request;
+}
+
+function challengeArtifactDocument(expectedDocumentId = "", chromeAuth = "") {
   if (!modernArtifactProtocol || !frame.contentWindow) return;
   if (
     currentArtifactBinding &&
@@ -5401,7 +5432,9 @@ function challengeArtifactDocument(expectedDocumentId = "") {
   // expose `unref`, so these calls are inert in production.
   /** @type {any} */ (channel.port1).unref?.();
   /** @type {any} */ (channel.port2).unref?.();
-  source.postMessage({ type: "lavish:challenge", challenge }, "*", [channel.port2]);
+  source.postMessage({ type: "lavish:challenge", challenge, ...(chromeAuth ? { chrome_auth: chromeAuth } : {}) }, "*", [
+    channel.port2,
+  ]);
 }
 
 if (modernArtifactProtocol) {
@@ -5412,7 +5445,16 @@ if (modernArtifactProtocol) {
     const message = event.data || {};
     if (message.type !== "lavish:ready" || message.page_protocol !== 1) return;
     latestReadyDocumentId = String(message.document_id || "");
-    challengeArtifactDocument(latestReadyDocumentId);
+    const documentId = latestReadyDocumentId;
+    const nonce = typeof message.document_nonce === "string" ? message.document_nonce : "";
+    if (!nonce) {
+      challengeArtifactDocument(documentId);
+      return;
+    }
+    requestChromeAuth(nonce).then((chromeAuth) => {
+      if (!chromeAuth || latestReadyDocumentId !== documentId || ended) return;
+      challengeArtifactDocument(documentId, chromeAuth);
+    });
   });
 } else {
   window.addEventListener("message", (event) => handleArtifactMessage(event));

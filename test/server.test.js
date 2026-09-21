@@ -2315,13 +2315,16 @@ test("/artifact serves files copied under the artifact directory", async () => {
 
     assert.equal(documentResponse.status, 200);
     assert.equal(documentResponse.headers.get("content-security-policy"), expectedSandbox);
+    // Path-addressed responses keep the opaque-origin sandbox but must be framable by the
+    // opaque-origin artifact itself, which no frame-ancestors expression can name.
+    const pathSandbox = expectedSandbox.replace("; frame-ancestors 'self'", "");
     assert.equal(popup.status, 200);
-    assert.equal(popup.headers.get("content-security-policy"), expectedSandbox);
+    assert.equal(popup.headers.get("content-security-policy"), pathSandbox);
     assert.equal(css.status, 200);
     assert.match(css.headers.get("content-type") || "", /text\/css/);
     assert.equal(await css.text(), "body { color: rgb(1 2 3); }\n");
     assert.equal(svg.status, 200);
-    assert.equal(svg.headers.get("content-security-policy"), expectedSandbox);
+    assert.equal(svg.headers.get("content-security-policy"), pathSandbox);
     assert.match(svg.headers.get("content-type") || "", /image\/svg\+xml/);
     assert.match(await svg.text(), /<svg/);
   } finally {

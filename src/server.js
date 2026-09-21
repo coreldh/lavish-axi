@@ -64,15 +64,19 @@ import { injectLavishSdk } from "./html-transform.js";
 import {
   artifactDestinationPathMatches,
   canonicalArtifactRoot,
+  createChromeAuthNonce,
   isArtifactHtmlPage,
+  isChromeAuthNonce,
   loadPageProofKey,
   normalizeReviewPageIdentity,
   pageProofKeyIdentity,
   readResolvedArtifactPage,
   resolveArtifactEntry,
   resolveArtifactPage,
+  signChromeAuth,
   signPageProof,
   signHistoricalDestination,
+  verifyChromeAuth,
   verifyHistoricalDestination,
   verifyPageProof,
 } from "./artifact-page.js";
@@ -147,8 +151,18 @@ const BROWSER_DISCONNECT_GRACE_MS = 10_000;
 // An escaped popup can navigate to an artifact-owned HTML or SVG asset on the
 // server origin. Keep every artifact response sandboxed at the response layer
 // so active documents stay opaque-origin even when they are top-level.
-const ARTIFACT_CONTENT_SECURITY_POLICY =
-  "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads; frame-ancestors 'self'";
+const ARTIFACT_SANDBOX_POLICY =
+  "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads";
+// Strict framing for responses with no authenticated handshake of their own: the legacy virtual
+// entry (whose full SDK talks to whatever parent frames it) and the export download.
+const ARTIFACT_CONTENT_SECURITY_POLICY = `${ARTIFACT_SANDBOX_POLICY}; frame-ancestors 'self'`;
+// Path-addressed artifact responses cannot use frame-ancestors: the reviewed artifact is
+// opaque-origin, so an authored nested sibling iframe can never satisfy 'self' and would be
+// blocked. Framing is therefore not the boundary here. A protocol-1 document stays inert unless it
+// is a direct child of its top window AND that parent presents the server-issued chrome-auth MAC
+// for this document's nonce, which only a same-origin current-generation chrome can obtain. A
+// foreign parent renders authored HTML and receives no token, proof, or review authority.
+const ARTIFACT_PATH_CONTENT_SECURITY_POLICY = ARTIFACT_SANDBOX_POLICY;
 // Sweep orphaned/expired attachments periodically, not just at startup: a
 // detached server can run for days, and an upload whose /prompts follow-up never
 // arrived would otherwise linger until the next restart.
@@ -2072,6 +2086,42 @@ export async function serve({
     }
   });
 
+  // The chrome proves itself to a protocol-1 document before that document reveals anything. Only
+  // a same-origin caller holding the CURRENT artifact generation may learn the MAC for a nonce, so
+  // a foreign parent (which can read the nonce from `lavish:ready`) and a superseded chrome both
+  // get nothing. The MAC omits the load token on purpose: a BFCache-restored document from an
+  // older generation must still recognize the chrome so the stale-recovery path can run.
+  app.post("/api/:key/artifact-bindings/chrome-auth", async (req, res, next) => {
+    try {
+      if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
+        res.status(403).json({ status: "cross-origin" });
+        return;
+      }
+      const generation = await store.verifyArtifactLoad(
+        req.params.key,
+        req.body?.artifact_load_token,
+        req.body?.artifact_revision,
+      );
+      if (!generation) {
+        res.status(404).json({ status: "session-not-found" });
+        return;
+      }
+      if (!generation.valid) {
+        res.status(409).json({ status: "stale" });
+        return;
+      }
+      const nonce = req.body?.document_nonce;
+      if (!isChromeAuthNonce(nonce)) {
+        res.status(400).json({ status: "invalid-nonce" });
+        return;
+      }
+      res.setHeader("cache-control", "no-store");
+      res.json({ chrome_auth: signChromeAuth(pageProofKey, req.params.key, nonce) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/:key/artifact-bindings/validate", async (req, res, next) => {
     try {
       if (!isSameOriginRequest(req, allowedHostnames, allowAnyHostname)) {
@@ -2277,6 +2327,7 @@ export async function serve({
         return;
       }
       res.setHeader("cache-control", "no-store");
+      const chromeNonce = createChromeAuthNonce();
       res.type("html").send(
         injectLavishSdk(
           html,
@@ -2287,6 +2338,8 @@ export async function serve({
             pageProtocol: 1,
             page: pageResolution.page,
             pageProof,
+            chromeNonce,
+            chromeAuth: signChromeAuth(pageProofKey, key, chromeNonce),
             servedRoute: pageResolution.servedRoute || assetPath,
           },
         ),
@@ -2342,9 +2395,12 @@ export async function serve({
   // rather than guessing whether the caller meant the compatibility route.
   app.get(/^\/artifact\/([^/]+)\/index\.html$/, async (req, res, next) => {
     try {
-      res.setHeader("content-security-policy", ARTIFACT_CONTENT_SECURITY_POLICY);
       const hasRevision = Object.prototype.hasOwnProperty.call(req.query, "artifact_revision");
       const hasToken = Object.prototype.hasOwnProperty.call(req.query, "artifact_load_token");
+      res.setHeader(
+        "content-security-policy",
+        hasRevision && hasToken ? ARTIFACT_CONTENT_SECURITY_POLICY : ARTIFACT_PATH_CONTENT_SECURITY_POLICY,
+      );
       if (hasRevision && hasToken) {
         await serveLegacyVirtualEntry(req, res);
         return;
@@ -2361,7 +2417,7 @@ export async function serve({
 
   app.get(/^\/artifact\/([^/]+)\/(.+)$/, async (req, res, next) => {
     try {
-      res.setHeader("content-security-policy", ARTIFACT_CONTENT_SECURITY_POLICY);
+      res.setHeader("content-security-policy", ARTIFACT_PATH_CONTENT_SECURITY_POLICY);
       await serveArtifactPath(req, res);
     } catch (error) {
       next(error);
@@ -2436,10 +2492,18 @@ export async function serve({
           res.status(403).json({ status: "invalid-page-proof" });
           return;
         }
-        pageContext = { pageProtocol: 1, page, pageProof: proof, servedRoute };
+        const chromeNonce = String(req.query.chrome_nonce || "");
+        const chromeAuth = String(req.query.chrome_auth || "");
+        pageContext = { pageProtocol: 1, page, pageProof: proof, servedRoute, chromeNonce, chromeAuth };
       }
       if (!verified.valid) {
         res.status(409).json({ status: "stale" });
+        return;
+      }
+      // A protocol-1 SDK without server-issued chrome-auth material could never authenticate its
+      // parent; refuse it rather than ship a bootstrap with nothing to compare against.
+      if (pageAware && !verifyChromeAuth(pageProofKey, key, pageContext.chromeNonce, pageContext.chromeAuth)) {
+        res.status(403).json({ status: "invalid-chrome-auth" });
         return;
       }
       res.setHeader("cache-control", "no-store");
@@ -3944,7 +4008,6 @@ ${faviconTag}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><div class="revisions-wrap" id="revisionsWrap" hidden><button class="revisions-button" id="revisionsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="revisionsDrawer"><span class="revisions-button-text">Revisions</span><span class="revisions-count" id="revisionsCount">0</span></button><div class="menu revisions-drawer" id="revisionsDrawer" role="dialog" aria-labelledby="revisionsTitle" aria-describedby="revisionsSummary" hidden><div class="revisions-head"><h2 class="revisions-title" id="revisionsTitle">Revisions</h2><p class="revisions-summary" id="revisionsSummary"></p></div><div class="revisions-list" id="revisionsList"></div><div class="revisions-foot"><p class="revisions-note">The agent declares these in the artifact itself. Reveal flashes the next block it marked for that revision; nothing about the page is restyled, so the saved file still looks the way it does here.</p></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
 <div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads" data-artifact-src="${entryArtifactPath}"></iframe></div><div class="panel-scrim" id="panelScrim"></div><aside class="panel" id="panel"><div class="panel-head" id="panelHead"><span class="panel-handle" aria-hidden="true"></span><div class="panel-head-row"><h2>Conversation</h2><span class="panel-summary" id="panelSummary" role="status" aria-live="polite"></span><button class="panel-toggle" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel" aria-label="Show conversation">${chromeIcons.chevronUp}</button></div></div><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="chat chat-queued" id="queuedLog"></div></div><div class="composer" id="chatComposer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner handoff-banner" id="outdatedBanner" hidden><span id="outdatedText">The Lavish server this page was connected to is no longer running. Reloading will work once it is running again.</span><span class="outdated-actions"><button class="handoff-takeover" id="outdatedReload" type="button">Check and reload</button><button class="handoff-takeover" id="outdatedDismiss" type="button">Dismiss</button></span></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from Lavish.</div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="chat-attachments" id="chatAttachments"></div><div class="chat-attachment-toolbar"><button class="chat-attach" id="chatAttach" type="button">Attach images</button><input id="chatAttachInput" type="file" accept="${escapeHtml(acceptedMime.join(","))}" multiple hidden><span class="chat-attachment-notice" id="chatAttachmentNotice" role="status"></span></div><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label class="share-check"><input id="shareGenerate" type="checkbox"><span>Generate a password (makes this page private)</span></label><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label id="shareUrlResult">Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label id="sharePasswordResult" hidden>Password (shared secret)<div class="share-copy-row"><input id="sharePasswordOut" readonly><button class="share-copy-btn" id="copySharePassword" type="button">Copy password</button></div></label><label id="shareSiteIdResult" hidden>Site ID<div class="share-copy-row"><input id="shareSiteId" readonly><button class="share-copy-btn" id="copyShareSiteId" type="button">Copy site ID</button></div></label><label id="shareUpdateKeyResult">Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note" id="shareUpdateKeyNote">Keep the update key private. ht-ml.app returns it once and it is the only way to update this page later; the service has no delete. Republish this page&#39;s HTML with <code>lavish-axi share &lt;file&gt; --site &lt;site id&gt; --update-key &lt;key&gt;</code>, and add <code>--private</code> to also lock it behind a new generated password.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button><button class="button ended-action layout-gate-bypass" id="layoutGateBypass" type="button" hidden>Show anyway</button></div></div>
@@ -3998,7 +4061,7 @@ function serializeModuleHelpers(module) {
  * @param {string} key
  * @param {number} [artifactRevision]
  * @param {string} [artifactLoadToken]
- * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[], pageProtocol?: number, page?: string | null, pageProof?: string, servedRoute?: string }} [options]
+ * @param {{ maxAttachmentCount?: number, maxAttachmentBytes?: number, acceptedImageMime?: string[], pageProtocol?: number, page?: string | null, pageProof?: string, servedRoute?: string, chromeNonce?: string, chromeAuth?: string }} [options]
  */
 export function createSdkJs(
   key,
@@ -4012,6 +4075,8 @@ export function createSdkJs(
     page = null,
     pageProof = "",
     servedRoute = "",
+    chromeNonce = "",
+    chromeAuth = "",
   } = {},
 ) {
   const mermaidHelperSource = serializeModuleHelpers(mermaidNode);
@@ -4068,6 +4133,8 @@ ${revisionHelperSource.declarations}
       page: pageIdentity,
       pageProof: pageProofValue,
       servedRoute: servedRouteValue,
+      chromeNonce: String(chromeNonce || ""),
+      chromeAuth: String(chromeAuth || ""),
     },
   )});
 })();`;

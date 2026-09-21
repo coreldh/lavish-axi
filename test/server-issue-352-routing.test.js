@@ -363,7 +363,8 @@ test(
         assert.match(entryBody, /EXACT BACKSLASH ENTRY/);
         assert.match(entryBody, /<script src="\/sdk\.js\?/);
         assert.match(entryBody, /page_protocol=1/);
-        assert.match(entryResponse.headers.get("content-security-policy"), /frame-ancestors 'self'/);
+        assert.match(entryResponse.headers.get("content-security-policy"), /^sandbox allow-scripts /);
+        assert.doesNotMatch(entryResponse.headers.get("content-security-policy"), /frame-ancestors/);
         const sdkSource = entryBody.match(/<script src="([^"]*\/sdk\.js\?[^"]+)">/)[1];
         assert.equal((await fetch(new URL(sdkSource, base))).status, 200);
         const context = { page: load.page, page_proof: load.page_proof };

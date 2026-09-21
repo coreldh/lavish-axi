@@ -11,6 +11,8 @@ export function injectLavishSdk(html, key, artifactRevision, artifactLoadToken =
     }
     if (context.pageProof) query += `&page_proof=${encodeURIComponent(String(context.pageProof))}`;
     if (context.servedRoute) query += `&served_route=${encodeURIComponent(String(context.servedRoute))}`;
+    if (context.chromeNonce) query += `&chrome_nonce=${encodeURIComponent(String(context.chromeNonce))}`;
+    if (context.chromeAuth) query += `&chrome_auth=${encodeURIComponent(String(context.chromeAuth))}`;
   }
   if (revision !== null) query += `&artifact_revision=${revision}`;
   if (token) query += `&artifact_load_token=${encodeURIComponent(token)}`;

@@ -262,6 +262,19 @@ function bootSdk({
   };
 }
 
+const TEST_CHROME_NONCE = "nonce-AAAAAAAAAAAAAAAAAAAAAAAA";
+const TEST_CHROME_AUTH = "server-issued-chrome-auth-mac";
+
+// Bounded: resolves with whatever reached the port within the window, never waits forever.
+function portMessagesWithin(port, ms = 150) {
+  return new Promise((resolve) => {
+    const seen = [];
+    port.addEventListener("message", (event) => seen.push(event.data));
+    port.start?.();
+    setTimeout(() => resolve(seen), ms);
+  });
+}
+
 function nextPortMessage(port, type = "") {
   return new Promise((resolve) => {
     const handler = (event) => {
@@ -297,6 +310,8 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
       page: "sub/page.html",
       pageProof: "proof-sub-page",
       servedRoute: "sub/page.html",
+      chromeNonce: TEST_CHROME_NONCE,
+      chromeAuth: TEST_CHROME_AUTH,
     },
   });
   const initialReady = sdk.posted.at(-1);
@@ -307,7 +322,7 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   /** @type {any} */ (first.port2).unref?.();
   const firstResponsePromise = nextPortMessage(first.port1);
   sdk.dispatchWindowEvent("message", {
-    data: { type: "lavish:challenge", challenge: "first-challenge" },
+    data: { type: "lavish:challenge", challenge: "first-challenge", chrome_auth: TEST_CHROME_AUTH },
     ports: [first.port2],
   });
   const firstResponse = await firstResponsePromise;
@@ -344,7 +359,7 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   /** @type {any} */ (second.port2).unref?.();
   const secondResponsePromise = nextPortMessage(second.port1);
   sdk.dispatchWindowEvent("message", {
-    data: { type: "lavish:challenge", challenge: "second-challenge" },
+    data: { type: "lavish:challenge", challenge: "second-challenge", chrome_auth: TEST_CHROME_AUTH },
     ports: [second.port2],
   });
   const secondResponse = await secondResponsePromise;
@@ -381,6 +396,8 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
       page: "sub/page.html",
       pageProof: "proof-sub-page",
       servedRoute: "sub/page.html",
+      chromeNonce: TEST_CHROME_NONCE,
+      chromeAuth: TEST_CHROME_AUTH,
     },
   });
   const channel = new MessageChannel();
@@ -392,7 +409,7 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
   });
   const responsePromise = nextPortMessage(channel.port1);
   sdk.dispatchWindowEvent("message", {
-    data: { type: "lavish:challenge", challenge: "scoped-upload" },
+    data: { type: "lavish:challenge", challenge: "scoped-upload", chrome_auth: TEST_CHROME_AUTH },
     ports: [channel.port2],
   });
   const response = await responsePromise;
@@ -812,4 +829,76 @@ test("the served SDK bundle drops a late restore once the user has opened a card
     sdk.posted.some((message) => message.type === "lavish:reviewDraftUnrestorable"),
     false,
   );
+});
+
+test("the protocol-1 SDK reveals nothing to a parent that cannot present this document's chrome auth", async (t) => {
+  const boot = (overrides = {}) =>
+    bootSdk({
+      sdkOptions: {
+        pageProtocol: 1,
+        page: "sub/page.html",
+        pageProof: "proof-sub-page",
+        servedRoute: "sub/page.html",
+        chromeNonce: TEST_CHROME_NONCE,
+        chromeAuth: TEST_CHROME_AUTH,
+        ...overrides,
+      },
+    });
+  const attempt = async (sdk, data) => {
+    const channel = new MessageChannel();
+    /** @type {any} */ (channel.port1).unref?.();
+    /** @type {any} */ (channel.port2).unref?.();
+    t.after(() => {
+      channel.port1.close();
+      channel.port2.close();
+    });
+    const seen = portMessagesWithin(channel.port1);
+    sdk.dispatchWindowEvent("message", { data, ports: [channel.port2] });
+    return { seen: await seen, port: channel.port1 };
+  };
+
+  const sdk = boot();
+  const ready = sdk.posted.at(-1);
+  assert.equal(ready.type, "lavish:ready");
+  assert.equal(ready.document_nonce, TEST_CHROME_NONCE);
+  // Readiness is broadcast to whatever parent frames the page, so it must carry no secret.
+  const readyText = JSON.stringify(ready);
+  assert.ok(!readyText.includes("proof-sub-page"));
+  assert.ok(!readyText.includes(TEST_CHROME_AUTH));
+  const clickListenersBefore = sdk.documentListenerCount("click");
+
+  const hostileChallenges = [
+    { type: "lavish:challenge", challenge: "missing" },
+    { type: "lavish:challenge", challenge: "forged", chrome_auth: "forged-mac" },
+    { type: "lavish:challenge", challenge: "empty", chrome_auth: "" },
+    { type: "lavish:challenge", challenge: "nonce-as-auth", chrome_auth: TEST_CHROME_NONCE },
+    { type: "lavish:challenge", challenge: "other-document", chrome_auth: "mac-for-another-document-nonce" },
+    // The obsolete bind message must stay meaningless too.
+    { type: "lavish:bind", challenge: "legacy", chrome_auth: TEST_CHROME_AUTH },
+  ];
+  for (const data of hostileChallenges) {
+    const { seen, port } = await attempt(sdk, data);
+    assert.deepEqual(seen, [], `no response for ${data.challenge}`);
+    // Even a well-formed activation on that port cannot install the review SDK.
+    port.postMessage({ type: "lavish:activate", document_id: ready.document_id, document_sequence: 1 });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(sdk.documentListenerCount("click"), clickListenersBefore, "the review SDK never installed");
+
+  // A document served without auth material can never be activated, even by an empty match.
+  const bare = boot({ chromeNonce: "", chromeAuth: "" });
+  for (const chrome_auth of [undefined, "", TEST_CHROME_AUTH]) {
+    const { seen } = await attempt(bare, { type: "lavish:challenge", challenge: "bare", chrome_auth });
+    assert.deepEqual(seen, []);
+  }
+
+  // Positive control: the same document answers the authenticated chrome.
+  const { seen } = await attempt(sdk, {
+    type: "lavish:challenge",
+    challenge: "genuine",
+    chrome_auth: TEST_CHROME_AUTH,
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].type, "lavish:challengeResponse");
+  assert.equal(seen[0].page_proof, "proof-sub-page");
 });

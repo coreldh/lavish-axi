@@ -325,7 +325,7 @@ test(
 );
 
 test(
-  "352 exact POSIX entry remains reviewable and foreign framing is blocked",
+  "352 exact POSIX entry remains reviewable and foreign framing gains no review authority",
   { skip: !runBrowserE2e || path.sep !== "/", timeout: 180_000 },
   async () => {
     const temp = await mkdtemp(path.join(tmpdir(), "lavish-352-exact-entry-"));
@@ -388,7 +388,34 @@ test(
       assert.equal(state.sessions[key].snapshot_page, path.basename(entry));
 
       const artifactUrl = new URL(`/artifact/${key}/${encodeURIComponent(path.basename(entry))}`, url).href;
-      const hostile = `<script>window.received=[];addEventListener('message',e=>{received.push(e.data);e.source.postMessage({type:'lavish:bind',...e.data},'*')})</script><iframe src="${artifactUrl}"></iframe>`;
+      const before = (await readState()).sessions[key];
+      // The hostile parent speaks the CURRENT protocol: it answers readiness with a real
+      // MessageChannel challenge (no auth, forged auth, the public nonce as auth), tries to
+      // activate the port anyway, replays the obsolete bind, and drives review routes directly.
+      const hostile = `<script>
+        window.received=[];window.portMessages=[];window.routeStatuses=[];
+        addEventListener('message',e=>{
+          received.push(e.data);
+          if(e.data&&e.data.relay!==undefined)return;
+          const auths=[undefined,'forged-mac',e.data&&e.data.document_nonce];
+          for(const chrome_auth of auths){
+            const c=new MessageChannel();
+            c.port1.onmessage=m=>portMessages.push(m.data);
+            e.source.postMessage({type:'lavish:challenge',challenge:'hostile',chrome_auth},'*',[c.port2]);
+            c.port1.postMessage({type:'lavish:activate',document_id:e.data&&e.data.document_id,document_sequence:1});
+          }
+          e.source.postMessage({type:'lavish:bind',...e.data},'*');
+          e.source.postMessage({type:'lavish:setAnnotationMode',enabled:true},'*');
+        });
+        const post=(path,body)=>fetch('${new URL("/", url).href}api/${key}/'+path,{method:'POST',headers:{'content-type':'text/plain'},body:JSON.stringify(body)}).then(r=>routeStatuses.push(path+':'+r.status),()=>routeStatuses.push(path+':blocked'));
+        post('prompts',{prompts:[{prompt:'hostile prompt'}]});
+        post('artifact-failures',{failures:[{kind:'artifact-unavailable'}]});
+        post('layout-diagnostics',{findings:[],complete:true});
+        post('attachments',{});
+        post('whiteboard-channel',{});
+        post('artifact-bindings/chrome-auth',{document_nonce:'x'.repeat(32)});
+      </script><iframe id="direct" src="${artifactUrl}"></iframe>
+      <iframe id="intermediate" sandbox="allow-scripts" srcdoc="<script>parent.postMessage({relay:'alive'},'*');addEventListener('message',e=>parent.postMessage({relay:e.data},'*'))</script><iframe src='${artifactUrl}'></iframe>"></iframe>`;
       const hostilePort = await freePort();
       hostileServer = spawn(process.execPath, ["-e", HOSTILE_SERVER_SCRIPT], {
         env: {
@@ -404,17 +431,248 @@ test(
         once(hostileServer, "exit").then(([code]) => Promise.reject(new Error(`hostile server exited ${code}`))),
       ]);
       browser("open", `http://127.0.0.1:${hostilePort}/`);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
       const result = browser(
         "eval",
-        "async () => { await new Promise(r => setTimeout(r, 500)); return window.received.length; }",
+        "() => JSON.stringify({received: window.received, ports: window.portMessages, routes: window.routeStatuses.sort()})",
       );
-      assert.match(result, /result:\s*"0"/);
-      assert.match(browser("console"), /frame-ancestors|refused to frame/i);
+      const observed = parseEvalJson(result);
+      // The authored page renders and may announce readiness, but that is all a foreign parent gets.
+      assert.match(browser("snapshot"), /Exact entry target/);
+      assert.deepEqual(observed.ports, [], "no challenge response or bound-port traffic reaches a foreign parent");
+      const direct = observed.received.filter((message) => message?.type);
+      assert.ok(direct.length > 0, "the directly framed document only announces readiness");
+      for (const message of direct) {
+        assert.deepEqual(Object.keys(message).sort(), ["document_id", "document_nonce", "page_protocol", "type"]);
+        assert.equal(message.type, "lavish:ready");
+      }
+      // The intermediate sandboxed frame proves it was alive and relayed nothing from the artifact:
+      // a document whose parent is not the top window never even announces readiness.
+      const relayed = observed.received.filter((message) => message?.relay !== undefined);
+      assert.deepEqual(relayed, [{ relay: "alive" }]);
+      const leaked = JSON.stringify(observed);
+      assert.doesNotMatch(leaked, /page_proof|artifact_load_token|challengeResponse/);
+      assert.equal(observed.routes.length, 6);
+      for (const status of observed.routes) assert.match(status, /:(blocked|4\d\d)$/, status);
+      const after = (await readState()).sessions[key];
+      assert.deepEqual(after.prompts, before.prompts);
+      assert.deepEqual(after.artifact_failures || [], before.artifact_failures || []);
+      assert.deepEqual(after.layout_warnings || [], before.layout_warnings || []);
+      assert.equal(after.artifact_revision, before.artifact_revision);
+      assert.equal(after.status, before.status);
     } finally {
       if (hostileServer?.exitCode === null) {
         hostileServer.kill();
         await once(hostileServer, "exit");
       }
+      cleanupRun(process.execPath, [cli, "stop", "--port", String(port)], env);
+      cleanupRun("chrome-devtools-axi", ["stop"], chromeEnv);
+      await rm(temp, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "352 authored nested sibling iframes render as authored without review controls, under one working top bar",
+  { skip: !runBrowserE2e, timeout: 240_000 },
+  async () => {
+    const temp = await realpath(await mkdtemp(path.join(tmpdir(), "lavish-352-nested-")));
+    const entry = path.join(temp, "entry.html");
+    const stateDir = path.join(temp, "state");
+    const port = await freePort();
+    const env = {
+      LAVISH_AXI_PORT: String(port),
+      LAVISH_AXI_STATE_DIR: stateDir,
+      LAVISH_AXI_NO_OPEN: "1",
+      LAVISH_AXI_TELEMETRY: "0",
+      LAVISH_AXI_HOST: "127.0.0.1",
+      LAVISH_AXI_LINK_HOST: "127.0.0.1",
+    };
+    const chromeEnv = {
+      CHROME_DEVTOOLS_AXI_SESSION: `lavish-nested-${process.pid}`,
+      CHROME_DEVTOOLS_AXI_USER_DATA_DIR: path.join(temp, "chrome"),
+    };
+    const cli = path.join(repoRoot, "dist", "cli.mjs");
+    const browser = (...args) => run("chrome-devtools-axi", args, chromeEnv);
+    const readState = async () => JSON.parse(await readFile(path.join(stateDir, "state.json"), "utf8"));
+    const childScript = (name) => `<script>
+      const say = (text) => { const p = document.createElement('p'); p.textContent = text; document.body.append(p); };
+      let lavish = 0;
+      addEventListener('message', (e) => { if (String(e.data && e.data.type).startsWith('lavish:')) lavish += 1; });
+      say('${name} script ran');
+      const img = new Image();
+      img.onload = () => say('${name} asset loaded ' + img.naturalWidth);
+      img.onerror = () => say('${name} asset FAILED');
+      img.src = 'pixel.png';
+      setTimeout(() => say('${name} css ' + getComputedStyle(document.body).outlineStyle + ' lavish messages ' + lavish + ' lavish ui ' + document.querySelectorAll('[data-lavish-ui]').length), 1500);
+    </script>`;
+    try {
+      await mkdir(path.join(temp, "sub"));
+      await writeFile(
+        path.join(temp, "sub", "pixel.png"),
+        Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+          "base64",
+        ),
+      );
+      await writeFile(path.join(temp, "sub", "child.css"), "body { outline: 1px dashed red; }");
+      for (const name of ["static", "dynamic"]) {
+        await writeFile(
+          path.join(temp, "sub", `${name}.html`),
+          `<!doctype html><link rel="stylesheet" href="child.css"><body><p>${name} child paragraph</p><a href="deeper.html">${name} go deeper</a>${childScript(name)}</body>`,
+        );
+      }
+      await writeFile(
+        path.join(temp, "sub", "deeper.html"),
+        `<!doctype html><link rel="stylesheet" href="child.css"><body><p>deeper paragraph</p>${childScript("deeper")}</body>`,
+      );
+      await writeFile(
+        entry,
+        `<!doctype html><body style="font:16px system-ui">
+          <script type="application/json" data-lavish-revisions>[{"id":"r2","label":"Second pass","timestamp":"2026-09-20T10:00:00Z","summary":"Reworded the block"}]</script>
+          <p>Outer review paragraph</p><p data-lavish-revision="r2">Revised outer block</p>
+          <iframe src="sub/static.html" style="width:420px;height:160px"></iframe>
+          <script>setTimeout(() => { const f = document.createElement('iframe'); f.src = 'sub/dynamic.html'; f.style.cssText = 'width:420px;height:160px'; document.body.append(f); }, 300);</script>
+        </body>`,
+      );
+      const opened = run(process.execPath, [cli, entry, "--no-open"], env);
+      const url = opened.match(/url:\s*"([^"]+)"/)?.[1];
+      assert.ok(url, opened);
+      const key = new URL(url).pathname.split("/").pop();
+      browser("open", url);
+      const click = (label) => {
+        const line = browser("snapshot")
+          .split("\n")
+          .find((line) => line.includes(label));
+        assert.ok(line, label);
+        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+      };
+      // Static and dynamically created nested siblings render, run authored script, apply their
+      // relative stylesheet, load a relative image, and never see or host the Lavish SDK.
+      const rendered = await eventually(
+        async () => browser("snapshot"),
+        (tree) =>
+          ["static", "dynamic"].every(
+            (name) =>
+              tree.includes(`${name} script ran`) &&
+              tree.includes(`${name} asset loaded 1`) &&
+              tree.includes(`${name} css dashed lavish messages 0 lavish ui 0`),
+          ) && !tree.includes("Checking layout."),
+        "nested sibling iframes did not render as authored",
+        30_000,
+      );
+      assert.doesNotMatch(rendered, /asset FAILED/);
+
+      // r54: exactly one bar, no duplicate ids anywhere in the rendered chrome.
+      const dom = parseEvalJson(
+        browser(
+          "eval",
+          "() => { const ids=[...document.querySelectorAll('[id]')].map(e=>e.id); return JSON.stringify({bars:document.querySelectorAll('.bar').length, duplicates:ids.filter((id,i)=>ids.indexOf(id)!==i), revisionsHidden:document.getElementById('revisionsWrap').hidden, revisionsCount:document.getElementById('revisionsCount').textContent}); }",
+        ),
+      );
+      assert.deepEqual(dom, { bars: 1, duplicates: [], revisionsHidden: false, revisionsCount: "1" });
+
+      // Annotation mode is on, yet a click inside a nested sibling is a plain authored click:
+      // native nested navigation happens and no annotation card appears for it.
+      click("static go deeper");
+      const deeper = await eventually(
+        async () => browser("snapshot"),
+        (tree) => tree.includes("deeper css dashed lavish messages 0 lavish ui 0"),
+        "nested navigation did not render the deeper sibling",
+        30_000,
+      );
+      assert.match(deeper, /deeper asset loaded 1/);
+      assert.doesNotMatch(deeper, /button "Queue"/);
+      click("dynamic child paragraph");
+      assert.doesNotMatch(browser("snapshot"), /button "Queue"/);
+
+      // #361 revisions drawer and reveal work from the single wired bar.
+      browser("eval", "() => { document.getElementById('revisionsButton').click(); return true; }");
+      const drawer = await eventually(
+        async () => browser("snapshot"),
+        (tree) => tree.includes("Second pass"),
+        "revisions drawer did not open",
+      );
+      assert.match(drawer, /Reveal the next block changed in Second pass/);
+      assert.match(
+        browser(
+          "eval",
+          "() => { const b=document.querySelector('#revisionsList .revision-reveal'); b.click(); return document.getElementById('revisionsButton').getAttribute('aria-expanded') + ':' + document.querySelectorAll('#revisionsList .revision-reveal').length; }",
+        ),
+        /:1/,
+      );
+      browser("eval", "() => { document.getElementById('revisionsButton').click(); return true; }");
+
+      // Annotation switch is wired: explore mode stops outer clicks from opening a card.
+      const pressed = () => browser("eval", "() => document.getElementById('annotation').getAttribute('aria-pressed')");
+      assert.match(pressed(), /true/);
+      browser("eval", "() => { document.getElementById('annotation').click(); return true; }");
+      assert.match(pressed(), /false/);
+      click("Outer review paragraph");
+      assert.doesNotMatch(browser("snapshot"), /button "Queue"/);
+      browser("eval", "() => { document.getElementById('annotation').click(); return true; }");
+      assert.match(pressed(), /true/);
+
+      // Overflow menu opens; Reload artifact advances the revision and nested frames re-render.
+      browser("eval", "() => { document.getElementById('moreButton').click(); return true; }");
+      assert.match(
+        browser(
+          "eval",
+          "() => String(document.getElementById('moreMenu').hidden) + ':' + document.getElementById('moreButton').getAttribute('aria-expanded')",
+        ),
+        /false:true/,
+      );
+      const revision = (await readState()).sessions[key].artifact_revision;
+      browser("eval", "() => { document.getElementById('reloadArtifact').click(); return true; }");
+      await eventually(readState, (state) => state.sessions[key].artifact_revision > revision, "reload did not start");
+      await eventually(
+        async () => browser("snapshot"),
+        (tree) =>
+          tree.includes("dynamic css dashed lavish messages 0 lavish ui 0") && tree.includes("static script ran"),
+        "nested siblings did not re-render after reload",
+        30_000,
+      );
+
+      // Outer review still delivers feedback attributed to the entry page only.
+      click("Outer review paragraph");
+      browser("type", "Outer note beside nested frames");
+      click('button "Queue"');
+      browser("eval", "() => { document.getElementById('send').click(); return true; }");
+      const delivered = await eventually(
+        readState,
+        (state) => state.sessions[key].prompts.length > 0,
+        "outer annotation was not delivered",
+      );
+      assert.equal(delivered.sessions[key].prompts.length, 1);
+      assert.equal(delivered.sessions[key].prompts[0].page, "entry.html");
+      assert.deepEqual(delivered.sessions[key].artifact_failures || [], []);
+
+      // Layout-warning control stays wired (hidden with no warnings, single instance).
+      assert.match(
+        browser(
+          "eval",
+          "() => String(document.getElementById('warningsWrap').hidden) + ':' + document.querySelectorAll('#warningsButton').length",
+        ),
+        /true:1/,
+      );
+
+      // Terminal control: End session from the one bar ends the stored session.
+      browser(
+        "eval",
+        "() => { document.getElementById('moreButton').click(); document.getElementById('end').click(); return true; }",
+      );
+      const confirm = browser("snapshot");
+      if (/End session/.test(confirm) && /button "End/.test(confirm)) {
+        const line = confirm.split("\n").find((line) => /button "End/.test(line) && !/More/.test(line));
+        if (line) browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+      }
+      const endedState = await eventually(
+        readState,
+        (state) => state.sessions[key].status === "ended",
+        "End session did not end the session",
+      );
+      assert.equal(endedState.sessions[key].ended_by, "user");
+    } finally {
       cleanupRun(process.execPath, [cli, "stop", "--port", String(port)], env);
       cleanupRun("chrome-devtools-axi", ["stop"], chromeEnv);
       await rm(temp, { recursive: true, force: true });
@@ -431,6 +689,14 @@ const server = http.createServer((_req, res) => {
 });
 server.listen(Number(process.env.LAVISH_HOSTILE_PORT), "127.0.0.1", () => process.stdout.write("READY\\n"));
 `;
+
+// `eval` prints a TOON string holding the page's own JSON string; unwrap until it is a value.
+function parseEvalJson(output) {
+  let value = output.match(/result:\s*(".*")\s*$/m)?.[1];
+  assert.ok(value, output);
+  while (typeof value === "string") value = JSON.parse(value);
+  return value;
+}
 
 function run(command, args, env, timeout = 45_000) {
   const result = spawnSync(command, args, {

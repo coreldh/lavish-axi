@@ -311,6 +311,8 @@ async function createChromeHarness({
     postMessage(message, _origin, transfer) {
       postedToFrame.push(message);
       if (modernBinding && message?.type === "lavish:challenge" && transfer?.[0]) {
+        // A binding that names `chromeAuth` models the real SDK: silent unless authenticated.
+        if (modernBinding.chromeAuth && message.chrome_auth !== modernBinding.chromeAuth) return;
         const childPort = transfer[0];
         modernPorts.push(childPort);
         childPort.addEventListener("message", (event) => modernPostedToFrame.push(event.data));
@@ -10716,4 +10718,91 @@ test("protocol 1 whiteboard feedback keeps its captured page and page-key replac
   );
   assert.equal(feedbackB.body.page, "page-b.html");
   assert.equal(feedbackB.body.page_proof, "proof-b");
+});
+
+test("protocol 1 authenticates the chrome to the document before it is challenged", async () => {
+  const nonce = "nonce-AAAAAAAAAAAAAAAAAAAAAAAA";
+  const binding = {
+    page: "page-a.html",
+    proof: "proof-a",
+    route: "page-a.html",
+    destination: "/artifact/abc/page-a.html",
+    documentId: "document-a",
+    token: "harness-load-1",
+    revision: 1,
+    chromeAuth: "server-mac",
+  };
+  const authRequests = [];
+  /** @type {{ ok: boolean, status: number, json: () => Promise<any> }} */
+  let authResponse = { ok: false, status: 409, json: async () => ({ status: "stale" }) };
+  const chrome = await createChromeHarness({
+    artifactSrc: binding.destination,
+    sessionData: {
+      ...defaultSessionData,
+      pageProtocol: 1,
+      initialArtifactLoadToken: "harness-load-1",
+      initialArtifactRevision: 1,
+    },
+    modernBinding: binding,
+    fetchImpl: async (url, init = {}) => {
+      if (String(url).includes("/artifact-bindings/chrome-auth")) {
+        authRequests.push({ url: String(url), body: JSON.parse(init.body) });
+        return authResponse;
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  await flushPromises();
+  const activated = () => chrome.modernPostedToFrame.some((message) => message.type === "lavish:activate");
+  const ready = () =>
+    chrome.dispatchWindowEvent("message", {
+      source: chrome.frame.contentWindow,
+      data: { type: "lavish:ready", page_protocol: 1, document_id: "document-a", document_nonce: nonce },
+    });
+
+  // The unauthenticated load-time challenge is ignored by the document, and a refused auth
+  // request produces no challenge at all.
+  ready();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(activated(), false);
+  assert.equal(authRequests.length, 1);
+  assert.equal(authRequests[0].url, "/api/abc/artifact-bindings/chrome-auth");
+  assert.deepEqual(authRequests[0].body, {
+    artifact_load_token: "harness-load-1",
+    artifact_revision: 1,
+    document_nonce: nonce,
+  });
+  assert.equal(
+    chrome.postedToFrame.some((message) => message.type === "lavish:challenge" && message.chrome_auth),
+    false,
+  );
+
+  // A wrong MAC reaches the document and is ignored; the failure is not cached.
+  authResponse = { ok: true, status: 200, json: async () => ({ chrome_auth: "wrong-mac" }) };
+  ready();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(activated(), false);
+
+  // Readiness from any window other than the artifact frame never triggers an auth request.
+  const before = authRequests.length;
+  chrome.dispatchWindowEvent("message", {
+    source: {},
+    data: { type: "lavish:ready", page_protocol: 1, document_id: "document-x", document_nonce: nonce },
+  });
+  await flushPromises();
+  assert.equal(authRequests.length, before);
+
+  // The genuine MAC for the document's nonce completes the handshake.
+  authResponse = { ok: true, status: 200, json: async () => ({ chrome_auth: "server-mac" }) };
+  chrome.dispatchWindowEvent("message", {
+    source: chrome.frame.contentWindow,
+    data: { type: "lavish:ready", page_protocol: 1, document_id: "document-a2", document_nonce: nonce + "B" },
+  });
+  chrome.updateModernBinding({ ...binding, documentId: "document-a2" });
+  await flushPromises();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(activated(), true);
 });
