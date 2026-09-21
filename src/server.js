@@ -159,9 +159,10 @@ const ARTIFACT_CONTENT_SECURITY_POLICY = `${ARTIFACT_SANDBOX_POLICY}; frame-ance
 // Path-addressed artifact responses cannot use frame-ancestors: the reviewed artifact is
 // opaque-origin, so an authored nested sibling iframe can never satisfy 'self' and would be
 // blocked. Framing is therefore not the boundary here. A protocol-1 document stays inert unless it
-// is a direct child of its top window AND that parent presents the server-issued chrome-auth MAC
-// for this document's nonce, which only a same-origin current-generation chrome can obtain. A
-// foreign parent renders authored HTML and receives no token, proof, or review authority.
+// is a direct child of its top window AND that parent, posting from this server's origin, presents
+// the server-issued chrome-auth MAC for this document's nonce, which only a same-origin
+// current-generation chrome can obtain. A foreign parent renders authored HTML and receives no
+// token, proof, or review authority.
 const ARTIFACT_PATH_CONTENT_SECURITY_POLICY = ARTIFACT_SANDBOX_POLICY;
 // Sweep orphaned/expired attachments periodically, not just at startup: a
 // detached server can run for days, and an upload whose /prompts follow-up never

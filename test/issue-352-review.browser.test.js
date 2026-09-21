@@ -63,12 +63,24 @@ test(
       evalChrome(
         '() => { annotation = false; postToFrame({type:"lavish:setAnnotationMode",enabled:false}); return true; }',
       );
+      // A ref goes stale when the chrome DOM mutates between the snapshot and the click
+      // (the layout gate settling, presence updates), so re-snapshot and retry like 352-B01.
       const click = (label) => {
-        const line = browser("snapshot")
-          .split("\n")
-          .find((line) => line.includes(label));
-        assert.ok(line, label);
-        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+        let staleError;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const line = browser("snapshot")
+            .split("\n")
+            .find((line) => line.includes(label));
+          assert.ok(line, label);
+          try {
+            browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+            return;
+          } catch (error) {
+            if (!/STALE_REF|Stale ref/.test(String(error?.message || error))) throw error;
+            staleError = error;
+          }
+        }
+        throw staleError;
       };
       click("Open history target");
       await eventually(
@@ -270,12 +282,24 @@ test(
         }; return true;
       }`,
       );
+      // A ref goes stale when the chrome DOM mutates between the snapshot and the click
+      // (the layout gate settling, presence updates), so re-snapshot and retry like 352-B01.
       const click = (label) => {
-        const line = browser("snapshot")
-          .split("\n")
-          .find((line) => line.includes(label));
-        assert.ok(line, label);
-        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+        let staleError;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const line = browser("snapshot")
+            .split("\n")
+            .find((line) => line.includes(label));
+          assert.ok(line, label);
+          try {
+            browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+            return;
+          } catch (error) {
+            if (!/STALE_REF|Stale ref/.test(String(error?.message || error))) throw error;
+            staleError = error;
+          }
+        }
+        throw staleError;
       };
       click("Fail A");
       await eventually(
@@ -355,12 +379,24 @@ test(
       assert.ok(url, opened);
       const key = new URL(url).pathname.split("/").pop();
       browser("open", url);
+      // A ref goes stale when the chrome DOM mutates between the snapshot and the click
+      // (the layout gate settling, presence updates), so re-snapshot and retry like 352-B01.
       const click = (label) => {
-        const line = browser("snapshot")
-          .split("\n")
-          .find((line) => line.includes(label));
-        assert.ok(line, label);
-        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+        let staleError;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const line = browser("snapshot")
+            .split("\n")
+            .find((line) => line.includes(label));
+          assert.ok(line, label);
+          try {
+            browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+            return;
+          } catch (error) {
+            if (!/STALE_REF|Stale ref/.test(String(error?.message || error))) throw error;
+            staleError = error;
+          }
+        }
+        throw staleError;
       };
       await eventually(
         async () => browser("snapshot"),
@@ -374,7 +410,7 @@ test(
       await eventually(readState, (state) => state.sessions[key].artifact_revision > revision, "reload did not start");
       await eventually(
         async () => browser("snapshot"),
-        (tree) => tree.includes("Literal entry draft"),
+        (tree) => tree.includes("Literal entry draft") && !tree.includes("Checking layout."),
         "entry draft did not survive reload",
       );
       click('button "Queue"');
@@ -568,12 +604,24 @@ test(
       assert.ok(url, opened);
       const key = new URL(url).pathname.split("/").pop();
       browser("open", url);
+      // A ref goes stale when the chrome DOM mutates between the snapshot and the click
+      // (the layout gate settling, presence updates), so re-snapshot and retry like 352-B01.
       const click = (label) => {
-        const line = browser("snapshot")
-          .split("\n")
-          .find((line) => line.includes(label));
-        assert.ok(line, label);
-        browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+        let staleError;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const line = browser("snapshot")
+            .split("\n")
+            .find((line) => line.includes(label));
+          assert.ok(line, label);
+          try {
+            browser("click", "@" + line.trim().split(/\s+/)[0].replace(/^uid=/, ""));
+            return;
+          } catch (error) {
+            if (!/STALE_REF|Stale ref/.test(String(error?.message || error))) throw error;
+            staleError = error;
+          }
+        }
+        throw staleError;
       };
       // Static and dynamically created nested siblings render, run authored script, apply their
       // relative stylesheet, load a relative image, and never see or host the Lavish SDK.

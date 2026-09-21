@@ -191,9 +191,11 @@ export { PAGE_PROOF_DOMAIN, PAGE_PROOF_KEY_BYTES, PAGE_PROOF_MAX_PAGE_BYTES };
 
 // Chrome authentication for the protocol-1 handshake. Each served document carries a fresh
 // server-minted nonce and this MAC over it. Only a same-origin chrome holding the current
-// artifact generation can obtain the MAC for a nonce, so a document that sees it in a challenge
-// knows its parent is this server's chrome before it reveals a load token or page proof. The MAC
-// is domain-separated from page proofs and grants nothing by itself.
+// artifact generation can obtain the MAC for a nonce. That chrome may relay a genuine MAC to
+// whatever page occupies its frame, so the SDK also requires the challenge to come from its own
+// server origin; together they tell a document its parent is this server's chrome before it
+// reveals a load token or page proof. The MAC is domain-separated from page proofs and grants
+// nothing by itself.
 const CHROME_AUTH_NONCE_RE = /^[A-Za-z0-9_-]{22,128}$/;
 
 export function isChromeAuthNonce(nonce) {

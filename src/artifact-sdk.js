@@ -579,8 +579,11 @@ export function createArtifactSdk(
       // Authenticate the chrome BEFORE revealing anything. Artifact pages may be framed by any
       // parent (an authored nested iframe needs that), so `event.source === parent` proves
       // nothing about who the parent is. Only this server's same-origin, current-generation
-      // chrome can obtain the MAC for this document's nonce; a foreign parent's challenge is
-      // dropped silently and never receives the load token, page proof, or a bound port.
+      // chrome can obtain the MAC for this document's nonce, but it fetches one for whatever
+      // nonce its frame's occupant announces, so an external page left in the review frame can
+      // relay a genuine MAC to a copy it frames elsewhere. The origin check above is what refuses
+      // that relay; a foreign parent's challenge is dropped silently either way and never
+      // receives the load token, page proof, or a bound port.
       if (!embeddedChromeAuth || message.chrome_auth !== embeddedChromeAuth) return;
       const response = {
         type: "lavish:challengeResponse",
