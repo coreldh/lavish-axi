@@ -239,7 +239,6 @@ export class SessionStore {
         session.layout_warnings,
         normalizedPrompts,
         Number(payload?.page_protocol) === 1,
-        resolveMigrationEntryPage(session, undefined),
       );
       if (!warningContextValidation.ok) return warningContextValidation.result;
     }
@@ -1488,7 +1487,7 @@ function planLayoutWarningPrompt(warnings, prompt, revision) {
   return { warningIds, expectedRevision, conflicts, queueIds, hadKnownWarning };
 }
 
-function validateLayoutWarningClaims(warnings, prompts, modern = false, entryPage = null) {
+function validateLayoutWarningClaims(warnings, prompts, modern = false) {
   const records = normalizeStoredWarnings(warnings);
   const invalid = [];
   for (const [promptIndex, prompt] of (Array.isArray(prompts) ? prompts : []).entries()) {
@@ -1498,17 +1497,10 @@ function validateLayoutWarningClaims(warnings, prompts, modern = false, entryPag
       : []
     ).entries()) {
       const record = records.find((candidate) => candidate.id === String(item.id || ""));
-      // Pre-page-protocol warning records have no page; they belong to the entry file.
-      const recordPage = record
-        ? record.page === null || record.page === undefined || record.page === ""
-          ? entryPage
-          : normalizeWarningPage(record.page)
-        : null;
-      // The server stamps legacy submissions with the entry page. Direct store callers may
-      // still omit a page, but a supplied page must never carry another page's warnings.
+      const recordPage = record ? normalizeWarningPage(record.page) : null;
       if (
-        (modern || typeof prompt.page === "string") &&
-        (!record || typeof prompt.page !== "string" || recordPage !== prompt.page)
+        (modern && (!record || typeof prompt.page !== "string" || recordPage !== prompt.page)) ||
+        (!modern && typeof prompt.page === "string" && recordPage !== null && recordPage !== prompt.page)
       ) {
         invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
         continue;

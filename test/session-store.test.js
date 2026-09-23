@@ -3124,5 +3124,19 @@ test("legacy state waits for entry context and preserves explicit null attributi
     const once = await readFile(stateFile, "utf8");
     await store.findByKey(session.key);
     assert.equal(await readFile(stateFile, "utf8"), once);
+
+    const warningPrompt = {
+      tag: "layout-warnings",
+      page: path.basename(session.file),
+      target: { type: "layout-warnings", warnings: [{ id: "modern-null-warning", page: null }] },
+    };
+    const modern = await store.queuePrompts(session.key, { page_protocol: 1, prompts: [warningPrompt] });
+    assert.equal(modern.invalid_page_context, true, "a null warning cannot acquire entry provenance");
+    assert.equal((await store.findByKey(session.key)).layout_warnings[0].status, "open");
+
+    const queuedLegacy = await store.queuePrompts(session.key, { prompts: [warningPrompt] });
+    assert.equal(queuedLegacy.invalid_page_context, undefined, "legacy feedback can retain unknown warning provenance");
+    const queuedWarning = queuedLegacy.prompts.find((prompt) => prompt.tag === "layout-warnings");
+    assert.equal(queuedWarning.target.warnings[0].page, null);
   });
 });
