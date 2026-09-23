@@ -46,6 +46,57 @@ function failure(load, page, sequence, detail = page) {
   };
 }
 
+test("prompt submission delivers ordinary feedback and rejects forged warning pages", async (t) => {
+  const { store, key, load } = await fixture(t);
+  const ordinary = await store.queuePrompts(key, submission("a.html", "ordinary"));
+  assert.equal(ordinary.invalid_page_context, undefined);
+  assert.deepEqual(
+    (await store.takeFeedback(key)).prompts.map((prompt) => prompt.prompt),
+    ["ordinary"],
+  );
+
+  const recorded = await store.recordLayoutDiagnostics(
+    key,
+    {
+      page: "a.html",
+      page_proof: "proof-a.html",
+      document_sequence: 1,
+      artifact_load_token: load.artifact_load_token,
+      artifact_revision: load.artifact_revision,
+      artifact_pass_sequence: 1,
+      complete: true,
+      viewport_width: 1080,
+      findings: [{ selector: "p", kind: "clipped-text", axis: "horizontal", overflowPx: 20, severity: "error" }],
+    },
+    {
+      validatePageContext: async ({ page, proof }) => ({
+        ok: page === "a.html" && proof === "proof-a.html",
+        page,
+        proof,
+      }),
+    },
+  );
+  assert.equal(recorded.warnings.length, 1);
+  const prepared = await store.prepareLayoutWarningFixes(key, [recorded.warnings[0].id], { page: "a.html" });
+  const warningPrompt = { ...prepared.prompt, tag: "layout-warnings", page: "a.html", page_proof: "proof-a.html" };
+  const forged = await store.queuePrompts(key, {
+    page_protocol: 1,
+    prompts: [
+      {
+        ...warningPrompt,
+        target: { ...warningPrompt.target, warnings: [{ ...warningPrompt.target.warnings[0], page: "b.html" }] },
+      },
+    ],
+  });
+  assert.equal(forged.invalid_page_context, true);
+  assert.equal((await store.takeFeedback(key)).status, "waiting");
+
+  const accepted = await store.queuePrompts(key, { page_protocol: 1, prompts: [warningPrompt] });
+  assert.equal(accepted.invalid_page_context, undefined);
+  const delivered = await store.takeFeedback(key);
+  assert.equal(delivered.prompts[0].target.warnings[0].page, "a.html");
+});
+
 test("authenticated failure-only A then B reports form durable FIFO batches without a protocol flag", async (t) => {
   const { store, key, load, stateFile } = await fixture(t);
   const validatePageContext = async ({ page, proof }) => ({ ok: proof === "proof-" + page, page, proof });

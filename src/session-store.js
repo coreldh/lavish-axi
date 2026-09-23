@@ -1487,6 +1487,47 @@ function planLayoutWarningPrompt(warnings, prompt, revision) {
   return { warningIds, expectedRevision, conflicts, queueIds, hadKnownWarning };
 }
 
+function validateLayoutWarningClaims(warnings, prompts, modern = false) {
+  const records = normalizeStoredWarnings(warnings);
+  const invalid = [];
+  for (const [promptIndex, prompt] of (Array.isArray(prompts) ? prompts : []).entries()) {
+    if (prompt?.tag !== "layout-warnings" || prompt.target?.type !== LAYOUT_WARNINGS_TARGET_TYPE) continue;
+    for (const [warningIndex, item] of (Array.isArray(prompt.target.warnings)
+      ? prompt.target.warnings
+      : []
+    ).entries()) {
+      const record = records.find((candidate) => candidate.id === String(item.id || ""));
+      if (modern && (!record || typeof prompt.page !== "string" || normalizeWarningPage(record.page) !== prompt.page)) {
+        invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
+        continue;
+      }
+      if (!Object.hasOwn(item || {}, "page") || item.page === null || item.page === "") continue;
+      const claimed = normalizeWarningPage(item.page);
+      if (!record || claimed === null || claimed !== normalizeWarningPage(record.page)) {
+        invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
+      }
+    }
+  }
+  return invalid.length
+    ? { ok: false, result: { invalid_page_context: true, invalid: invalid.slice(0, 8) } }
+    : { ok: true };
+}
+
+function authoritativeLayoutWarningTarget(warnings, target) {
+  const normalized = normalizeLayoutWarningsTarget(target);
+  const records = normalizeStoredWarnings(warnings);
+  return {
+    ...normalized,
+    warnings: normalized.warnings.map((item) => {
+      const record = records.find((candidate) => candidate.id === item.id);
+      return {
+        ...item,
+        page: record ? normalizeWarningPage(record.page) : null,
+      };
+    }),
+  };
+}
+
 // The active artifact load, in the shape state.json carries it. Snake-cased like every other
 // stored field, and complete: the fences a begin is judged against (`request_id`,
 // `request_sequence`, `handoff_token`) belong to the same epoch as the token, so a process that
