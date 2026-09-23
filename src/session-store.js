@@ -239,6 +239,7 @@ export class SessionStore {
         session.layout_warnings,
         normalizedPrompts,
         Number(payload?.page_protocol) === 1,
+        resolveMigrationEntryPage(session, undefined),
       );
       if (!warningContextValidation.ok) return warningContextValidation.result;
     }
@@ -1487,7 +1488,7 @@ function planLayoutWarningPrompt(warnings, prompt, revision) {
   return { warningIds, expectedRevision, conflicts, queueIds, hadKnownWarning };
 }
 
-function validateLayoutWarningClaims(warnings, prompts, modern = false) {
+function validateLayoutWarningClaims(warnings, prompts, modern = false, entryPage = null) {
   const records = normalizeStoredWarnings(warnings);
   const invalid = [];
   for (const [promptIndex, prompt] of (Array.isArray(prompts) ? prompts : []).entries()) {
@@ -1497,13 +1498,24 @@ function validateLayoutWarningClaims(warnings, prompts, modern = false) {
       : []
     ).entries()) {
       const record = records.find((candidate) => candidate.id === String(item.id || ""));
-      if (modern && (!record || typeof prompt.page !== "string" || normalizeWarningPage(record.page) !== prompt.page)) {
+      // Pre-page-protocol warning records have no page; they belong to the entry file.
+      const recordPage = record
+        ? record.page === null || record.page === undefined || record.page === ""
+          ? entryPage
+          : normalizeWarningPage(record.page)
+        : null;
+      // The server stamps legacy submissions with the entry page. Direct store callers may
+      // still omit a page, but a supplied page must never carry another page's warnings.
+      if (
+        (modern || typeof prompt.page === "string") &&
+        (!record || typeof prompt.page !== "string" || recordPage !== prompt.page)
+      ) {
         invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
         continue;
       }
       if (!Object.hasOwn(item || {}, "page") || item.page === null || item.page === "") continue;
       const claimed = normalizeWarningPage(item.page);
-      if (!record || claimed === null || claimed !== normalizeWarningPage(record.page)) {
+      if (!record || claimed === null || claimed !== recordPage) {
         invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
       }
     }

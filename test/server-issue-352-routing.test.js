@@ -989,6 +989,26 @@ test("issue 352 rejects cross-page sends and warning selections while accepting 
     const prepared = await post("layout-warnings/queue", { page_protocol: 1, ...contexts[0], ids: aIds });
     assert.equal(prepared.status, 200);
     const aPrompt = (await prepared.json()).prompt;
+    const bId = warnings.find((warning) => warning.page === "b.html").id;
+    assert.notEqual(bId, aPrompt.target.warnings[0].id);
+    const legacyWrongPage = await post("prompts", {
+      prompts: [
+        {
+          ...aPrompt,
+          tag: "layout-warnings",
+          page: undefined,
+          page_proof: undefined,
+          target: { ...aPrompt.target, warnings: [{ id: bId }] },
+        },
+      ],
+    });
+    const legacyWrongPageBody = await legacyWrongPage.json();
+    assert.equal(
+      legacyWrongPage.status,
+      400,
+      `legacy prompts cannot queue a sibling warning under the entry page: ${JSON.stringify(legacyWrongPageBody)}`,
+    );
+    assert.equal(legacyWrongPageBody.status, "invalid-page-context");
     const prompts = contexts.map((context) => ({ ...context, prompt: "page note", tag: "message" }));
     assert.equal((await post("prompts", { page_protocol: 1, prompts })).status, 400);
     assert.equal(
