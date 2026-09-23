@@ -63,7 +63,16 @@ test("a restarted review keeps its load while feedback moves from entry to autho
       });
     const entryFeedback = await post("prompts", {
       page_protocol: 1,
-      prompts: [{ uid: "entry-note", tag: "p", selector: "a", prompt: "Review entry", page: load.page, page_proof: load.page_proof }],
+      prompts: [
+        {
+          uid: "entry-note",
+          tag: "p",
+          selector: "a",
+          prompt: "Review entry",
+          page: load.page,
+          page_proof: load.page_proof,
+        },
+      ],
       domSnapshot: "ENTRY SNAPSHOT",
       snapshot_page: load.page,
       snapshot_page_proof: load.page_proof,
@@ -91,30 +100,43 @@ test("a restarted review keeps its load while feedback moves from entry to autho
     assert.equal(siblingLoad.page, "sibling.html");
     assert.equal(siblingLoad.artifact_revision, load.artifact_revision + 1);
     assert.equal(
-      (await post("artifact-failures", {
-        failures: [{ kind: "artifact-asset-unavailable", detail: "stale entry" }],
-        artifact_load_token: load.artifact_load_token,
-        artifact_revision: load.artifact_revision,
-        page: load.page,
-        page_proof: load.page_proof,
-        document_sequence: 1,
-      })).status,
+      (
+        await post("artifact-failures", {
+          failures: [{ kind: "artifact-asset-unavailable", detail: "stale entry" }],
+          artifact_load_token: load.artifact_load_token,
+          artifact_revision: load.artifact_revision,
+          page: load.page,
+          page_proof: load.page_proof,
+          document_sequence: 1,
+        })
+      ).status,
       409,
     );
     assert.equal(
-      (await post("artifact-failures", {
-        failures: [{ kind: "artifact-asset-unavailable", detail: "wrong proof" }],
-        artifact_load_token: siblingLoad.artifact_load_token,
-        artifact_revision: siblingLoad.artifact_revision,
-        page: siblingLoad.page,
-        page_proof: load.page_proof,
-        document_sequence: 1,
-      })).status,
+      (
+        await post("artifact-failures", {
+          failures: [{ kind: "artifact-asset-unavailable", detail: "wrong proof" }],
+          artifact_load_token: siblingLoad.artifact_load_token,
+          artifact_revision: siblingLoad.artifact_revision,
+          page: siblingLoad.page,
+          page_proof: load.page_proof,
+          document_sequence: 1,
+        })
+      ).status,
       400,
     );
     const siblingFeedback = await post("prompts", {
       page_protocol: 1,
-      prompts: [{ uid: "sibling-note", tag: "p", selector: "p", prompt: "Review sibling", page: siblingLoad.page, page_proof: siblingLoad.page_proof }],
+      prompts: [
+        {
+          uid: "sibling-note",
+          tag: "p",
+          selector: "p",
+          prompt: "Review sibling",
+          page: siblingLoad.page,
+          page_proof: siblingLoad.page_proof,
+        },
+      ],
       domSnapshot: "SIBLING SNAPSHOT",
       snapshot_page: siblingLoad.page,
       snapshot_page_proof: siblingLoad.page_proof,
