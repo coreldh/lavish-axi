@@ -407,6 +407,19 @@ test("a replacement server preserves the live reviewer handoff and artifact load
 
     // An upgrade restart hands the reviewer's already-open tab a store that has only state.json
     // to go on. The tab did not ask for the restart and its load is still the current one.
+    const siblingLoad = await new SessionStore(stateFile).currentArtifactLoad(session.key);
+    assert.equal(siblingLoad.valid, true);
+    assert.equal(siblingLoad.artifact_load_token, load.artifact_load_token);
+    assert.equal(siblingLoad.artifact_revision, load.artifact_revision);
+
+    const whiteboardChannel = await new SessionStore(stateFile).authenticateWhiteboardChannel(
+      session.key,
+      load.artifact_load_token,
+      load.artifact_revision,
+      1,
+    );
+    assert.equal(whiteboardChannel.status, "authenticated");
+
     const restarted = new SessionStore(stateFile);
     const verified = await restarted.verifyArtifactLoad(session.key, load.artifact_load_token, load.artifact_revision);
     assert.equal(verified.valid, true);

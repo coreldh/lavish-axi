@@ -501,7 +501,7 @@ export class SessionStore {
       const state = await this.readState();
       const session = state.sessions[key];
       if (!session) return null;
-      const load = this.artifactLoads.get(key);
+      const load = this.#activeArtifactLoad(session);
       const revision = parseRevisionValue(artifactRevision);
       if (
         !load ||
