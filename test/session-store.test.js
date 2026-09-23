@@ -70,7 +70,10 @@ for (const source of ["whiteboard", "diagnostics", "failures"]) {
       findings: [],
     });
 
-    for (const [page, sequence] of [["a.html", 1], ["b.html", 2]]) {
+    for (const [page, sequence] of [
+      ["a.html", 1],
+      ["b.html", 2],
+    ]) {
       if (source === "whiteboard") {
         const channel = await store.authenticateWhiteboardChannel(
           key,
