@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -209,6 +209,52 @@ test("destination receipts authenticate decoded segments while preserving author
       currentLoad = await recovered.json();
       assert.equal(currentLoad.artifact_url, destination.url);
     }
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a recovered sibling can be atomically rewritten after its pinned first GET", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-rewrite-sibling-"));
+  const entry = path.join(root, "entry.html");
+  const sibling = path.join(root, "sibling.html");
+  const replacement = path.join(root, "replacement.html");
+  await writeFile(entry, '<!doctype html><a href="sibling.html">Sibling</a>');
+  await writeFile(sibling, "<!doctype html><p>First sibling</p>");
+  const server = await serve({ port: 0, stateFile: path.join(root, "state.json"), version: "rewrite-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { session, handoff } = await openAndLoad(base, entry);
+    const route = `/artifact/${session.key}/sibling.html`;
+    const context = injectedPageContext(base, await fetch(`${base}${route}`).then((response) => response.text()));
+    const destination = { ...context, url: route, query: "", fragment: "" };
+    const begin = async (sequence) => {
+      const response = await fetch(`${base}/api/${session.key}/artifact-loads/begin`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: base },
+        body: JSON.stringify({
+          request_id: `rewrite-${sequence}`,
+          request_sequence: sequence,
+          chrome_load_token: handoff.chrome_load_token,
+          destination,
+        }),
+      });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    await begin(2);
+    await writeFile(replacement, "<!doctype html><p>Changed before first GET</p>");
+    await rename(replacement, sibling);
+    assert.equal((await fetch(`${base}${route}`)).status, 403, "a pinned first GET rejects a changed inode");
+
+    await begin(3);
+    assert.match(await fetch(`${base}${route}`).then((response) => response.text()), /Changed before first GET/);
+    await writeFile(replacement, "<!doctype html><p>Changed after first GET</p>");
+    await rename(replacement, sibling);
+    const reviewed = await fetch(`${base}${route}`);
+    assert.equal(reviewed.status, 200, "a later visit reads the current root-contained sibling");
+    assert.match(await reviewed.text(), /Changed after first GET/);
   } finally {
     await server.close();
     await rm(root, { recursive: true, force: true });

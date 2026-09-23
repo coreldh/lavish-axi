@@ -613,6 +613,70 @@ test("a replacement server restores the begin fences the previous one issued", a
   }
 });
 
+test("a complete pre-352 durable load survives the upgrade restart", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const load = await beginArtifactLoad(store, session.key);
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    // #371 on main wrote these six fields, before page-scoped document fencing existed.
+    delete state.sessions[session.key].artifact_load.schema_version;
+    delete state.sessions[session.key].artifact_load.last_document_sequence;
+    await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`);
+
+    const restarted = new SessionStore(stateFile);
+    const verified = await restarted.verifyArtifactLoad(session.key, load.artifact_load_token, load.artifact_revision);
+    assert.equal(verified.valid, true);
+    const current = await restarted.currentArtifactLoad(session.key);
+    assert.equal(current.artifact_load_token, load.artifact_load_token);
+    assert.equal(
+      (await restarted.authenticateWhiteboardChannel(session.key, load.artifact_load_token, load.artifact_revision, 1))
+        .status,
+      "authenticated",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unversioned page-scoped load retains its document fence after upgrade", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const load = await beginArtifactLoad(store, session.key);
+    assert.equal(
+      (await store.authenticateWhiteboardChannel(session.key, load.artifact_load_token, load.artifact_revision, 2))
+        .status,
+      "authenticated",
+    );
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    delete state.sessions[session.key].artifact_load.schema_version;
+    await writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`);
+
+    const restarted = new SessionStore(stateFile);
+    assert.equal(
+      (await restarted.authenticateWhiteboardChannel(session.key, load.artifact_load_token, load.artifact_revision, 1))
+        .status,
+      "stale-sequence",
+    );
+    assert.equal(
+      (await restarted.authenticateWhiteboardChannel(session.key, load.artifact_load_token, load.artifact_revision, 2))
+        .status,
+      "authenticated",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("a partially stored artifact load is no load at all", async () => {
   // Every field of the epoch is a fence some later begin is judged against, so a record missing
   // one cannot be honored in part: restoring the token while defaulting `handoff_token` away
@@ -673,6 +737,8 @@ test("a partially stored artifact load is no load at all", async () => {
 
 test("a stored artifact load with a malformed fence is no load at all", async () => {
   const corruptions = [
+    { schema_version: 1 },
+    { schema_version: "2" },
     { last_document_sequence: "soon" },
     { last_document_sequence: -1 },
     { last_pass_sequence: "soon" },

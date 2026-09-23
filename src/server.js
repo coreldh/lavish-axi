@@ -2070,6 +2070,7 @@ export async function serve({
           token: result.artifact_load_token,
           route: destination.servedRoute,
           resolution: destination.resolution,
+          documentRead: false,
         });
       } else if (loadDestinations.get(req.params.key)?.token !== result.artifact_load_token) {
         loadDestinations.delete(req.params.key);
@@ -2300,7 +2301,7 @@ export async function serve({
       }
       let html;
       try {
-        html = await readArtifactPageContent(pinned || pageResolution);
+        html = await readArtifactPageContent(pinned && !recovered.documentRead ? pinned : pageResolution);
       } catch (error) {
         if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
           res.status(404).send("Not found");
@@ -2327,6 +2328,7 @@ export async function serve({
         expiredArtifactLoad(res);
         return;
       }
+      if (pinned && loadDestinations.get(key) === recovered) recovered.documentRead = true;
       res.setHeader("cache-control", "no-store");
       const chromeNonce = createChromeAuthNonce();
       res.type("html").send(

@@ -1494,6 +1494,7 @@ function planLayoutWarningPrompt(warnings, prompt, revision) {
 // begin the previous process already overtook win.
 function serializeArtifactLoad(load) {
   return {
+    schema_version: 2,
     artifact_load_token: load.artifactLoadToken,
     artifact_revision: load.artifactRevision,
     last_document_sequence: load.lastDocumentSequence,
@@ -1504,11 +1505,12 @@ function serializeArtifactLoad(load) {
   };
 }
 
-// The original durable epoch's six required fields. Page ordering was added later, so old
-// complete records can still be restored with a zero document sequence.
+// #371 wrote the first six fields before page-scoped document fencing existed. Versioned loads
+// require all seven; the complete older shape restores with the new fence at zero.
 const STORED_ARTIFACT_LOAD_FIELDS = [
   "artifact_load_token",
   "artifact_revision",
+  "last_document_sequence",
   "last_pass_sequence",
   "request_id",
   "request_sequence",
@@ -1518,10 +1520,10 @@ const STORED_ARTIFACT_LOAD_FIELDS = [
 // All of the epoch or none of it. Restoring a partial record would honor the token while some
 // fence it travels with defaulted away: without `handoff_token` the load answers 200 to everyone
 // while its own reviewer's next begin is told `no-handoff`, and without `request_sequence` a begin
-// the previous process already overtook wins. So an older or hand-edited state.json degrades to
-// the pre-persistence behaviour - one re-handshake and a fresh epoch - rather than admitting a
-// load the store can only partly describe. Presence and type are what is checked, not value:
-// `request_id` is legitimately "" and both sequence fences are legitimately 0 on a just-begun
+// the previous process already overtook wins. A partial versioned state.json degrades to the
+// pre-persistence behaviour - one re-handshake and a fresh epoch - rather than admitting a load
+// the store can only partly describe. Presence and type are what is checked, not value:
+// `request_id` is legitimately "" and each sequence fence is legitimately 0 on a just-begun
 // load. The revision is not: `beginArtifactLoad` only mints positive ones, so 0 is a value this
 // code never wrote and a load restored with it would be served at a revision that never existed.
 // The two tokens are additionally required non-empty, which rejects nothing this code wrote
@@ -1530,7 +1532,12 @@ const STORED_ARTIFACT_LOAD_FIELDS = [
 // a token-less pass.
 function restoreArtifactLoad(stored) {
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
-  if (STORED_ARTIFACT_LOAD_FIELDS.some((field) => !Object.hasOwn(stored, field))) return null;
+  const versioned = Object.hasOwn(stored, "schema_version");
+  if (versioned && stored.schema_version !== 2) return null;
+  const priorEpoch = !versioned && !Object.hasOwn(stored, "last_document_sequence");
+  if (STORED_ARTIFACT_LOAD_FIELDS.some((field) => field !== "last_document_sequence" && !Object.hasOwn(stored, field)))
+    return null;
+  if (!priorEpoch && !Object.hasOwn(stored, "last_document_sequence")) return null;
   const artifactLoadToken = stored.artifact_load_token;
   const handoffToken = stored.handoff_token;
   const requestId = stored.request_id;
@@ -1539,13 +1546,25 @@ function restoreArtifactLoad(stored) {
   if (typeof requestId !== "string") return null;
   const artifactRevision = parseSequenceValue(stored.artifact_revision);
   if (artifactRevision === 0) return null;
+  const lastDocumentSequence = priorEpoch ? 0 : parseSequenceValue(stored.last_document_sequence);
   const lastPassSequence = parseSequenceValue(stored.last_pass_sequence);
-  const lastDocumentSequence = Object.hasOwn(stored, "last_document_sequence")
-    ? parseSequenceValue(stored.last_document_sequence)
-    : 0;
   const requestSequence = parseSequenceValue(stored.request_sequence);
-  if (artifactRevision === null || lastDocumentSequence === null || lastPassSequence === null || requestSequence === null) return null;
-  return { artifactRevision, artifactLoadToken, lastDocumentSequence, lastPassSequence, requestId, requestSequence, handoffToken };
+  if (
+    artifactRevision === null ||
+    lastDocumentSequence === null ||
+    lastPassSequence === null ||
+    requestSequence === null
+  )
+    return null;
+  return {
+    artifactRevision,
+    artifactLoadToken,
+    lastDocumentSequence,
+    lastPassSequence,
+    requestId,
+    requestSequence,
+    handoffToken,
+  };
 }
 
 function normalizeStoredArtifactLoad(stored) {
@@ -1557,47 +1576,6 @@ function normalizeStoredArtifactLoad(stored) {
 // corrupt fence into an open one.
 function parseSequenceValue(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
-function validateLayoutWarningClaims(warnings, prompts, modern = false) {
-  const records = normalizeStoredWarnings(warnings);
-  const invalid = [];
-  for (const [promptIndex, prompt] of (Array.isArray(prompts) ? prompts : []).entries()) {
-    if (prompt?.tag !== "layout-warnings" || prompt.target?.type !== LAYOUT_WARNINGS_TARGET_TYPE) continue;
-    for (const [warningIndex, item] of (Array.isArray(prompt.target.warnings)
-      ? prompt.target.warnings
-      : []
-    ).entries()) {
-      const record = records.find((candidate) => candidate.id === String(item.id || ""));
-      if (modern && (!record || typeof prompt.page !== "string" || normalizeWarningPage(record.page) !== prompt.page)) {
-        invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
-        continue;
-      }
-      if (!Object.hasOwn(item || {}, "page") || item.page === null || item.page === "") continue;
-      const claimed = normalizeWarningPage(item.page);
-      if (!record || claimed === null || claimed !== normalizeWarningPage(record.page)) {
-        invalid.push({ index: promptIndex, warning_index: warningIndex, prompt_id: prompt.prompt_id || "" });
-      }
-    }
-  }
-  return invalid.length
-    ? { ok: false, result: { invalid_page_context: true, invalid: invalid.slice(0, 8) } }
-    : { ok: true };
-}
-
-function authoritativeLayoutWarningTarget(warnings, target) {
-  const normalized = normalizeLayoutWarningsTarget(target);
-  const records = normalizeStoredWarnings(warnings);
-  return {
-    ...normalized,
-    warnings: normalized.warnings.map((item) => {
-      const record = records.find((candidate) => candidate.id === item.id);
-      return {
-        ...item,
-        page: record ? normalizeWarningPage(record.page) : null,
-      };
-    }),
-  };
 }
 
 function normalizeRevision(value) {
