@@ -44,6 +44,130 @@ function feedbackResult(result) {
   );
 }
 
+for (const source of ["whiteboard", "diagnostics", "failures"]) {
+  test(`${source} document advancement fences older pages after restart`, async (t) => {
+    const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const key = session.key;
+    const load = await beginArtifactLoad(store, key);
+    const options = {
+      validatePageContext: async ({ page, proof }) => ({ ok: proof === "proof-" + page, page, proof }),
+    };
+    const diagnostics = (page, sequence, passSequence) => ({
+      page,
+      page_proof: "proof-" + page,
+      document_sequence: sequence,
+      artifact_load_token: load.artifact_load_token,
+      artifact_revision: load.artifact_revision,
+      artifact_pass_sequence: passSequence,
+      complete: true,
+      viewport_width: 1080,
+      findings: [],
+    });
+
+    for (const [page, sequence] of [["a.html", 1], ["b.html", 2]]) {
+      if (source === "whiteboard") {
+        const channel = await store.authenticateWhiteboardChannel(
+          key,
+          load.artifact_load_token,
+          load.artifact_revision,
+          sequence,
+        );
+        assert.equal(channel.status, "authenticated");
+      } else if (source === "diagnostics") {
+        const result = await store.recordLayoutDiagnostics(key, diagnostics(page, sequence, 1), options);
+        assert.equal(result.changed, false);
+      } else {
+        const result = await store.recordArtifactFailures(
+          key,
+          {
+            page,
+            page_proof: "proof-" + page,
+            document_sequence: sequence,
+            artifact_load_token: load.artifact_load_token,
+            artifact_revision: load.artifact_revision,
+            failures: [{ kind: "artifact-asset-unavailable", detail: page }],
+          },
+          options,
+        );
+        assert.equal(result.changed, true);
+      }
+    }
+
+    let latestSequence = 2;
+    if (source === "failures") {
+      const duplicate = await store.recordArtifactFailures(
+        key,
+        {
+          page: "b.html",
+          page_proof: "proof-b.html",
+          document_sequence: 3,
+          artifact_load_token: load.artifact_load_token,
+          artifact_revision: load.artifact_revision,
+          failures: [{ kind: "artifact-asset-unavailable", detail: "b.html" }],
+        },
+        options,
+      );
+      assert.equal(duplicate.changed, false);
+      latestSequence = 3;
+    }
+
+    const persisted = JSON.parse(await readFile(stateFile, "utf8")).sessions[key].artifact_load;
+    assert.equal(persisted.last_document_sequence, latestSequence);
+    const restarted = new SessionStore(stateFile);
+    const oldChannel = await restarted.authenticateWhiteboardChannel(
+      key,
+      load.artifact_load_token,
+      load.artifact_revision,
+      1,
+    );
+    assert.equal(oldChannel.status, "stale-sequence");
+    const currentChannel = await restarted.authenticateWhiteboardChannel(
+      key,
+      load.artifact_load_token,
+      load.artifact_revision,
+      latestSequence,
+    );
+    assert.equal(currentChannel.status, "authenticated");
+    assert.equal((await restarted.recordLayoutDiagnostics(key, diagnostics("a.html", 1, 2), options)).stale, true);
+    assert.equal(
+      (await restarted.recordLayoutDiagnostics(key, diagnostics("b.html", latestSequence, 2), options)).stale,
+      undefined,
+    );
+    const lateFailure = await restarted.recordArtifactFailures(
+      key,
+      {
+        page: "a.html",
+        page_proof: "proof-a.html",
+        document_sequence: 1,
+        artifact_load_token: load.artifact_load_token,
+        artifact_revision: load.artifact_revision,
+        failures: [{ kind: "artifact-asset-unavailable", detail: "late-a" }],
+      },
+      options,
+    );
+    assert.equal(lateFailure.stale, true);
+    const currentFailure = await restarted.recordArtifactFailures(
+      key,
+      {
+        page: "b.html",
+        page_proof: "proof-b.html",
+        document_sequence: latestSequence,
+        artifact_load_token: load.artifact_load_token,
+        artifact_revision: load.artifact_revision,
+        failures: [{ kind: "artifact-asset-unavailable", detail: "current-b" }],
+      },
+      options,
+    );
+    assert.equal(currentFailure.changed, true);
+  });
+}
+
 test("queued prompts are returned with DOM snapshot context and then cleared", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
@@ -493,6 +617,7 @@ test("a partially stored artifact load is no load at all", async () => {
   const fields = [
     "artifact_load_token",
     "artifact_revision",
+    "last_document_sequence",
     "last_pass_sequence",
     "request_id",
     "request_sequence",
@@ -545,6 +670,8 @@ test("a partially stored artifact load is no load at all", async () => {
 
 test("a stored artifact load with a malformed fence is no load at all", async () => {
   const corruptions = [
+    { last_document_sequence: "soon" },
+    { last_document_sequence: -1 },
     { last_pass_sequence: "soon" },
     { request_sequence: -1 },
     { request_id: 7 },

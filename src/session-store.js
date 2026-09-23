@@ -517,6 +517,8 @@ export class SessionStore {
       if (documentSequence > Number(load.lastDocumentSequence || 0)) {
         load.lastDocumentSequence = documentSequence;
         load.lastPassSequence = 0;
+        session.artifact_load = serializeArtifactLoad(load);
+        await this.writeState(state);
       }
       return { session, status: "authenticated" };
     });
@@ -588,7 +590,8 @@ export class SessionStore {
       }
       // Every request has been authenticated and fully ordered before this high-water update.
       // A newer document starts its pass counter at one; equal documents retain pass ordering.
-      if (modernContext && documentSequence.value > Number(load.lastDocumentSequence || 0)) {
+      const documentAdvanced = modernContext && documentSequence.value > Number(load.lastDocumentSequence || 0);
+      if (documentAdvanced) {
         load.lastDocumentSequence = documentSequence.value;
         load.lastPassSequence = 0;
       }
@@ -611,6 +614,10 @@ export class SessionStore {
         changed = changed || obsolete.changed;
       }
       if (!changed) {
+        if (documentAdvanced) {
+          session.artifact_load = serializeArtifactLoad(load);
+          await this.writeState(state);
+        }
         return { session, changed: false, warnings: serializeLayoutWarnings(warnings) };
       }
       session.layout_warnings = warnings;
@@ -718,7 +725,8 @@ export class SessionStore {
       ) {
         return { session, changed: false, stale: true, ...(invalidPageContext ? { invalid_page_context: true } : {}) };
       }
-      if (boundDocument && documentSequence.value > Number(load.lastDocumentSequence || 0)) {
+      const documentAdvanced = boundDocument && documentSequence.value > Number(load.lastDocumentSequence || 0);
+      if (documentAdvanced) {
         load.lastDocumentSequence = documentSequence.value;
         load.lastPassSequence = 0;
       }
@@ -740,7 +748,13 @@ export class SessionStore {
               (old) => old.page === failure.page && old.kind === failure.kind && old.detail === failure.detail,
             ),
         );
-        if (!fresh.length) return { session, changed: false, failures: session.artifact_failures };
+        if (!fresh.length) {
+          if (documentAdvanced) {
+            session.artifact_load = serializeArtifactLoad(load);
+            await this.writeState(state);
+          }
+          return { session, changed: false, failures: session.artifact_failures };
+        }
         appendFeedbackBatch(
           session,
           {
@@ -757,6 +771,7 @@ export class SessionStore {
           { keepSnapshot: true },
         );
         if (session.status !== "ended") session.status = "feedback";
+        if (documentAdvanced) session.artifact_load = serializeArtifactLoad(load);
         session.updated_at = new Date().toISOString();
         await this.writeState(state);
         return { session, changed: true, failures: session.artifact_failures };
@@ -764,6 +779,10 @@ export class SessionStore {
       const previous = Array.isArray(session.artifact_failures) ? session.artifact_failures : [];
       const { failures, changed } = mergeArtifactFailures(previous, normalized);
       if (!changed) {
+        if (documentAdvanced) {
+          session.artifact_load = serializeArtifactLoad(load);
+          await this.writeState(state);
+        }
         return { session, changed: false, failures };
       }
       session.artifact_failures = failures;
