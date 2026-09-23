@@ -567,7 +567,15 @@ export function createArtifactSdk(
       if (readyRetryTimer) window.clearTimeout(readyRetryTimer);
       readyRetryTimer = undefined;
     };
-    const chromeOrigin = String(window.location?.origin || "");
+    // The sandbox makes location.origin "null" even for a page served by this
+    // server. The injected SDK script URL retains the server's tuple origin.
+    const chromeOrigin = (() => {
+      try {
+        return new URL(/** @type {HTMLScriptElement | null} */ (document.currentScript)?.src).origin;
+      } catch {
+        return "";
+      }
+    })();
     const readyListener = (event) => {
       if (accepted || event.source !== parent) return;
       if (!chromeOrigin || chromeOrigin === "null" || event.origin !== chromeOrigin) return;

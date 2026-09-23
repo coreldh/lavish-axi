@@ -142,11 +142,11 @@ function bootSdk({
       observe() {}
       disconnect() {}
     },
-    URL: {
-      createObjectURL() {
+    URL: class extends URL {
+      static createObjectURL() {
         return "blob:lavish-test";
-      },
-      revokeObjectURL() {},
+      }
+      static revokeObjectURL() {}
     },
     getComputedStyle: () => ({}),
     setTimeout: scheduleTimer,
@@ -154,6 +154,7 @@ function bootSdk({
     requestAnimationFrame: (fn) => (runAnimationFrames ? scheduleTimer(fn, 0) : 0),
     document: {
       readyState: "complete",
+      currentScript: { src: "http://127.0.0.1/sdk.js?key=abc" },
       documentElement,
       head,
       body,
@@ -907,7 +908,7 @@ test("the protocol-1 SDK reveals nothing to a parent that cannot present this do
   assert.equal(seen[0].page_proof, "proof-sub-page");
 });
 
-test("the protocol-1 SDK ignores the genuine chrome auth when a foreign or opaque parent relays it", async (t) => {
+test("the protocol-1 SDK accepts the chrome origin in an opaque artifact and rejects relays", async (t) => {
   const boot = (origin = undefined) =>
     bootSdk({
       origin,
@@ -953,9 +954,13 @@ test("the protocol-1 SDK ignores the genuine chrome auth when a foreign or opaqu
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(sdk.documentListenerCount("click"), clickListenersBefore, "the review SDK never installed");
 
-  // A document whose own URL has no tuple origin can never accept an opaque sender.
+  // The sandbox gives the artifact an opaque origin, but its served SDK still names
+  // the chrome's origin. An opaque sender remains untrusted.
   const opaque = boot("null");
   assert.deepEqual(await attempt(opaque, "null"), []);
+  const opaqueAccepted = await attempt(opaque, "http://127.0.0.1");
+  assert.equal(opaqueAccepted.length, 1);
+  assert.equal(opaqueAccepted[0].type, "lavish:challengeResponse");
 
   // Positive control: the same MAC from the chrome's own origin completes the challenge.
   const seen = await attempt(sdk, "http://127.0.0.1");
