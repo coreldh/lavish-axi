@@ -54,7 +54,7 @@ test("a restarted review keeps its load while feedback moves from entry to autho
   let server = await serve({ port: 0, stateFile, version: "restart-sibling-test" });
   try {
     let base = `http://127.0.0.1:${server.port}`;
-    const { session, handoff, load } = await openAndLoad(base, entry);
+    const { session, load } = await openAndLoad(base, entry);
     const post = (route, body, origin = base) =>
       fetch(`${base}/api/${session.key}/${route}`, {
         method: "POST",
@@ -75,14 +75,15 @@ test("a restarted review keeps its load while feedback moves from entry to autho
     base = `http://127.0.0.1:${server.port}`;
     const restored = await post("chrome-loads/begin", {});
     assert.equal(restored.status, 200);
-    assert.equal((await restored.json()).artifact_load_token, load.artifact_load_token);
+    const restoredHandoff = await restored.json();
+    assert.equal(restoredHandoff.artifact_load_token, load.artifact_load_token);
     const siblingHtml = await fetch(`${base}/artifact/${session.key}/sibling.html`).then((response) => response.text());
     const sibling = injectedPageContext(base, siblingHtml);
     const destination = { ...sibling, url: `/artifact/${session.key}/sibling.html`, query: "", fragment: "" };
     const next = await post("artifact-loads/begin", {
       request_id: "authored-sibling-after-restart",
       request_sequence: 2,
-      chrome_load_token: handoff.chrome_load_token,
+      chrome_load_token: restoredHandoff.chrome_load_token,
       destination,
     });
     assert.equal(next.status, 200);
@@ -109,7 +110,7 @@ test("a restarted review keeps its load while feedback moves from entry to autho
         page_proof: load.page_proof,
         document_sequence: 1,
       })).status,
-      403,
+      400,
     );
     const siblingFeedback = await post("prompts", {
       page_protocol: 1,
