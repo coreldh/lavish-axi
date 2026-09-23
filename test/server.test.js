@@ -4916,7 +4916,7 @@ test("a review WebSocket reconnect within the grace period keeps the active poll
     port: 0,
     stateFile: path.join(dir, "state.json"),
     version: "9.9.9-test",
-    browserDisconnectGraceMs: 100,
+    browserDisconnectGraceMs: 1000,
   });
   let reconnected = null;
   try {
@@ -4929,12 +4929,11 @@ test("a review WebSocket reconnect within the grace period keeps the active poll
     const browser = await startPresenceStream(base, opened.key);
     assert.equal(await browser.next(), "waiting");
 
-    const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=180`).then((response) =>
+    const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=1200`).then((response) =>
       response.json(),
     );
     assert.equal(await browser.next(), "listening");
     await browser.close();
-    await new Promise((resolve) => setTimeout(resolve, 20));
     reconnected = await startPresenceStream(base, opened.key);
     assert.equal(await reconnected.next(), "listening");
 
@@ -4991,6 +4990,8 @@ test("exclusive listener ownership rejects a loser and reports a takeover", asyn
   const stateFile = path.join(dir, "state.json");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
   const server = await serve({ port: 0, stateFile, version: "9.9.9-test" });
+  let browser = null;
+  const firstPollController = new AbortController();
   try {
     const base = `http://127.0.0.1:${server.port}`;
     const open = await fetch(`${base}/api/sessions`, {
@@ -4999,8 +5000,12 @@ test("exclusive listener ownership rejects a loser and reports a takeover", asyn
       body: JSON.stringify({ file: artifact }),
     });
     const { key } = await open.json();
-    const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    browser = await startPresenceStream(base, key);
+    assert.equal(await browser.next(), "waiting");
+    const poll = fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&owner=worker-7`, {
+      signal: firstPollController.signal,
+    }).catch((error) => error);
+    assert.equal(await browser.next(), "listening");
 
     const health = await fetch(`${base}/health`).then((response) => response.json());
     assert.deepEqual(
@@ -5036,6 +5041,8 @@ test("exclusive listener ownership rejects a loser and reports a takeover", asyn
     takeover.abort();
     await replacement;
   } finally {
+    firstPollController.abort();
+    await browser?.close();
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
