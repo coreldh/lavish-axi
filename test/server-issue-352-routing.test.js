@@ -45,6 +45,102 @@ function injectedPageContext(base, html) {
   };
 }
 
+test("a restarted review keeps its load while feedback moves from entry to authored sibling", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-restart-sibling-"));
+  const entry = path.join(root, "entry.html");
+  const stateFile = path.join(root, "state.json");
+  await writeFile(entry, '<!doctype html><a href="sibling.html">Sibling</a>');
+  await writeFile(path.join(root, "sibling.html"), "<!doctype html><p>Sibling page</p>");
+  let server = await serve({ port: 0, stateFile, version: "restart-sibling-test" });
+  try {
+    let base = `http://127.0.0.1:${server.port}`;
+    const { session, handoff, load } = await openAndLoad(base, entry);
+    const post = (route, body, origin = base) =>
+      fetch(`${base}/api/${session.key}/${route}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin },
+        body: JSON.stringify(body),
+      });
+    const entryFeedback = await post("prompts", {
+      page_protocol: 1,
+      prompts: [{ uid: "entry-note", tag: "p", selector: "a", prompt: "Review entry", page: load.page, page_proof: load.page_proof }],
+      domSnapshot: "ENTRY SNAPSHOT",
+      snapshot_page: load.page,
+      snapshot_page_proof: load.page_proof,
+    });
+    assert.equal(entryFeedback.status, 200);
+
+    await server.close();
+    server = await serve({ port: 0, stateFile, version: "restart-sibling-test" });
+    base = `http://127.0.0.1:${server.port}`;
+    const restored = await post("chrome-loads/begin", {});
+    assert.equal(restored.status, 200);
+    assert.equal((await restored.json()).artifact_load_token, load.artifact_load_token);
+    const siblingHtml = await fetch(`${base}/artifact/${session.key}/sibling.html`).then((response) => response.text());
+    const sibling = injectedPageContext(base, siblingHtml);
+    const destination = { ...sibling, url: `/artifact/${session.key}/sibling.html`, query: "", fragment: "" };
+    const next = await post("artifact-loads/begin", {
+      request_id: "authored-sibling-after-restart",
+      request_sequence: 2,
+      chrome_load_token: handoff.chrome_load_token,
+      destination,
+    });
+    assert.equal(next.status, 200);
+    const siblingLoad = await next.json();
+    assert.equal(siblingLoad.page, "sibling.html");
+    assert.equal(siblingLoad.artifact_revision, load.artifact_revision + 1);
+    assert.equal(
+      (await post("artifact-failures", {
+        failures: [{ kind: "artifact-asset-unavailable", detail: "stale entry" }],
+        artifact_load_token: load.artifact_load_token,
+        artifact_revision: load.artifact_revision,
+        page: load.page,
+        page_proof: load.page_proof,
+        document_sequence: 1,
+      })).status,
+      409,
+    );
+    assert.equal(
+      (await post("artifact-failures", {
+        failures: [{ kind: "artifact-asset-unavailable", detail: "wrong proof" }],
+        artifact_load_token: siblingLoad.artifact_load_token,
+        artifact_revision: siblingLoad.artifact_revision,
+        page: siblingLoad.page,
+        page_proof: load.page_proof,
+        document_sequence: 1,
+      })).status,
+      403,
+    );
+    const siblingFeedback = await post("prompts", {
+      page_protocol: 1,
+      prompts: [{ uid: "sibling-note", tag: "p", selector: "p", prompt: "Review sibling", page: siblingLoad.page, page_proof: siblingLoad.page_proof }],
+      domSnapshot: "SIBLING SNAPSHOT",
+      snapshot_page: siblingLoad.page,
+      snapshot_page_proof: siblingLoad.page_proof,
+    });
+    assert.equal(siblingFeedback.status, 200);
+    const failure = await post("artifact-failures", {
+      failures: [{ kind: "artifact-asset-unavailable", detail: "sibling asset" }],
+      artifact_load_token: siblingLoad.artifact_load_token,
+      artifact_revision: siblingLoad.artifact_revision,
+      page: siblingLoad.page,
+      page_proof: siblingLoad.page_proof,
+      document_sequence: 1,
+    });
+    assert.equal(failure.status, 200);
+
+    const first = await fetch(`${base}/api/poll?file=${encodeURIComponent(entry)}&timeoutMs=0`).then((r) => r.json());
+    const second = await fetch(`${base}/api/poll?file=${encodeURIComponent(entry)}&timeoutMs=0`).then((r) => r.json());
+    assert.deepEqual([first.snapshot_page, second.snapshot_page], ["entry.html", "sibling.html"]);
+    assert.deepEqual([first.prompts[0].page, second.prompts[0].page], ["entry.html", "sibling.html"]);
+    assert.equal(second.artifact_failures[0].page, "sibling.html");
+    assert.equal(second.artifact_failures[0].detail, "sibling asset");
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("destination receipts authenticate decoded segments while preserving authored URL spelling", async () => {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "lavish-url-spelling-")));
   const entry = path.join(root, "entry.html");
