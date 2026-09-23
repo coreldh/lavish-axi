@@ -5540,7 +5540,13 @@ test("a disconnect during immediate feedback take requeues the batch without wor
     socket.on("error", () => {});
     socket.destroy();
     releaseTake();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const listenerDeadline = Date.now() + 2000;
+    while (true) {
+      const health = await fetch(`${base}/health`).then((response) => response.json());
+      if (!health.listeners.some((listener) => listener.key === key)) break;
+      assert.ok(Date.now() < listenerDeadline, "disconnected poll kept its listener");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
 
     const presence = await startPresenceStream(base, key);
     try {
