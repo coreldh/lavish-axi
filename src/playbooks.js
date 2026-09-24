@@ -226,6 +226,7 @@ export const PLAYBOOKS = [
 \`\`\`html
 <div>
   <button type="button" onclick="(async (btn) => {
+    const copyRun = btn._lavishCopyRun = (btn._lavishCopyRun || 0) + 1;
     const qs = [...document.querySelectorAll('[data-lavish-question]')];
     const status = btn.parentElement.querySelector('[data-lavish-copy-all-status]');
     btn.parentElement.querySelector('[data-lavish-copy-all-manual]')?.remove();
@@ -243,7 +244,9 @@ export const PLAYBOOKS = [
         if (el instanceof HTMLSelectElement) {
           vals = [...el.selectedOptions].filter((o) => !o.disabled && !o.closest('optgroup[disabled]')).map((o) => o.value.trim()).filter(Boolean);
         } else {
-          const v = el.value.trim();
+          const v = isChoice && (!el.hasAttribute('value') || !el.value.trim())
+            ? el.labels?.[0]?.textContent?.trim() || el.getAttribute('aria-label')?.trim() || el.name || ''
+            : el.value.trim();
           vals = v ? [v] : [];
         }
         const label = el.name || el.labels?.[0]?.textContent?.trim() || el.getAttribute('aria-label')?.trim() || el.getAttribute('placeholder')?.trim() || el.tagName.toLowerCase();
@@ -260,9 +263,11 @@ export const PLAYBOOKS = [
     try {
       if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('Clipboard API unavailable');
       await navigator.clipboard.writeText(text);
+      if (copyRun !== btn._lavishCopyRun) return;
       status.textContent = 'Answers copied.';
       return;
     } catch {}
+    if (copyRun !== btn._lavishCopyRun) return;
     const tmp = document.createElement('textarea');
     tmp.value = text;
     tmp.readOnly = true;

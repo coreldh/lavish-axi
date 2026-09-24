@@ -17,6 +17,10 @@ let chromeLaunchState;
 async function chromePath() {
   const candidates = [
     process.env.CHROME_PATH,
+    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google/Chrome/Application/chrome.exe"),
+    process.env["PROGRAMFILES(X86)"] &&
+      path.join(process.env["PROGRAMFILES(X86)"], "Google/Chrome/Application/chrome.exe"),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google/Chrome/Application/chrome.exe"),
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/usr/bin/google-chrome",
@@ -49,7 +53,7 @@ async function headlessChromeState(chrome) {
         "--dump-dom",
         "about:blank",
       ],
-      { encoding: "utf8", timeout: 15_000 },
+      { stdio: "ignore", timeout: 15_000 },
     );
     chromeLaunchState =
       result.status === 0
@@ -99,15 +103,19 @@ function probeScript(scenario, { clicks = 1 } = {}) {
       "Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined }); document.execCommand = undefined;",
     delayedManual:
       "Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => new Promise((_, reject) => setTimeout(() => reject(new Error('permission denied')), 5)) } }); document.execCommand = undefined;",
+    staleFailure:
+      "window.__copied = ''; let writes = 0; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: (value) => ++writes === 1 ? new Promise((_, reject) => setTimeout(() => reject(new Error('permission denied')), 15)) : Promise.resolve(window.__copied = value) } }); document.execCommand = undefined;",
     empty:
       "window.__clipboardCalls = 0; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { window.__clipboardCalls += 1; } } });",
   }[scenario];
 
   const clickOnce = `document.querySelector('button[type="button"]').click(); await new Promise((resolve) => setTimeout(resolve, 0));`;
   const clickLines =
-    scenario === "delayedManual"
-      ? `for (let i = 0; i < ${clicks}; i++) document.querySelector('button[type="button"]').click(); await new Promise((resolve) => setTimeout(resolve, 20));`
-      : Array.from({ length: clicks }, () => clickOnce).join("\n        ");
+    scenario === "staleFailure"
+      ? `document.querySelector('button[type="button"]').click(); document.querySelector('input[name="answer"]').value = 'New answer'; document.querySelector('button[type="button"]').click(); await new Promise((resolve) => setTimeout(resolve, 30));`
+      : scenario === "delayedManual"
+        ? `for (let i = 0; i < ${clicks}; i++) document.querySelector('button[type="button"]').click(); await new Promise((resolve) => setTimeout(resolve, 20));`
+        : Array.from({ length: clicks }, () => clickOnce).join("\n        ");
 
   return `<script>
     (async () => {
@@ -301,6 +309,28 @@ test("overlapping rejected clipboard writes leave one manual textarea", async (t
   assert.equal(result.manual.length, 1);
   assert.equal(result.manual[0].value, expected);
   assert.equal(result.manual[0].selected, true);
+});
+
+test("an older rejected copy cannot replace a newer successful answer", async (t) => {
+  const result = await runBrowserScenario(
+    t,
+    "staleFailure",
+    '<form data-lavish-question="revision"><input name="answer" value="Old answer"></form>',
+  );
+  if (!result) return;
+  assert.equal(result.copied, "revision:\n  answer: New answer");
+  assert.equal(result.manualTextareaCount, 0);
+  assert.equal(result.status, "Answers copied.");
+});
+
+test("checked choices with empty or missing values copy their visible labels", async (t) => {
+  const result = await runBrowserScenario(
+    t,
+    "clipboard",
+    '<form data-lavish-question="choices"><label><input type="checkbox" name="feature" value="" checked> Include notes</label><label><input type="radio" name="tier" checked> Standard tier</label></form>',
+  );
+  if (!result) return;
+  assert.equal(result.copied, "choices:\n  feature: Include notes\n  tier: Standard tier");
 });
 
 const fieldsetFixture = `<form data-lavish-question="access">
