@@ -304,6 +304,18 @@ test("fieldset-disabled and directly disabled controls are excluded", async (t) 
   assert.equal(result.copied, "access:\n  active: Visible answer");
 });
 
+const unsupportedInputFixture = `<form data-lavish-question="settings">
+      <input type="range" name="volume" value="50">
+      <input type="color" name="accent" value="#000000">
+      <input type="text" name="note" value="Keep this">
+    </form>`;
+
+test("range and color values are excluded from copied answers", async (t) => {
+  const result = await runBrowserScenario(t, "clipboard", unsupportedInputFixture);
+  if (!result) return;
+  assert.equal(result.copied, "settings:\n  note: Keep this");
+});
+
 const multiSelectFixture = `<form data-lavish-question="tags">
       <select name="tags" multiple>
         <option value="alpha" selected>Alpha</option>
@@ -317,6 +329,23 @@ test("a multi-value select copies one line per selected option", async (t) => {
   if (!result) return;
   assert.equal(result.noLavish, true);
   assert.equal(result.copied, "tags:\n  tags: alpha\n  tags: beta");
+});
+
+const disabledSelectedOptionsFixture = `<form data-lavish-question="tags">
+      <select name="tags" multiple>
+        <option value="alpha" selected>Alpha</option>
+        <option value="beta" selected disabled>Beta</option>
+        <optgroup label="Unavailable" disabled>
+          <option value="gamma" selected>Gamma</option>
+        </optgroup>
+        <option value="delta" selected>Delta</option>
+      </select>
+    </form>`;
+
+test("disabled selected options and disabled optgroups are excluded", async (t) => {
+  const result = await runBrowserScenario(t, "clipboard", disabledSelectedOptionsFixture);
+  if (!result) return;
+  assert.equal(result.copied, "tags:\n  tags: alpha\n  tags: delta");
 });
 
 const multilineFixture = `<form data-lavish-question="notes">

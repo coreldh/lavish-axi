@@ -238,10 +238,10 @@ export const PLAYBOOKS = [
         if (el.closest('[data-lavish-question]') !== q) continue;
         const isChoice = el.matches('input[type=checkbox], input[type=radio]');
         if (isChoice && !el.checked) continue;
-        if (el.matches('input[type=button], input[type=submit], input[type=reset], input[type=image], input[type=hidden], input[type=file]')) continue;
+        if (el.matches('input[type=button], input[type=submit], input[type=reset], input[type=image], input[type=hidden], input[type=file], input[type=range], input[type=color]')) continue;
         let vals;
         if (el instanceof HTMLSelectElement) {
-          vals = [...el.selectedOptions].map((o) => o.value.trim()).filter(Boolean);
+          vals = [...el.selectedOptions].filter((o) => !o.disabled && !o.closest('optgroup[disabled]')).map((o) => o.value.trim()).filter(Boolean);
         } else {
           const v = el.value.trim();
           vals = v ? [v] : [];
