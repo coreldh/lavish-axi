@@ -97,12 +97,17 @@ function probeScript(scenario, { clicks = 1 } = {}) {
       "window.__execCommandText = ''; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('permission denied'); } } }); document.execCommand = (command) => { if (command !== 'copy') return false; const temporary = [...document.querySelectorAll('textarea')].find((area) => area.readOnly && !area.dataset.lavishCopyAllManual); window.__execCommandText = temporary?.value || ''; return Boolean(temporary); };",
     manual:
       "Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined }); document.execCommand = undefined;",
+    delayedManual:
+      "Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => new Promise((_, reject) => setTimeout(() => reject(new Error('permission denied')), 5)) } }); document.execCommand = undefined;",
     empty:
       "window.__clipboardCalls = 0; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { window.__clipboardCalls += 1; } } });",
   }[scenario];
 
   const clickOnce = `document.querySelector('button[type="button"]').click(); await new Promise((resolve) => setTimeout(resolve, 0));`;
-  const clickLines = Array.from({ length: clicks }, () => clickOnce).join("\n        ");
+  const clickLines =
+    scenario === "delayedManual"
+      ? `for (let i = 0; i < ${clicks}; i++) document.querySelector('button[type="button"]').click(); await new Promise((resolve) => setTimeout(resolve, 20));`
+      : Array.from({ length: clicks }, () => clickOnce).join("\n        ");
 
   return `<script>
     (async () => {
@@ -287,6 +292,15 @@ test("repeated clicks with the fallback forced leave exactly one manual textarea
   assert.equal(result.manualTextareaCount, 1, "the prior manual textarea is removed before a new one is added");
   assert.equal(result.manual.length, 1);
   assert.equal(result.manual[0].value, expected);
+});
+
+test("overlapping rejected clipboard writes leave one manual textarea", async (t) => {
+  const result = await runBrowserScenario(t, "delayedManual", true, { clicks: 2 });
+  if (!result) return;
+  assert.equal(result.manualTextareaCount, 1);
+  assert.equal(result.manual.length, 1);
+  assert.equal(result.manual[0].value, expected);
+  assert.equal(result.manual[0].selected, true);
 });
 
 const fieldsetFixture = `<form data-lavish-question="access">

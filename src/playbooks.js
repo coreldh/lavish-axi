@@ -281,6 +281,7 @@ export const PLAYBOOKS = [
       status.textContent = 'Answers copied.';
       return;
     }
+    btn.parentElement.querySelector('[data-lavish-copy-all-manual]')?.remove();
     const man = document.createElement('textarea');
     man.value = text;
     man.readOnly = true;
