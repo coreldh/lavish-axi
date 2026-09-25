@@ -17,10 +17,6 @@ let chromeLaunchState;
 async function chromePath() {
   const candidates = [
     process.env.CHROME_PATH,
-    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google/Chrome/Application/chrome.exe"),
-    process.env["PROGRAMFILES(X86)"] &&
-      path.join(process.env["PROGRAMFILES(X86)"], "Google/Chrome/Application/chrome.exe"),
-    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google/Chrome/Application/chrome.exe"),
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/usr/bin/google-chrome",
@@ -200,6 +196,10 @@ function resultFromDump(html) {
 }
 
 async function runBrowserScenario(t, scenario, fixture, options = {}) {
+  if (process.platform === "win32") {
+    t.skip("the headless dump harness relies on POSIX process-group cleanup");
+    return null;
+  }
   const snippet = copyAllHtmlSnippet();
   const chrome = await chromePath();
   if (!chrome) {
