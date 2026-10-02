@@ -4345,13 +4345,53 @@ function whiteboardChannelAuthBody(token, context) {
 
 function retireWhiteboardChannelsForBinding(binding) {
   if (!binding) return;
-  for (const [key, channel] of inlineWhiteboardChannels) {
-    if (channel.context?.binding !== binding) continue;
-    channel.active = false;
-    inlineWhiteboardChannels.delete(key);
+  for (const channel of inlineWhiteboardChannels.values()) {
+    if (channel.context?.binding === binding) channel.active = false;
   }
   if (overlayContext?.binding === binding) overlayContext.active = false;
   if (overlayOpeningContext?.binding === binding) overlayOpeningContext.active = false;
+}
+
+function whiteboardChannelKey(context) {
+  return JSON.stringify([context?.key, context?.documentId]);
+}
+
+function hasLiveInlineWhiteboard(context) {
+  return [...inlineWhiteboardChannels.values()].some(
+    (channel) => channel.active && channel.context.key === context.key,
+  );
+}
+
+function restoreWhiteboardChannelsForBinding(binding) {
+  for (const channel of inlineWhiteboardChannels.values()) {
+    const previous = channel.context;
+    if (
+      previous.documentId !== binding.documentId ||
+      previous.page !== binding.page ||
+      previous.proof !== binding.proof ||
+      !isArtifactChildWindow(channel.window)
+    )
+      continue;
+    channel.context = {
+      ...captureWhiteboardContext(previous.index, binding, "inline"),
+      channelId: channel.channelId,
+      channel,
+    };
+    channel.active = true;
+    if (!channel.initialized) initializeInlineWhiteboardChannel(channel);
+  }
+}
+
+function initializeInlineWhiteboardChannel(channel) {
+  const context = channel.context;
+  const isCurrent = () =>
+    channel.active &&
+    channel.context === context &&
+    whiteboardContextIsLive(context) &&
+    inlineWhiteboardChannels.get(whiteboardChannelKey(context)) === channel;
+  handleWhiteboardReady(context, "inline", isCurrent).then((initialized) => {
+    if (isCurrent()) channel.initialized = initialized;
+  });
 }
 
 function retireAllWhiteboardChannels() {
@@ -4374,7 +4414,7 @@ function postToWhiteboardOverlay(message, context = overlayContext, allowInactiv
 }
 
 function postToInlineWhiteboard(context, message, allowInactive = false) {
-  const channel = context?.channel || inlineWhiteboardChannels.get(context?.key);
+  const channel = context?.channel || inlineWhiteboardChannels.get(whiteboardChannelKey(context));
   if (!channel || (!allowInactive && (!channel.active || !whiteboardContextIsLive(context)))) return;
   if (channel.window) channel.window.postMessage({ ...message, channelId: channel.channelId }, "*");
 }
@@ -4458,7 +4498,7 @@ function showWhiteboardOverlay(context) {
   overlayIndex = context.index;
   overlayFrameReady = false;
   overlayChannelId = "";
-  inlineWhiteboardChannels.delete(context.key);
+  inlineWhiteboardChannels.delete(whiteboardChannelKey(context));
   whiteboardError.hidden = true;
   whiteboardOverlay.hidden = false;
   postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: context.index, page: context.page });
@@ -4479,7 +4519,7 @@ function finishWhiteboardClose(context = overlayContext) {
   overlayChannelId = "";
   if (context) {
     context.active = false;
-    if (context.key) inlineWhiteboardChannels.delete(context.key);
+    if (context.key) inlineWhiteboardChannels.delete(whiteboardChannelKey(context));
   }
   overlayContext = null;
   if (shouldResume) {
@@ -4488,7 +4528,7 @@ function finishWhiteboardClose(context = overlayContext) {
 }
 
 function whiteboardTeardownKey(context, placement) {
-  return placement + ":" + (context?.key || "");
+  return placement + ":" + whiteboardChannelKey(context);
 }
 
 function beginWhiteboardTeardown(context, placement, onComplete) {
@@ -4546,7 +4586,7 @@ function failWhiteboardTeardown(context, message, placement) {
 }
 
 function whiteboardFlushKey(context, placement) {
-  return placement + ":" + (context?.key || "");
+  return placement + ":" + whiteboardChannelKey(context);
 }
 
 function beginWhiteboardFlush(context, placement) {
@@ -4882,30 +4922,41 @@ function handleInlineWhiteboardMessage(event, message) {
     const binding = modernArtifactProtocol ? currentArtifactBinding : null;
     if (modernArtifactProtocol && !binding) return;
     const context = captureWhiteboardContext(index, binding, "inline");
-    if (!context || inlineWhiteboardChannels.has(context.key)) return;
+    if (!context || hasLiveInlineWhiteboard(context)) return;
     const channelId = String(message.channelToken || "");
     if (!channelId) return;
     context.channelId = channelId;
     const channel = { context, window: event.source, channelId, initialized: false, active: true };
     context.channel = channel;
     authenticateWhiteboardChannel(channelId, context).then((authenticated) => {
-      if (!authenticated || ended || !whiteboardContextIsLive(context) || inlineWhiteboardChannels.has(context.key)) {
+      if (!authenticated || ended || !whiteboardContextIsLive(context) || hasLiveInlineWhiteboard(context)) {
         channel.active = false;
         return;
       }
-      inlineWhiteboardChannels.set(context.key, channel);
+      inlineWhiteboardChannels.set(whiteboardChannelKey(context), channel);
       const record = whiteboardRecord(index, context.page);
       if (!record) return;
       record.diagramId = String(message.diagramId || "");
-      handleWhiteboardReady(
-        context,
-        "inline",
-        () =>
-          channel.active && whiteboardContextIsLive(context) && inlineWhiteboardChannels.get(context.key) === channel,
-      ).then((initialized) => {
-        if (inlineWhiteboardChannels.get(context.key) === channel) channel.initialized = initialized;
-      });
+      initializeInlineWhiteboardChannel(channel);
     });
+    return;
+  }
+  const pendingCompletions =
+    message.type === "lavish-whiteboard:flushComplete"
+      ? whiteboardFlushes
+      : message.type === "lavish-whiteboard:teardownReady" || message.type === "lavish-whiteboard:teardownFailed"
+        ? whiteboardTeardowns
+        : null;
+  if (pendingCompletions) {
+    const pending = [...pendingCompletions.values()].find(
+      (candidate) =>
+        candidate.placement === "inline" &&
+        candidate.context.channel?.window === event.source &&
+        candidate.context.channelId === message.channelId &&
+        candidate.index === index &&
+        candidate.flushId === message.flushId,
+    );
+    if (pending) handleAuthenticatedWhiteboardMessage(pending.context, message, "inline");
     return;
   }
   // Look up by the sender's captured channel, not by the current page. A late
@@ -5399,6 +5450,7 @@ function challengeArtifactDocument(expectedDocumentId = "", chromeAuth = "") {
     retireArtifactBinding();
     pendingArtifactFailureBinding = null;
     currentArtifactBinding = binding;
+    restoreWhiteboardChannelsForBinding(binding);
     stampLegacyQueuedPrompts(binding);
     activatePageReviewState(binding.page);
     activateComposerPage(binding.page);
@@ -5808,7 +5860,7 @@ frame.addEventListener("load", () => {
   postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
   if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
   if (overlayContext && overlayIndex !== null && whiteboardContextIsLive(overlayContext)) {
-    inlineWhiteboardChannels.delete(overlayContext.key);
+    inlineWhiteboardChannels.delete(whiteboardChannelKey(overlayContext));
     postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: overlayIndex, page: overlayContext.page });
   }
 });

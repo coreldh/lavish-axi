@@ -10514,12 +10514,19 @@ test("a mark naming an undeclared revision never reaches the legend", async () =
   assert.equal(chrome.element("revisionsSummary").textContent, "1 revision · 0 marked blocks");
 });
 
-test("protocol 1 returning whiteboards register after binding retirement", async () => {
+test("protocol 1 returning whiteboards support fresh navigation and BFCache actions", async () => {
+  const requests = [];
   const chrome = await createChromeHarness({
     artifactSrc: "/artifact/abc/page-a.html",
     sessionData: { ...defaultSessionData, pageProtocol: 1 },
     modernBinding: protocolWhiteboardBinding("page-a.html", "a"),
-    fetchImpl: async (url) => whiteboardFetch(url),
+    fetchImpl: async (url, init = {}) => {
+      requests.push({ url: String(url), method: init.method, body: init.body ? JSON.parse(init.body) : null });
+      if (String(url).includes("feedback-files")) {
+        return { ok: true, json: async () => ({ scene_path: "/tmp/a.scene.json", preview_path: "/tmp/a.png" }) };
+      }
+      return whiteboardFetch(url);
+    },
   });
   await flushPromises();
   await flushPromises();
@@ -10530,6 +10537,7 @@ test("protocol 1 returning whiteboards register after binding retirement", async
 
   const bind = async (page, suffix) => {
     const binding = protocolWhiteboardBinding(page, suffix);
+    binding.proof = page === "page-a.html" ? "proof-a" : "proof-b";
     chrome.updateModernBinding(binding);
     chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
     await flushPromises();
@@ -10543,21 +10551,114 @@ test("protocol 1 returning whiteboards register after binding retirement", async
   assert.equal(returning.posted.at(-1)?.type, "lavish-whiteboard:init");
   assert.equal(returning.posted.at(-1).channelId, "channel-a-return");
 
-  await bind("page-b.html", "b-return");
-  await bind("page-a.html", "a-bfcache");
-  const priorMessages = original.posted.length;
-  chrome.sendInlineWhiteboardMessage(original, {
-    type: "lavish-whiteboard:ready",
+  await bind("page-b.html", "b");
+  const save = {
+    type: "lavish-whiteboard:save",
     diagramIndex: 0,
-    diagramId: "mermaid-1",
-    channelToken: "channel-a",
+    channelId: "channel-a",
+    sourceHash: "hash",
+    scene: { page: "A" },
+    flushId: "restored-save",
+  };
+  const beforeInactiveSave = requests.length;
+  chrome.sendInlineWhiteboardMessage(original, save);
+  await flushPromises();
+  assert.equal(requests.length, beforeInactiveSave, "a retired editor cannot start a save");
+
+  await bind("page-a.html", "a");
+  const beforeRestoredActions = original.posted.length;
+  const restoredDuplicate = await initializeInlineWhiteboard(chrome, "duplicate-restored-a");
+  assert.equal(restoredDuplicate.posted.length, 0);
+  chrome.sendInlineWhiteboardMessage(original, save);
+  await flushPromises();
+  await flushPromises();
+  assert.equal(original.posted.at(-1).type, "lavish-whiteboard:saveResult");
+  assert.equal(original.posted.at(-1).ok, true);
+  const put = requests.filter((request) => request.method === "PUT").at(-1);
+  assert.equal(put.url, "/api/abc/whiteboard/0?page=page-a.html&page_proof=proof-a");
+
+  chrome.sendInlineWhiteboardMessage(original, {
+    ...save,
+    type: "lavish-whiteboard:queueFeedback",
+    pngDataUrl: "data:image/png;base64,AAAA",
+    note: "Restored A edit",
+    summaryLines: ["A edit"],
+    stats: { added: 1 },
   });
   await flushPromises();
   await flushPromises();
-  assert.equal(original.posted.length, priorMessages + 1, "a restored editor can register its window again");
-  assert.equal(original.posted.at(-1).type, "lavish-whiteboard:init");
-  const restoredDuplicate = await initializeInlineWhiteboard(chrome, "duplicate-restored-a");
-  assert.equal(restoredDuplicate.posted.length, 0);
+  assert.equal(original.posted.at(-1).type, "lavish-whiteboard:queueResult");
+  assert.equal(original.posted.at(-1).ok, true);
+  assert.equal(chrome.queued().at(-1).page, "page-a.html");
+
+  chrome.sendInlineWhiteboardMessage(original, { ...save, type: "lavish-whiteboard:maximize" });
+  const prepare = original.posted.at(-1);
+  assert.equal(prepare.type, "lavish-whiteboard:prepareTeardown");
+  chrome.sendInlineWhiteboardMessage(original, {
+    ...save,
+    type: "lavish-whiteboard:teardownReady",
+    flushId: prepare.flushId,
+  });
+  await flushPromises();
+  assert.match(chrome.element("whiteboardFrame").src, /^\/whiteboard-frame\?diagramIndex=0&key=abc$/);
+  assert.equal(
+    original.posted.slice(beforeRestoredActions).some((message) => message.type === "lavish-whiteboard:init"),
+    false,
+    "BFCache actions use the existing editor without a second ready or init",
+  );
+});
+
+test("protocol 1 retired whiteboards complete accepted teardowns and flushes", async () => {
+  for (const completion of ["teardownReady", "teardownFailed", "flushComplete"]) {
+    const chrome = await createChromeHarness({
+      artifactSrc: "/artifact/abc/page-a.html",
+      sessionData: { ...defaultSessionData, pageProtocol: 1 },
+      modernBinding: protocolWhiteboardBinding("page-a.html", "a"),
+      fetchImpl: async (url) => whiteboardFetch(url),
+    });
+    await flushPromises();
+    await flushPromises();
+    const original = await initializeInlineWhiteboard(chrome, "channel-a");
+    if (completion === "flushComplete") {
+      chrome.eventSource().listeners.get("chrome-outdated")();
+      chrome.element("outdatedReload").click();
+    } else chrome.element("reloadArtifact").click();
+    await flushPromises();
+    const pending = original.posted.at(-1);
+    assert.equal(
+      pending.type,
+      completion === "flushComplete" ? "lavish-whiteboard:flush" : "lavish-whiteboard:prepareTeardown",
+    );
+    const binding = protocolWhiteboardBinding("page-b.html", "b");
+    chrome.updateModernBinding(binding);
+    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
+    await flushPromises();
+    await flushPromises();
+    const beforeCompletion = chrome.artifactBeginRequests.length;
+    chrome.sendInlineWhiteboardMessage(original, {
+      type: "lavish-whiteboard:" + completion,
+      diagramIndex: 0,
+      channelId: "channel-a",
+      flushId: pending.flushId,
+      ok: true,
+    });
+    await flushPromises();
+    await flushPromises();
+    if (completion === "flushComplete") {
+      assert.equal(chrome.reloadCount(), 1, "the accepted flush resolves without its timeout");
+    } else {
+      assert.equal(chrome.artifactBeginRequests.length, beforeCompletion + (completion === "teardownReady" ? 1 : 0));
+      const beforeNextReload = chrome.artifactBeginRequests.length;
+      chrome.element("reloadArtifact").click();
+      await flushPromises();
+      await flushPromises();
+      assert.equal(
+        chrome.artifactBeginRequests.length,
+        beforeNextReload + 1,
+        "a completed teardown releases the reload reservation",
+      );
+    }
+  }
 });
 
 test("protocol 1 whiteboards isolate the same index and finish saves on the captured page", async () => {

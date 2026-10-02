@@ -7,11 +7,9 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { pipeline } from "node:stream/promises";
 
 import chokidar from "chokidar";
 import express from "express";
-import send from "send";
 
 import {
   classifySevereTextOverflow,
@@ -2391,17 +2389,9 @@ export async function serve({
       return;
     }
     try {
-      const transfer = send(req, encodeURI(opened.file), { etag: app.enabled("etag") });
-      transfer.res = res;
-      transfer.on("error", (error) => {
-        throw error;
+      await new Promise((resolve, reject) => {
+        res.sendFile(opened.file, { dotfiles: "allow" }, (error) => (error ? reject(error) : resolve(null)));
       });
-      let body = Promise.resolve();
-      transfer.stream = (_file, options) => {
-        body = pipeline(opened.handle.createReadStream({ ...options, autoClose: false }), res);
-      };
-      transfer.send(opened.file, await opened.handle.stat());
-      await body;
     } finally {
       await opened.handle.close();
     }
