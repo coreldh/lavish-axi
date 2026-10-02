@@ -7,6 +7,7 @@ import { isIP } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pipeline } from "node:stream/promises";
 
 import chokidar from "chokidar";
 import express from "express";
@@ -2389,9 +2390,59 @@ export async function serve({
       return;
     }
     try {
-      await new Promise((resolve, reject) => {
-        res.sendFile(opened.file, { dotfiles: "allow" }, (error) => (error ? reject(error) : resolve(null)));
-      });
+      const stats = await opened.handle.stat();
+      const size = stats.size;
+      const etag = `W/"${size.toString(16)}-${stats.mtime.getTime().toString(16)}"`;
+      const modified = stats.mtime.toUTCString();
+      res.type(path.extname(opened.file) || "application/octet-stream");
+      res.setHeader("accept-ranges", "bytes");
+      res.setHeader("cache-control", "public, max-age=0");
+      res.setHeader("last-modified", modified);
+      if (app.enabled("etag")) res.setHeader("etag", etag);
+      const match = req.get("if-match");
+      const unmodified = Date.parse(req.get("if-unmodified-since") || "");
+      if (
+        match
+          ? !res.getHeader("etag") ||
+            (match !== "*" &&
+              !match.split(",").some((value) => {
+                const tag = value.trim();
+                return tag === etag || tag === "W/" + etag || "W/" + tag === etag;
+              }))
+          : Number.isFinite(unmodified) && Date.parse(modified) > unmodified
+      ) {
+        throw Object.assign(new Error("Precondition Failed"), { status: 412 });
+      }
+      if (req.fresh) {
+        res.removeHeader("content-type");
+        res.status(304).end();
+        return;
+      }
+      let start = 0;
+      let end = size - 1;
+      const ifRange = req.get("if-range");
+      const rangeFresh =
+        !ifRange ||
+        (ifRange.includes('"')
+          ? Boolean(res.getHeader("etag") && ifRange.includes(etag))
+          : Date.parse(modified) <= Date.parse(ifRange));
+      if (req.get("range")?.startsWith("bytes=") && rangeFresh) {
+        const ranges = req.range(size, { combine: true });
+        if (ranges === -1) {
+          res.setHeader("content-range", `bytes */${size}`);
+          throw Object.assign(new Error("Range Not Satisfiable"), { status: 416 });
+        }
+        if (Array.isArray(ranges) && ranges.length === 1) {
+          ({ start, end } = ranges[0]);
+          res.status(206).setHeader("content-range", `bytes ${start}-${end}/${size}`);
+        }
+      }
+      res.setHeader("content-length", String(end - start + 1));
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      await pipeline(opened.handle.createReadStream({ start, end: Math.max(start, end), autoClose: false }), res);
     } finally {
       await opened.handle.close();
     }

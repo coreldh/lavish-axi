@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { renameSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1267,4 +1268,97 @@ test("non-HTML artifact assets preserve sendFile ranges and conditional requests
     await server.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("non-HTML asset responses keep verified bytes after a path swap", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-asset-swap-"));
+  const artifactDir = path.join(root, "artifact");
+  await mkdir(artifactDir);
+  const entry = path.join(artifactDir, "entry.html");
+  const asset = path.join(artifactDir, ".video.mp4");
+  const retained = path.join(artifactDir, "retained.mp4");
+  const outside = path.join(root, "outside.mp4");
+  const bytes = "0123456789abcdefghijklmnopqrstuvwxyz";
+  await writeFile(entry, "<!doctype html><video src=.video.mp4></video>");
+  await writeFile(asset, bytes);
+  await writeFile(outside, "OUTSIDE BYTES MUST NEVER BE SERVED");
+  let opened = 0;
+  const closed = new Set();
+  const server = await serve({
+    port: 0,
+    stateFile: path.join(root, "state.json"),
+    artifactAssetOpen: async (file, flags) => {
+      const handle = await open(file, flags);
+      opened += 1;
+      const originalStat = handle.stat.bind(handle);
+      const originalClose = handle.close.bind(handle);
+      handle.stat = /** @type {typeof handle.stat} */ (
+        async (options) => {
+          const details = await originalStat(options);
+          if (options?.bigint) {
+            const ino = details.ino;
+            let reads = 0;
+            Object.defineProperty(details, "ino", {
+              get() {
+                if (++reads === 2) {
+                  renameSync(asset, retained);
+                  symlinkSync(outside, asset);
+                }
+                return ino;
+              },
+            });
+          }
+          return details;
+        }
+      );
+      handle.close = async () => {
+        await originalClose();
+        closed.add(handle);
+      };
+      return handle;
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const { session } = await openAndLoad(base, entry);
+    const url = `${base}/artifact/${session.key}/.video.mp4`;
+    let etag = "";
+    for (const status of [200, 206, 304, 416]) {
+      const headers =
+        status === 206
+          ? { range: "bytes=2-5" }
+          : status === 304
+            ? { "if-none-match": etag }
+            : status === 416
+              ? { range: "bytes=100-" }
+              : {};
+      try {
+        const response = await fetch(url, { headers, cache: "force-cache" });
+        assert.equal(response.status, status);
+        const body = await response.text();
+        assert.ok(!body.includes("OUTSIDE BYTES"));
+        if (status === 200) {
+          assert.equal(body, bytes);
+          assert.equal(response.headers.get("content-type"), "video/mp4");
+          etag = response.headers.get("etag");
+          assert.ok(etag);
+        }
+        if (status === 206) {
+          assert.equal(body, "2345");
+          assert.equal(response.headers.get("content-range"), `bytes 2-5/${bytes.length}`);
+          assert.equal(response.headers.get("content-length"), "4");
+        }
+        if (status === 304) assert.equal(body, "");
+        if (status === 416) assert.equal(response.headers.get("content-range"), `bytes */${bytes.length}`);
+      } finally {
+        await rm(asset);
+        await rename(retained, asset);
+      }
+    }
+  } finally {
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+  assert.equal(opened, 4);
+  assert.equal(closed.size, opened, "full, partial, fresh and rejected responses close their verified handles");
 });
