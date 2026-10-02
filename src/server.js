@@ -3634,8 +3634,8 @@ function optionalBodyString(value) {
   return trimmed || undefined;
 }
 
-// Confines an asset request lexically first, then - like export-bundle.js's guardedRead -
-// resolves the real (symlink-followed) path and refuses anything that escapes the artifact
+// Confines an asset request lexically first, then resolves the real (symlink-followed)
+// path and refuses anything that escapes the artifact
 // directory, so a symlink placed beside the artifact can't make this route serve an outside
 // file (e.g. ~/.ssh/id_rsa).
 export async function resolveArtifactAsset(root, assetPath) {
@@ -3649,8 +3649,8 @@ export async function resolveArtifactAsset(root, assetPath) {
     real = await realpath(file);
   } catch (error) {
     // Nonexistent path (e.g. an asset that hasn't been built yet): nothing to read, so the
-    // lexical confinement above is enough - the caller's existsSync/sendFile handles the 404.
-    // Every other realpath failure fails closed, like guardedRead.
+    // lexical confinement above is enough for the caller to report the 404.
+    // Every other realpath failure fails closed.
     if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
       return file;
     }
@@ -3666,8 +3666,8 @@ export async function resolveArtifactAsset(root, assetPath) {
   if (relativeReal === ".." || relativeReal.startsWith(`..${path.sep}`) || path.isAbsolute(relativeReal)) {
     return null;
   }
-  // Hand back the resolved path, not the requested one: a real path contains no symlinks, so
-  // sendFile re-opening it cannot be redirected by a link swapped in after this check.
+  // This resolution alone does not authorize a later pathname read: the artifact route
+  // verifies the opened handle with openVerifiedLocalFile before consuming its bytes.
   return real;
 }
 
