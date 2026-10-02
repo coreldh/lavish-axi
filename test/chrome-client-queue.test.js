@@ -7679,6 +7679,13 @@ test("protocol 1 restores review state and scroll only for the accepted canonica
     artifact_load_token: "harness-load-1",
     artifact_revision: 1,
   });
+  chrome.dispatchFrameLoad();
+  await flushPromises();
+  assert.equal(
+    chrome.modernPostedToFrame.filter((message) => message.type === "lavish:restoreReviewState").length,
+    1,
+    "a load after binding acceptance must not replay the fresh document's draft twice",
+  );
 
   const envelope = JSON.parse(storage.get("lavish-axi:review-state:abc"));
   assert.equal(envelope.version, 1);
@@ -7689,6 +7696,63 @@ test("protocol 1 restores review state and scroll only for the accepted canonica
       { page: "page-b.html", text: "page B draft" },
     ],
   );
+});
+
+test("protocol 1 preserves live review state on BFCache return and same-document rechallenge", async () => {
+  const a = protocolWhiteboardBinding("page-a.html", "a");
+  const b = protocolWhiteboardBinding("page-b.html", "b");
+  const chrome = await createChromeHarness({
+    artifactSrc: a.destination,
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: a,
+  });
+  await flushPromises();
+  await flushPromises();
+  const activeTuple = () => chrome.modernPostedToFrame.filter((message) => message.type === "lavish:activate").at(-1);
+  const state = { card: { selector: "#hero", text: "Keep this card and its image" }, fields: [] };
+  chrome.sendModernMessage({ ...activeTuple(), type: "lavish:reviewState", state });
+  chrome.sendModernMessage({ ...activeTuple(), type: "lavish:scroll", x: 3, y: 120 });
+  await flushPromises();
+  const bind = async (binding) => {
+    chrome.updateModernBinding(binding);
+    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
+    await flushPromises();
+    await flushPromises();
+  };
+  await bind(b);
+  const beforeReturn = chrome.modernPostedToFrame.length;
+  await bind(a);
+  chrome.dispatchFrameLoad();
+  await flushPromises();
+  const returnMessages = chrome.modernPostedToFrame.slice(beforeReturn);
+  assert.ok(returnMessages.some((message) => message.type === "lavish:activate"));
+  assert.ok(returnMessages.some((message) => message.type === "lavish:setAnnotationMode"));
+  assert.deepEqual(
+    returnMessages.filter((message) => ["lavish:restoreScroll", "lavish:restoreReviewState"].includes(message.type)),
+    [],
+  );
+  chrome.sendModernMessage({ ...activeTuple(), type: "lavish:documentDeparting" });
+  await flushPromises();
+  const beforeRechallenge = chrome.modernPostedToFrame.length;
+  await bind(a);
+  const rechallengeMessages = chrome.modernPostedToFrame.slice(beforeRechallenge);
+  assert.ok(rechallengeMessages.some((message) => message.type === "lavish:activate"));
+  assert.deepEqual(
+    rechallengeMessages.filter((message) =>
+      ["lavish:restoreScroll", "lavish:restoreReviewState"].includes(message.type),
+    ),
+    [],
+  );
+  const fresh = { ...a, documentId: "fresh-a" };
+  chrome.updateModernBinding(fresh);
+  chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: fresh.documentId });
+  chrome.dispatchFrameLoad();
+  await flushPromises();
+  await flushPromises();
+  const restores = chrome.modernPostedToFrame.filter((message) => message.type === "lavish:restoreReviewState");
+  assert.equal(restores.length, 1, "a fresh document restores exactly once when load precedes acceptance");
+  assert.deepEqual(restores[0].state, state);
+  assert.equal(restores[0].document_id, fresh.documentId);
 });
 
 test("protocol 1 displays and sends only the authenticated page and restores other queues and composer drafts", async () => {

@@ -344,6 +344,26 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   const clickListeners = sdk.documentListenerCount("click");
   assert.ok(clickListeners > 0, "the accepted document installs the full SDK once");
 
+  const heading = appendTo(sdk.body, cell("h1", "Headline"));
+  sdk.click(heading);
+  const card = sdk.card();
+  card.querySelector("textarea").value = "Keep my annotated image";
+  const input = card.querySelector(".lavish-attach-input");
+  input.files = [{ name: "evidence.png", type: "image/png", size: 3, arrayBuffer: async () => new ArrayBuffer(3) }];
+  const uploadPromise = nextPortMessage(first.port1, "lavish:uploadAttachment");
+  input.listeners.find((listener) => listener.type === "change").handler();
+  const upload = await uploadPromise;
+  first.port1.postMessage({
+    ...firstResponse,
+    type: "lavish:attachmentResult",
+    document_sequence: 1,
+    nonce: upload.nonce,
+    localId: upload.localId,
+    ok: true,
+    id: "stored-image",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
   const departingPromise = nextPortMessage(first.port1, "lavish:documentDeparting");
   sdk.dispatchWindowEvent("pagehide");
   const departing = await departingPromise;
@@ -374,6 +394,13 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   second.port1.postMessage({ ...secondResponse, type: "lavish:activate", document_sequence: 2 });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sdk.documentListenerCount("click"), clickListeners, "rebind does not duplicate the SDK");
+  assert.equal(sdk.card(), card, "BFCache preserves the live annotation card");
+  assert.equal(card.querySelector("textarea").value, "Keep my annotated image");
+  const queuedPromise = nextPortMessage(second.port1, "lavish:queuePrompt");
+  card.querySelector(".lavish-send").onclick();
+  const queued = await queuedPromise;
+  assert.equal(queued.prompt.prompt, "Keep my annotated image");
+  assert.deepEqual(queued.prompt.attachments, [{ id: "stored-image", name: "evidence.png" }]);
 
   const snapshotPromise = nextPortMessage(second.port1, "lavish:snapshot");
   second.port1.postMessage({

@@ -339,6 +339,7 @@ let artifactMessageSequence = 0;
 let layoutDiagnosticSequence = 0;
 /** @type {{ port: MessagePort, page: string|null, proof: string, route: string, destination: string, documentId: string, documentSequence: number, token: string, revision: number, version: number, window: WindowProxy } | null} */
 let currentArtifactBinding = null;
+const acceptedDocumentIds = new Set();
 /** @type {{ documentId: string, port: MessagePort, timeout: ReturnType<typeof setTimeout> } | null} */
 let artifactChallengeAttempt = null;
 let latestReadyDocumentId = "";
@@ -5473,6 +5474,12 @@ function challengeArtifactDocument(expectedDocumentId = "", chromeAuth = "") {
     retireArtifactBinding();
     pendingArtifactFailureBinding = null;
     currentArtifactBinding = binding;
+    const resumed = acceptedDocumentIds.has(binding.documentId);
+    acceptedDocumentIds.add(binding.documentId);
+    if (acceptedDocumentIds.size > 256) {
+      const oldest = acceptedDocumentIds.values().next().value;
+      if (oldest !== undefined) acceptedDocumentIds.delete(oldest);
+    }
     restoreWhiteboardChannelsForBinding(binding);
     stampLegacyQueuedPrompts(binding);
     activatePageReviewState(binding.page);
@@ -5501,8 +5508,10 @@ function challengeArtifactDocument(expectedDocumentId = "", chromeAuth = "") {
     // The initial load handler may have run before the SDK announced readiness.
     // Release the retained chrome state only after the accepted binding exists.
     postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
-    postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
-    if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
+    if (!resumed) {
+      postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
+      if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
+    }
   });
   channel.port1.start?.();
   // Node's MessageChannel (used by the deterministic client harness) keeps the
@@ -5879,9 +5888,10 @@ frame.addEventListener("load", () => {
   }
   if (artifactSpokeToken !== artifactLoadToken) armArtifactAvailabilityProbe(artifactLoadToken);
   postToFrame({ type: "lavish:setAnnotationMode", enabled: annotation && !ended });
-  // Replay the pre-reload scroll position so hot reloads don't jump the artifact to the top.
-  postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
-  if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
+  if (!modernArtifactProtocol) {
+    postToFrame({ type: "lavish:restoreScroll", x: lastScroll.x, y: lastScroll.y });
+    if (lastReviewState) postToFrame({ type: "lavish:restoreReviewState", state: lastReviewState });
+  }
   if (overlayContext && overlayIndex !== null && whiteboardContextIsLive(overlayContext)) {
     inlineWhiteboardChannels.delete(whiteboardChannelKey(overlayContext));
     postToFrame({ type: "lavish:suspendWhiteboard", diagramIndex: overlayIndex, page: overlayContext.page });
