@@ -3,6 +3,8 @@ import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink, writeFile } from "
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createServer } from "node:http";
+import express from "express";
 
 import { serve } from "../src/server.js";
 
@@ -1193,6 +1195,76 @@ test("issue 352 validates page claims atomically and keeps proofs out of poll ou
       await server.close();
     }
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("non-HTML artifact assets preserve sendFile ranges and conditional requests", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "lavish-352-asset-http-"));
+  const entry = path.join(root, "entry.html");
+  const asset = path.join(root, "video.mp4");
+  await writeFile(entry, "<!doctype html><video src=video.mp4></video>");
+  await writeFile(asset, "0123456789abcdefghijklmnopqrstuvwxyz");
+  const server = await serve({ port: 0, stateFile: path.join(root, "state.json") });
+  const reference = express();
+  reference.get("/asset", (_req, res) => res.sendFile(asset, { dotfiles: "allow" }));
+  reference.use((error, _req, res, _next) => {
+    for (const [name, value] of Object.entries(error.headers || {})) res.setHeader(name, value);
+    res.status(error.status || 500).end();
+  });
+  const baseline = createServer(reference);
+  try {
+    await new Promise((resolve) => baseline.listen(0, "127.0.0.1", () => resolve(null)));
+    const address = baseline.address();
+    assert.ok(address && typeof address !== "string");
+    const referenceUrl = `http://127.0.0.1:${address.port}/asset`;
+    const base = `http://127.0.0.1:${server.port}`;
+    const { session } = await openAndLoad(base, entry);
+    const url = `${base}/artifact/${session.key}/video.mp4`;
+    const initial = await fetch(referenceUrl);
+    await initial.text();
+    const etag = initial.headers.get("etag");
+    const modified = initial.headers.get("last-modified");
+    assert.ok(etag);
+    assert.ok(modified);
+    const cases = [
+      {},
+      { headers: { range: "bytes=2-5" } },
+      { headers: { range: "bytes=-4" } },
+      { headers: { range: "bytes=30-" } },
+      { headers: { range: "bytes=0-1,8-9" } },
+      { headers: { range: "bytes=invalid" } },
+      { headers: { range: "bytes=100-" } },
+      { headers: { "if-none-match": etag } },
+      { headers: { "if-modified-since": modified } },
+      { headers: { "if-match": '"different"' } },
+      { headers: { "if-unmodified-since": "Thu, 01 Jan 1970 00:00:00 GMT" } },
+      { headers: { range: "bytes=2-5", "if-range": etag } },
+      { headers: { range: "bytes=2-5", "if-range": '"different"' } },
+      { headers: { range: "bytes=2-5", "if-range": modified } },
+      { method: "HEAD", headers: { range: "bytes=2-5" } },
+    ];
+    for (const options of cases) {
+      const expected = await fetch(referenceUrl, { ...options, cache: "force-cache" });
+      const actual = await fetch(url, { ...options, cache: "force-cache" });
+      const label = JSON.stringify(options);
+      assert.equal(actual.status, expected.status, label);
+      for (const header of ["accept-ranges", "cache-control", "last-modified", "etag", "content-range"]) {
+        assert.equal(actual.headers.get(header), expected.headers.get(header), `${label}: ${header}`);
+      }
+      if (expected.status < 400) {
+        for (const header of ["content-type", "content-length"]) {
+          assert.equal(actual.headers.get(header), expected.headers.get(header), `${label}: ${header}`);
+        }
+        assert.equal(await actual.text(), await expected.text(), label);
+      } else {
+        await actual.text();
+        await expected.text();
+      }
+    }
+  } finally {
+    await new Promise((resolve, reject) => baseline.close((error) => (error ? reject(error) : resolve(null))));
+    await server.close();
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -4345,8 +4345,10 @@ function whiteboardChannelAuthBody(token, context) {
 
 function retireWhiteboardChannelsForBinding(binding) {
   if (!binding) return;
-  for (const channel of inlineWhiteboardChannels.values()) {
-    if (channel.context?.binding === binding) channel.active = false;
+  for (const [key, channel] of inlineWhiteboardChannels) {
+    if (channel.context?.binding !== binding) continue;
+    channel.active = false;
+    inlineWhiteboardChannels.delete(key);
   }
   if (overlayContext?.binding === binding) overlayContext.active = false;
   if (overlayOpeningContext?.binding === binding) overlayOpeningContext.active = false;

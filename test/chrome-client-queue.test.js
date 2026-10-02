@@ -10514,6 +10514,52 @@ test("a mark naming an undeclared revision never reaches the legend", async () =
   assert.equal(chrome.element("revisionsSummary").textContent, "1 revision · 0 marked blocks");
 });
 
+test("protocol 1 returning whiteboards register after binding retirement", async () => {
+  const chrome = await createChromeHarness({
+    artifactSrc: "/artifact/abc/page-a.html",
+    sessionData: { ...defaultSessionData, pageProtocol: 1 },
+    modernBinding: protocolWhiteboardBinding("page-a.html", "a"),
+    fetchImpl: async (url) => whiteboardFetch(url),
+  });
+  await flushPromises();
+  await flushPromises();
+  const original = await initializeInlineWhiteboard(chrome, "channel-a");
+  assert.equal(original.posted.at(-1).type, "lavish-whiteboard:init");
+  const duplicate = await initializeInlineWhiteboard(chrome, "duplicate-a");
+  assert.equal(duplicate.posted.length, 0, "two live editors cannot share a page/index");
+
+  const bind = async (page, suffix) => {
+    const binding = protocolWhiteboardBinding(page, suffix);
+    chrome.updateModernBinding(binding);
+    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
+    await flushPromises();
+    await flushPromises();
+  };
+  await bind("page-b.html", "b");
+  const sibling = await initializeInlineWhiteboard(chrome, "channel-b");
+  assert.equal(sibling.posted.at(-1).type, "lavish-whiteboard:init");
+  await bind("page-a.html", "a-return");
+  const returning = await initializeInlineWhiteboard(chrome, "channel-a-return");
+  assert.equal(returning.posted.at(-1)?.type, "lavish-whiteboard:init");
+  assert.equal(returning.posted.at(-1).channelId, "channel-a-return");
+
+  await bind("page-b.html", "b-return");
+  await bind("page-a.html", "a-bfcache");
+  const priorMessages = original.posted.length;
+  chrome.sendInlineWhiteboardMessage(original, {
+    type: "lavish-whiteboard:ready",
+    diagramIndex: 0,
+    diagramId: "mermaid-1",
+    channelToken: "channel-a",
+  });
+  await flushPromises();
+  await flushPromises();
+  assert.equal(original.posted.length, priorMessages + 1, "a restored editor can register its window again");
+  assert.equal(original.posted.at(-1).type, "lavish-whiteboard:init");
+  const restoredDuplicate = await initializeInlineWhiteboard(chrome, "duplicate-restored-a");
+  assert.equal(restoredDuplicate.posted.length, 0);
+});
+
 test("protocol 1 whiteboards isolate the same index and finish saves on the captured page", async () => {
   const requests = [];
   const pendingSaves = [];

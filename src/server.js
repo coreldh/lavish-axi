@@ -11,6 +11,7 @@ import { pipeline } from "node:stream/promises";
 
 import chokidar from "chokidar";
 import express from "express";
+import send from "send";
 
 import {
   classifySevereTextOverflow,
@@ -2389,11 +2390,18 @@ export async function serve({
       res.status(403).send("Forbidden");
       return;
     }
-    // Express treats any string containing '/' as a MIME type, not a filename.
-    res.type(path.extname(opened.file) || "application/octet-stream");
-    res.setHeader("content-length", String(opened.stats.size));
     try {
-      await pipeline(opened.handle.createReadStream({ autoClose: false }), res);
+      const transfer = send(req, encodeURI(opened.file), { etag: app.enabled("etag") });
+      transfer.res = res;
+      transfer.on("error", (error) => {
+        throw error;
+      });
+      let body = Promise.resolve();
+      transfer.stream = (_file, options) => {
+        body = pipeline(opened.handle.createReadStream({ ...options, autoClose: false }), res);
+      };
+      transfer.send(opened.file, await opened.handle.stat());
+      await body;
     } finally {
       await opened.handle.close();
     }
