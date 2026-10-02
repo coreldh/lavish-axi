@@ -4544,7 +4544,16 @@ function beginWhiteboardTeardown(context, placement, onComplete) {
   const promise = new Promise((complete) => {
     resolve = complete;
   });
-  const teardown = { context, index: context.index, placement, flushId, promise, resolve, onComplete };
+  const teardown = {
+    context,
+    index: context.index,
+    placement,
+    flushId,
+    promise,
+    resolve,
+    onComplete,
+    source: placement === "inline" ? context.channel.window : whiteboardFrame.contentWindow,
+  };
   whiteboardTeardowns.set(teardownKey, teardown);
   const message = { type: "lavish-whiteboard:prepareTeardown", flushId };
   postToWhiteboard(context, message);
@@ -4599,7 +4608,15 @@ function beginWhiteboardFlush(context, placement) {
   const promise = new Promise((complete) => {
     resolve = complete;
   });
-  whiteboardFlushes.set(flushKey, { context, index: context.index, placement, flushId, promise, resolve });
+  whiteboardFlushes.set(flushKey, {
+    context,
+    index: context.index,
+    placement,
+    flushId,
+    promise,
+    resolve,
+    source: placement === "inline" ? context.channel.window : whiteboardFrame.contentWindow,
+  });
   postToWhiteboard(context, { type: "lavish-whiteboard:flush", flushId });
   return promise;
 }
@@ -4941,24 +4958,6 @@ function handleInlineWhiteboardMessage(event, message) {
     });
     return;
   }
-  const pendingCompletions =
-    message.type === "lavish-whiteboard:flushComplete"
-      ? whiteboardFlushes
-      : message.type === "lavish-whiteboard:teardownReady" || message.type === "lavish-whiteboard:teardownFailed"
-        ? whiteboardTeardowns
-        : null;
-  if (pendingCompletions) {
-    const pending = [...pendingCompletions.values()].find(
-      (candidate) =>
-        candidate.placement === "inline" &&
-        candidate.context.channel?.window === event.source &&
-        candidate.context.channelId === message.channelId &&
-        candidate.index === index &&
-        candidate.flushId === message.flushId,
-    );
-    if (pending) handleAuthenticatedWhiteboardMessage(pending.context, message, "inline");
-    return;
-  }
   // Look up by the sender's captured channel, not by the current page. A late
   // message from page A must never be reinterpreted as diagram 0 on page B.
   const channel = [...inlineWhiteboardChannels.values()].find(
@@ -5000,8 +4999,32 @@ function handleOverlayWhiteboardMessage(event, message) {
   handleAuthenticatedWhiteboardMessage(context, message, "overlay");
 }
 
+function handlePendingWhiteboardMessage(event, message) {
+  if (ended) return false;
+  const operations =
+    message.type === "lavish-whiteboard:save"
+      ? [...whiteboardTeardowns.values(), ...whiteboardFlushes.values()]
+      : message.type === "lavish-whiteboard:flushComplete"
+        ? [...whiteboardFlushes.values()]
+        : message.type === "lavish-whiteboard:teardownReady" || message.type === "lavish-whiteboard:teardownFailed"
+          ? [...whiteboardTeardowns.values()]
+          : [];
+  const pending = operations.find(
+    (candidate) =>
+      candidate.source === event.source &&
+      candidate.context.channelId === message.channelId &&
+      candidate.index === validWhiteboardIndex(message.diagramIndex) &&
+      candidate.flushId === message.flushId,
+  );
+  if (!pending) return false;
+  if (message.type === "lavish-whiteboard:save") handleWhiteboardSave(pending.context, message);
+  else handleAuthenticatedWhiteboardMessage(pending.context, message, pending.placement);
+  return true;
+}
+
 window.addEventListener("message", (event) => {
   const message = event.data || {};
+  if (handlePendingWhiteboardMessage(event, message)) return;
   if (event.source === whiteboardFrame.contentWindow) {
     handleOverlayWhiteboardMessage(event, message);
   } else if (event.source !== frame.contentWindow) {

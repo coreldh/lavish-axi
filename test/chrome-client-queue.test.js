@@ -10608,55 +10608,121 @@ test("protocol 1 returning whiteboards support fresh navigation and BFCache acti
   );
 });
 
-test("protocol 1 retired whiteboards complete accepted teardowns and flushes", async () => {
-  for (const completion of ["teardownReady", "teardownFailed", "flushComplete"]) {
-    const chrome = await createChromeHarness({
-      artifactSrc: "/artifact/abc/page-a.html",
-      sessionData: { ...defaultSessionData, pageProtocol: 1 },
-      modernBinding: protocolWhiteboardBinding("page-a.html", "a"),
-      fetchImpl: async (url) => whiteboardFetch(url),
-    });
-    await flushPromises();
-    await flushPromises();
-    const original = await initializeInlineWhiteboard(chrome, "channel-a");
-    if (completion === "flushComplete") {
-      chrome.eventSource().listeners.get("chrome-outdated")();
-      chrome.element("outdatedReload").click();
-    } else chrome.element("reloadArtifact").click();
-    await flushPromises();
-    const pending = original.posted.at(-1);
-    assert.equal(
-      pending.type,
-      completion === "flushComplete" ? "lavish-whiteboard:flush" : "lavish-whiteboard:prepareTeardown",
-    );
-    const binding = protocolWhiteboardBinding("page-b.html", "b");
-    chrome.updateModernBinding(binding);
-    chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
-    await flushPromises();
-    await flushPromises();
-    const beforeCompletion = chrome.artifactBeginRequests.length;
-    chrome.sendInlineWhiteboardMessage(original, {
-      type: "lavish-whiteboard:" + completion,
-      diagramIndex: 0,
-      channelId: "channel-a",
-      flushId: pending.flushId,
-      ok: true,
-    });
-    await flushPromises();
-    await flushPromises();
-    if (completion === "flushComplete") {
-      assert.equal(chrome.reloadCount(), 1, "the accepted flush resolves without its timeout");
-    } else {
-      assert.equal(chrome.artifactBeginRequests.length, beforeCompletion + (completion === "teardownReady" ? 1 : 0));
-      const beforeNextReload = chrome.artifactBeginRequests.length;
-      chrome.element("reloadArtifact").click();
+test("protocol 1 retired whiteboards save before completing accepted operations", async () => {
+  for (const placement of ["inline", "overlay"]) {
+    for (const completion of ["teardownReady", "teardownFailed", "flushComplete"]) {
+      const writes = [];
+      let failSave = false;
+      const chrome = await createChromeHarness({
+        artifactSrc: "/artifact/abc/page-a.html",
+        sessionData: { ...defaultSessionData, pageProtocol: 1 },
+        modernBinding: protocolWhiteboardBinding("page-a.html", "a"),
+        fetchImpl: async (url, init = {}) => {
+          if (init.method === "PUT") {
+            writes.push({ url: String(url), body: JSON.parse(init.body) });
+            return { ok: !failSave, json: async () => ({}) };
+          }
+          return whiteboardFetch(url);
+        },
+      });
       await flushPromises();
       await flushPromises();
+      const original = await initializeInlineWhiteboard(chrome, "channel-a");
+      const save = {
+        type: "lavish-whiteboard:save",
+        diagramIndex: 0,
+        channelId: "channel-a",
+        sourceHash: "hash",
+        scene: { page: "A" },
+      };
+      if (placement === "overlay") {
+        chrome.sendInlineWhiteboardMessage(original, { ...save, type: "lavish-whiteboard:maximize" });
+        const prepare = original.posted.at(-1);
+        chrome.sendInlineWhiteboardMessage(original, { ...save, flushId: prepare.flushId });
+        await flushPromises();
+        await flushPromises();
+        assert.equal(original.posted.at(-1).type, "lavish-whiteboard:saveResult");
+        chrome.sendInlineWhiteboardMessage(original, {
+          ...save,
+          type: "lavish-whiteboard:teardownReady",
+          flushId: prepare.flushId,
+        });
+        chrome.sendWhiteboardMessage({ type: "lavish-whiteboard:ready", diagramIndex: 0, channelToken: "overlay-a" });
+        await flushPromises();
+        await flushPromises();
+        assert.equal(chrome.postedToWhiteboard.at(-1).type, "lavish-whiteboard:init");
+        save.channelId = "overlay-a";
+      }
+      const send = (message) =>
+        placement === "inline"
+          ? chrome.sendInlineWhiteboardMessage(original, message)
+          : chrome.sendWhiteboardMessage(message);
+      const posted = () => (placement === "inline" ? original.posted : chrome.postedToWhiteboard);
+      if (completion === "flushComplete") {
+        chrome.eventSource().listeners.get("chrome-outdated")();
+        chrome.element("outdatedReload").click();
+      } else if (placement === "inline") chrome.element("reloadArtifact").click();
+      else chrome.element("whiteboardClose").click();
+      await flushPromises();
+      const pending = posted().at(-1);
       assert.equal(
-        chrome.artifactBeginRequests.length,
-        beforeNextReload + 1,
-        "a completed teardown releases the reload reservation",
+        pending.type,
+        completion === "flushComplete" ? "lavish-whiteboard:flush" : "lavish-whiteboard:prepareTeardown",
       );
+      const binding = protocolWhiteboardBinding("page-b.html", "b");
+      chrome.updateModernBinding(binding);
+      chrome.sendFrameMessage({ type: "lavish:ready", page_protocol: 1, document_id: binding.documentId });
+      await flushPromises();
+      await flushPromises();
+      const beforeSave = writes.length;
+      const beforeMessages = posted().length;
+      for (const changed of [
+        { flushId: "unrelated-save" },
+        { channelId: "different-channel", flushId: pending.flushId },
+        { diagramIndex: 1, flushId: pending.flushId },
+      ])
+        send({ ...save, ...changed });
+      const impostor = chrome.createInlineWhiteboard();
+      chrome.sendInlineWhiteboardMessage(impostor, { ...save, flushId: pending.flushId });
+      await flushPromises();
+      await flushPromises();
+      assert.equal(writes.length, beforeSave, "unrelated retired saves cannot persist anything");
+      assert.equal(posted().length, beforeMessages, "unrelated saves receive no acknowledgement");
+      failSave = completion === "teardownFailed";
+      send({ ...save, flushId: pending.flushId });
+      await flushPromises();
+      await flushPromises();
+      assert.equal(writes.length, beforeSave + 1, "the accepted operation's save is persisted");
+      assert.equal(writes.at(-1).url, "/api/abc/whiteboard/0?page=page-a.html&page_proof=proof-a");
+      const result = posted().at(-1);
+      assert.equal(result.type, "lavish-whiteboard:saveResult");
+      assert.equal(result.flushId, pending.flushId);
+      assert.equal(result.ok, !failSave);
+      const beforeCompletion = chrome.artifactBeginRequests.length;
+      send({ ...save, type: "lavish-whiteboard:" + completion, flushId: result.flushId, ok: result.ok });
+      await flushPromises();
+      await flushPromises();
+      if (completion === "flushComplete") {
+        assert.equal(chrome.reloadCount(), 1, "the accepted flush resolves without its timeout");
+      } else if (placement === "inline") {
+        assert.equal(chrome.artifactBeginRequests.length, beforeCompletion + (completion === "teardownReady" ? 1 : 0));
+        const beforeNextReload = chrome.artifactBeginRequests.length;
+        chrome.element("reloadArtifact").click();
+        await flushPromises();
+        await flushPromises();
+        assert.equal(
+          chrome.artifactBeginRequests.length,
+          beforeNextReload + 1,
+          "a completed teardown releases the reload reservation",
+        );
+      } else {
+        assert.equal(chrome.element("whiteboardOverlay").hidden, completion === "teardownReady");
+      }
+      const afterCompletion = writes.length;
+      send({ ...save, flushId: pending.flushId });
+      await flushPromises();
+      await flushPromises();
+      assert.equal(writes.length, afterCompletion, "completion retires permission for the pending save");
     }
   }
 });
