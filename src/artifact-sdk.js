@@ -402,16 +402,8 @@ export function planClipboardPaste(clipboardData, acceptedMime) {
 
 /**
  * Decide whether an incoming `lavish:attachmentResult` may be applied to this
- * document's chips. Two independent conditions, both required:
- *
- * 1. It came from the chrome (`event.source === parent`). The SDK's listener is on
- *    `window`, so without this the artifact can post to ITSELF and hand its own
- *    chips any server id - the upload mediation the chrome performs is bypassed.
- * 2. It carries THIS document's upload nonce. Chip ids (`att-1`, `att-2`, ...)
- *    restart on every document load, so a result still in flight across an iframe
- *    reload would otherwise match a brand-new chip by id alone and mark it ready
- *    with the previous document's image. The nonce is minted per document, so a
- *    pre-reload result can never match.
+ * document's chips. The transport and document-isolation requirements live in
+ * docs/invariants.md#image-attachments.
  *
  * The nonce is compared by exact string identity - no coercion, no truthiness -
  * so a hostile `{nonce: true}` or `{nonce: [realNonce]}` cannot pass.

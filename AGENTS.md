@@ -93,7 +93,7 @@ Each line is the rule. [docs/invariants.md](docs/invariants.md) has the failure 
 - Every store mutation takes `store.lock`. `referencedAttachmentIds` stays lock-free. [Image attachments](docs/invariants.md#image-attachments).
 - Attachment identity is the content-addressed file. `queuePrompts` re-derives path, mime, bytes, and dimensions from disk. Resolution is all-or-nothing. `boundAttachmentRefs` runs before any filesystem await. [Image attachments](docs/invariants.md#image-attachments).
 - Uploads are magic-byte validated and ignore `Content-Type`. Accepted types derive from `ACCEPTED_IMAGE_MIME`, never a second hardcoded list. [Image attachments](docs/invariants.md#image-attachments).
-- Upload results bind to the requesting document by `ATTACHMENT_NONCE` plus `event.source === parent`. [Image attachments](docs/invariants.md#image-attachments).
+- Upload-result authentication follows [Image attachments](docs/invariants.md#image-attachments).
 - An oversized file is decided `error` before its bytes are read. [Image attachments](docs/invariants.md#image-attachments).
 - The composer notice is derived on every render, paste and drop go through `transferredFiles`, and the chip send gate holds back only the composer's own message and an explicit end. [Image attachments](docs/invariants.md#image-attachments).
 - Do not put a body-parser `limit` on the attachment upload route. Drain the body, then 413. The chrome is the confused deputy for iframe uploads and shares one page-wide budget with the composer. [Image attachments](docs/invariants.md#image-attachments).

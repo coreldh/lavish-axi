@@ -524,10 +524,8 @@ export class SessionStore {
     });
   }
 
-  // Native navigation inside the artifact does not carry the query string that the chrome adds
-  // to the initial iframe URL.  Page routes use this read-only snapshot to stamp the same active
-  // generation onto an eligible sibling without minting a second load or weakening the existing
-  // token/revision checks used by the entry document and SDK route.
+  // Document routes need the existing generation to stamp the SDK; observing it
+  // must not mint a new load during authored navigation.
   async currentArtifactLoad(key) {
     return this.runExclusive(async () => {
       const state = await this.readState();
