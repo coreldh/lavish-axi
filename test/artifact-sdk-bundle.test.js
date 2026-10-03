@@ -362,7 +362,20 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
     ok: true,
     id: "stored-image",
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  // Messages on one port arrive in order, so a snapshot round trip proves the SDK has
+  // applied the upload result; a single event-loop turn is not enough on Windows.
+  const uploadedSnapshotPromise = nextPortMessage(first.port1, "lavish:snapshot");
+  first.port1.postMessage({
+    type: "lavish:requestSnapshot",
+    snapshot_request_id: "after-upload",
+    page: firstResponse.page,
+    page_proof: firstResponse.page_proof,
+    document_id: firstResponse.document_id,
+    document_sequence: 1,
+    artifact_load_token: firstResponse.artifact_load_token,
+    artifact_revision: firstResponse.artifact_revision,
+  });
+  assert.equal((await uploadedSnapshotPromise).snapshot_request_id, "after-upload");
 
   const departingPromise = nextPortMessage(first.port1, "lavish:documentDeparting");
   sdk.dispatchWindowEvent("pagehide");
@@ -392,16 +405,8 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   assert.equal(secondResponse.document_id, firstResponse.document_id);
   assert.equal(secondResponse.destination, firstResponse.destination);
   second.port1.postMessage({ ...secondResponse, type: "lavish:activate", document_sequence: 2 });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(sdk.documentListenerCount("click"), clickListeners, "rebind does not duplicate the SDK");
-  assert.equal(sdk.card(), card, "BFCache preserves the live annotation card");
-  assert.equal(card.querySelector("textarea").value, "Keep my annotated image");
-  const queuedPromise = nextPortMessage(second.port1, "lavish:queuePrompt");
-  card.querySelector(".lavish-send").onclick();
-  const queued = await queuedPromise;
-  assert.equal(queued.prompt.prompt, "Keep my annotated image");
-  assert.deepEqual(queued.prompt.attachments, [{ id: "stored-image", name: "evidence.png" }]);
-
+  // The snapshot reply follows activate on the same port, so the SDK is rebound before
+  // the card is used.
   const snapshotPromise = nextPortMessage(second.port1, "lavish:snapshot");
   second.port1.postMessage({
     type: "lavish:requestSnapshot",
@@ -417,6 +422,15 @@ test("the protocol-1 SDK rebinds a BFCache document without reinstalling its DOM
   assert.equal(snapshot.type, "lavish:snapshot");
   assert.equal(snapshot.document_sequence, 2);
   assert.equal(snapshot.snapshot_request_id, "after-bfcache");
+  assert.equal(sdk.documentListenerCount("click"), clickListeners, "rebind does not duplicate the SDK");
+  assert.equal(sdk.card(), card, "BFCache preserves the live annotation card");
+  assert.equal(card.querySelector("textarea").value, "Keep my annotated image");
+  const queuedPromise = nextPortMessage(second.port1, "lavish:queuePrompt");
+  card.querySelector(".lavish-send").onclick();
+  const queued = await queuedPromise;
+  assert.equal(queued.prompt.prompt, "Keep my annotated image");
+  assert.deepEqual(queued.prompt.attachments, [{ id: "stored-image", name: "evidence.png" }]);
+
   first.port1.close();
   second.port1.close();
 });
