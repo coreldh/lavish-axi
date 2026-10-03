@@ -560,7 +560,18 @@ test("the protocol-1 SDK sends scoped uploads and authored destinations over its
     ok: true,
     id: "stored-image",
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  const uploadedSnapshotPromise = nextPortMessage(channel.port1, "lavish:snapshot");
+  channel.port1.postMessage({
+    type: "lavish:requestSnapshot",
+    snapshot_request_id: "after-upload",
+    page: response.page,
+    page_proof: response.page_proof,
+    document_id: response.document_id,
+    document_sequence: 7,
+    artifact_load_token: response.artifact_load_token,
+    artifact_revision: response.artifact_revision,
+  });
+  assert.equal((await uploadedSnapshotPromise).snapshot_request_id, "after-upload");
   const queuedPromise = nextPortMessage(channel.port1, "lavish:queuePrompt");
   card.querySelector("textarea").value = "Review scoped upload";
   card.querySelector(".lavish-send").onclick();
