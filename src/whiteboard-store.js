@@ -306,9 +306,9 @@ export async function saveWhiteboardForPage(stateDir, key, page, index, options 
 }
 
 /**
- * Legacy entry read. A page-aware call must use `loadWhiteboardForPage`; an
- * entry read never searches digest directories and a sibling read never
- * searches this direct namespace.
+ * With no page option, retain the legacy entry namespace. An explicit page
+ * string or `{ page }` selects only that sibling's digest namespace, as does
+ * `loadWhiteboardForPage`; neither read falls back to the other namespace.
  */
 export async function loadWhiteboard(stateDir, key, index, options = undefined) {
   const page = pageFromOptions(options);
